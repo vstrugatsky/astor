@@ -1,0 +1,18 @@
+# Spike universe. Replace with a real Astor watchlist before drawing conclusions
+# about YOUR tickers -- but keep the mix: the low-liquidity names at the bottom
+# are what expose missing-bar behaviour, and the mega caps are what expose the
+# concurrency ceiling.
+
+# --- high liquidity: should produce a bar every single minute ---
+AAPL MSFT NVDA AMZN GOOGL META TSLA AMD AVGO NFLX
+SPY QQQ IWM TQQQ SQQQ
+JPM BAC WFC GS MS
+XOM CVX COP SLB OXY
+UNH JNJ LLY PFE MRK
+
+# --- mid liquidity ---
+COIN PLTR SOFI RIVN LCID SNAP PINS RBLX U DKNG
+MARA RIOT CLSK HOOD AFRM UPST SHOP XYZ ROKU ABNB
+
+# --- lower liquidity: expect missing minutes, especially outside peak hours ---
+SMCI IONQ RGTI BBAI LUNR RKLB ASTS ACHR JOBY PATH

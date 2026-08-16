@@ -1,0 +1,21 @@
+[project]
+name = "astor"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "ib-async==2.1.0",
+    "tzdata",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.1",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"] # Handled by the formatter

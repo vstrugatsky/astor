@@ -1,0 +1,14 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+.idea/
+.DS_Store
+
+# Spike output: raw measurement logs, regenerated per run
+spike/results/
+
+# Machine-specific local setup
+.claude/settings.local.json
+claude-personal
