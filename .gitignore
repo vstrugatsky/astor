@@ -12,3 +12,6 @@ spike/results/
 # Machine-specific local setup
 .claude/settings.local.json
 claude-personal
+
+# Generated: replay bar cache and trigger database
+data/
