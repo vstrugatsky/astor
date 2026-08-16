@@ -1,0 +1,51 @@
+#!/bin/sh
+#
+# Auto-push after every commit, so work survives the machine.
+#
+# Enable with:  git config core.hooksPath .githooks
+#
+# This lives in the repo rather than in .git/hooks on purpose. .git/hooks is not
+# versioned, so it would be lost along with the machine it is meant to protect --
+# and would not come back on a fresh clone. The one-line enable above is still
+# needed after cloning, since core.hooksPath is local config.
+#
+# A failure here never costs you the commit: git ignores post-commit exit codes,
+# and the commit is already written locally. The hook just tells you the push did
+# not land, so you know the remote is behind.
+
+set -u
+
+git_dir=$(git rev-parse --git-dir 2>/dev/null) || exit 0
+
+# Skip commits made mid-operation. A rebase, merge, cherry-pick or bisect
+# produces intermediate commits that should not be published one at a time.
+for marker in MERGE_HEAD CHERRY_PICK_HEAD BISECT_LOG rebase-merge rebase-apply; do
+    if [ -e "$git_dir/$marker" ]; then
+        exit 0
+    fi
+done
+
+# Detached HEAD has no branch to push.
+branch=$(git symbolic-ref --short -q HEAD) || exit 0
+
+# No remote configured yet is a normal state, not an error.
+git remote get-url origin >/dev/null 2>&1 || exit 0
+
+if git rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+    out=$(git push origin "$branch" 2>&1)
+    status=$?
+else
+    out=$(git push -u origin "$branch" 2>&1)
+    status=$?
+fi
+
+if [ "$status" -eq 0 ]; then
+    printf 'auto-push: %s -> origin\n' "$branch"
+else
+    printf 'auto-push FAILED for %s\n' "$branch" >&2
+    printf 'The commit is safe locally; only the remote is behind.\n' >&2
+    printf '%s\n' "$out" >&2
+    printf 'Retry with: git push origin %s\n' "$branch" >&2
+fi
+
+exit 0
