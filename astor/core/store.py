@@ -41,13 +41,59 @@ CREATE INDEX IF NOT EXISTS idx_triggers_run ON triggers(run_id);
 CREATE INDEX IF NOT EXISTS idx_triggers_symbol ON triggers(symbol, bar_start);
 """
 
+# Views are derived, so they are dropped and rebuilt on every connect rather than
+# guarded with IF NOT EXISTS -- otherwise a changed definition here would never
+# reach a database that already exists.
+VIEWS = """
+DROP VIEW IF EXISTS trigger_detail;
+CREATE VIEW trigger_detail AS
+SELECT
+    t.id,
+    t.run_id,
+    t.symbol,
+    t.setup,
+    t.direction,
+    -- NOT date()/time(): those parse the ISO offset and normalize to UTC, which
+    -- silently shifts every ET timestamp by 4-5 hours. Timestamps are always
+    -- written as tz-aware ET isoformat, so slicing the fixed-width string keeps
+    -- them in the session's own clock -- the only one the trader reasons in.
+    substr(t.bar_start, 1, 10) AS session,
+    substr(t.bar_start, 12, 8) AS trigger_time,
+    t.trigger_price,
+    t.level_name,
+    t.level_value,
+    -- U&R records bars_below/depth_below_level, O&F records the mirrored pair.
+    -- Coalescing gives one column per concept across both setups.
+    COALESCE(json_extract(t.extras_json, '$.bars_below'),
+             json_extract(t.extras_json, '$.bars_above'))         AS bars_beyond,
+    COALESCE(json_extract(t.extras_json, '$.depth_below_level'),
+             json_extract(t.extras_json, '$.height_above_level')) AS excursion,
+    COALESCE(json_extract(t.extras_json, '$.undercut_low'),
+             json_extract(t.extras_json, '$.overshoot_high'))     AS extreme,
+    t.bar_start,
+    t.bar_end,
+    t.detection_ts,
+    t.extras_json
+FROM triggers t;
+
+DROP VIEW IF EXISTS latest_triggers;
+CREATE VIEW latest_triggers AS
+SELECT * FROM trigger_detail
+WHERE run_id = (SELECT run_id FROM runs ORDER BY created_at DESC, run_id DESC LIMIT 1);
+"""
+
 
 class TriggerStore:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self.conn = sqlite3.connect(path)
+        # WAL lets a reader (DataGrip) browse the store while a replay is
+        # writing, instead of the two blocking each other. The setting is
+        # persisted in the database file, so it survives reconnects.
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self.conn.executescript(VIEWS)
         self.conn.commit()
 
     def start_run(self, run_id: str, mode: str, params: dict) -> None:

@@ -6,6 +6,7 @@ uv run python -m astor.test_setups
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from astor.core.scanner import Scanner
@@ -171,6 +172,84 @@ def test_run_replay_end_to_end() -> None:
         seen[0].bar_end,
         seen[0].bar_start + timedelta(minutes=1),
     )
+
+
+def test_store_view_keeps_eastern_time() -> None:
+    """The view must report the session's own clock, not UTC.
+
+    SQLite's date()/time() parse the ISO offset and normalize to UTC, which
+    shifted every trigger 4 hours forward and made RTH triggers appear after
+    the close. This is the guard against that returning.
+    """
+    import tempfile
+
+    from astor.core.store import TriggerStore
+    from astor.core.types import Trigger
+
+    path = Path(tempfile.mkdtemp()) / "t.db"
+    store = TriggerStore(path)
+    store.start_run("r1", "replay", {})
+    trig = Trigger(
+        symbol="TEST",
+        setup="U&R",
+        direction="long",
+        trigger_price=100.5,
+        bar_start=OPEN,
+        bar_end=OPEN + timedelta(minutes=1),
+        level_name="PDL",
+        level_value=100.0,
+        extras={"bars_below": 3, "depth_below_level": 1.5, "undercut_low": 98.5},
+    )
+    store.record("r1", trig, trig.bar_end)
+    store.commit()
+
+    row = store.conn.execute(
+        "SELECT session, trigger_time, bars_beyond, excursion, extreme"
+        " FROM latest_triggers"
+    ).fetchone()
+    check("session date is ET", row[0], "2026-08-14")
+    check("trigger time is ET, not UTC", row[1], "09:30:00")
+    check("bars_beyond coalesced", row[2], 3)
+    check("excursion coalesced", row[3], 1.5)
+    check("extreme coalesced", row[4], 98.5)
+    check("WAL enabled", store.conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+    store.close()
+
+
+def test_store_view_coalesces_short_setup() -> None:
+    """O&F records the mirrored extras keys; the view must map them too."""
+    import tempfile
+
+    from astor.core.store import TriggerStore
+    from astor.core.types import Trigger
+
+    store = TriggerStore(Path(tempfile.mkdtemp()) / "t.db")
+    store.start_run("r1", "replay", {})
+    store.record(
+        "r1",
+        Trigger(
+            symbol="TEST",
+            setup="O&F",
+            direction="short",
+            trigger_price=104.5,
+            bar_start=OPEN,
+            bar_end=OPEN + timedelta(minutes=1),
+            level_name="PDH",
+            level_value=105.0,
+            extras={
+                "bars_above": 2,
+                "height_above_level": 1.5,
+                "overshoot_high": 106.5,
+            },
+        ),
+        OPEN + timedelta(minutes=1),
+    )
+    store.commit()
+    row = store.conn.execute(
+        "SELECT bars_beyond, excursion, extreme FROM latest_triggers"
+    ).fetchone()
+    check("short-side coalesce", row, (2, 1.5, 106.5))
+    store.close()
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
