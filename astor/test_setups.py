@@ -45,7 +45,9 @@ def test_undercut_rally_basic() -> None:
     check("direction", t.direction, "long")
     check("bars below", t.extras["bars_below"], 3)
     check("undercut low", t.extras["undercut_low"], 98.5)
-    check("depth", t.extras["depth_below_level"], 1.5)
+    # Absolute dollar figures are deliberately not stored -- only ADR units.
+    for gone in ("depth_below_level", "reclaim_close", "reclaim_distance", "adr"):
+        assert gone not in t.extras, f"{gone} should no longer be recorded"
     # Re-armed: a bar above PDL must not fire again without a new undercut.
     check("no repeat fire", s.on_bar(bar(4, 100.5, 102, 100.4, 101.5), LEVELS), None)
 
@@ -95,7 +97,8 @@ def test_overshoot_fail_basic() -> None:
     check("direction", t.direction, "short")
     check("bars above", t.extras["bars_above"], 2)
     check("overshoot high", t.extras["overshoot_high"], 106.5)
-    check("height", t.extras["height_above_level"], 1.5)
+    for gone in ("height_above_level", "fail_close", "reclaim_distance", "adr"):
+        assert gone not in t.extras, f"{gone} should no longer be recorded"
 
 
 def test_boundary_is_strict() -> None:
@@ -360,20 +363,19 @@ def test_store_view_keeps_eastern_time() -> None:
         bar_end=OPEN + timedelta(minutes=1),
         level_name="PDL",
         level_value=100.0,
-        extras={"bars_below": 3, "depth_below_level": 1.5, "undercut_low": 98.5},
+        extras={"bars_below": 3, "bars_armed": 4, "excursion_adr": 0.15},
     )
     store.record("r1", trig, trig.bar_end)
     store.commit()
 
     row = store.conn.execute(
-        "SELECT session, trigger_time, bars_beyond, excursion, extreme"
-        " FROM latest_triggers"
+        "SELECT session, trigger_time, bars_beyond, latency_sec FROM latest_triggers"
     ).fetchone()
     check("session date is ET", row[0], "2026-08-14")
     check("trigger time is ET, not UTC", row[1], "09:30:00")
     check("bars_beyond coalesced", row[2], 3)
-    check("excursion coalesced", row[3], 1.5)
-    check("extreme coalesced", row[4], 98.5)
+    # Replay detects at bar completion, so latency is zero by construction.
+    check("replay latency is zero", row[3], 0.0)
     check("WAL enabled", store.conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
     store.close()
 
@@ -408,9 +410,9 @@ def test_store_view_coalesces_short_setup() -> None:
     )
     store.commit()
     row = store.conn.execute(
-        "SELECT bars_beyond, excursion, extreme FROM latest_triggers"
+        "SELECT bars_beyond, bars_armed, excursion_adr FROM latest_triggers"
     ).fetchone()
-    check("short-side coalesce", row, (2, 1.5, 106.5))
+    check("short-side coalesce", row, (2, 3, 0.15))
     store.close()
 
 

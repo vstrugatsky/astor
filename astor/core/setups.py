@@ -12,6 +12,11 @@ Each setup applies two independent tests at trigger time:
   reclaim    how convincingly price came back. Rejects a close that limps a
              cent past the level and means nothing.
 
+Both are recorded only in ADR units. The dollar figures they derive from are
+deliberately not stored: they are not comparable across a watchlist, and the
+absolute prices that do matter -- the level and the trigger -- are already
+columns on the trigger row.
+
 A bar that breaches the level always arms the setup. The filters are applied
 when it would fire, against the *accumulated* excursion, so an undercut that
 deepens over several bars is judged on its full extent rather than its first
@@ -110,10 +115,6 @@ class UndercutRally(Setup):
                 "undercut_start": self._undercut_start.isoformat(),
                 "bars_below": self._bars_below,
                 "bars_armed": self._bars_armed,
-                "depth_below_level": round(excursion, 4),
-                "reclaim_close": bar.close,
-                "reclaim_distance": round(reclaim, 4),
-                "adr": round(adr, 4),
                 "adr_pct": levels.adr_pct,
                 "excursion_adr": round(excursion / adr, 4) if adr > 0 else None,
                 "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,
@@ -193,10 +194,6 @@ class OvershootFail(Setup):
                 "overshoot_start": self._overshoot_start.isoformat(),
                 "bars_above": self._bars_above,
                 "bars_armed": self._bars_armed,
-                "height_above_level": round(excursion, 4),
-                "fail_close": bar.close,
-                "reclaim_distance": round(reclaim, 4),
-                "adr": round(adr, 4),
                 "adr_pct": levels.adr_pct,
                 "excursion_adr": round(excursion / adr, 4) if adr > 0 else None,
                 "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,

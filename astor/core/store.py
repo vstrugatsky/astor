@@ -50,42 +50,28 @@ CREATE VIEW trigger_detail AS
 SELECT
     t.id,
     t.run_id,
-    t.symbol,
-    t.setup,
-    t.direction,
     -- NOT date()/time(): those parse the ISO offset and normalize to UTC, which
     -- silently shifts every ET timestamp by 4-5 hours. Timestamps are always
     -- written as tz-aware ET isoformat, so slicing the fixed-width string keeps
     -- them in the session's own clock -- the only one the trader reasons in.
     substr(t.bar_start, 1, 10) AS session,
     substr(t.bar_start, 12, 8) AS trigger_time,
+    t.symbol,
+    t.setup,
     t.trigger_price,
-    t.level_name,
     t.level_value,
-    -- U&R records bars_below/depth_below_level, O&F records the mirrored pair.
-    -- Coalescing gives one column per concept across both setups.
+    -- U&R and O&F record mirrored key names; coalescing gives one column each.
     COALESCE(json_extract(t.extras_json, '$.bars_below'),
-             json_extract(t.extras_json, '$.bars_above'))         AS bars_beyond,
-    COALESCE(json_extract(t.extras_json, '$.depth_below_level'),
-             json_extract(t.extras_json, '$.height_above_level')) AS excursion,
-    COALESCE(json_extract(t.extras_json, '$.undercut_low'),
-             json_extract(t.extras_json, '$.overshoot_high'))     AS extreme,
-    json_extract(t.extras_json, '$.reclaim_distance')             AS reclaim_dist,
-    -- bars_beyond is time price actually held past the level; bars_armed is how
-    -- long the setup had been waiting. They diverge whenever a reclaim was
-    -- suppressed by a filter, and conflating them overstates how sustained the
-    -- breach was.
-    json_extract(t.extras_json, '$.bars_armed')                   AS bars_armed,
-    -- Excursion and reclaim in ADR units: the scale the filters actually use,
-    -- and the one that is comparable across a watchlist.
-    json_extract(t.extras_json, '$.excursion_adr')                AS excursion_adr,
-    json_extract(t.extras_json, '$.reclaim_adr')                  AS reclaim_adr,
-    json_extract(t.extras_json, '$.adr')                          AS adr,
-    json_extract(t.extras_json, '$.adr_pct')                      AS adr_pct,
-    t.bar_start,
-    t.bar_end,
-    t.detection_ts,
-    t.extras_json
+             json_extract(t.extras_json, '$.bars_above'))     AS bars_beyond,
+    json_extract(t.extras_json, '$.bars_armed')               AS bars_armed,
+    json_extract(t.extras_json, '$.excursion_adr')            AS excursion_adr,
+    json_extract(t.extras_json, '$.reclaim_adr')              AS reclaim_adr,
+    json_extract(t.extras_json, '$.adr_pct')                  AS adr_pct,
+    -- detection_ts equals bar_end exactly in Replay, so showing both is noise.
+    -- The difference is the only part that carries information, and it is what
+    -- Live will populate: how long after the bar closed the trigger was seen.
+    round((julianday(t.detection_ts) - julianday(t.bar_end)) * 86400, 1)
+                                                              AS latency_sec
 FROM triggers t;
 
 DROP VIEW IF EXISTS latest_triggers;
