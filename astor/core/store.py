@@ -141,6 +141,27 @@ class TriggerStore:
             ),
         )
 
+    def purge_runs(self, keep: str | None = None) -> int:
+        """Delete stored runs in place, leaving the database file itself alone.
+
+        Deleting the file instead would replace its inode, and any client with
+        an open connection (DataGrip) keeps reading the old unlinked file --
+        showing stale rows indefinitely with no indication anything is wrong.
+        Clearing rows keeps every existing connection valid.
+        """
+        if keep:
+            n = self.conn.execute(
+                "SELECT count(*) FROM runs WHERE run_id != ?", (keep,)
+            ).fetchone()[0]
+            self.conn.execute("DELETE FROM triggers WHERE run_id != ?", (keep,))
+            self.conn.execute("DELETE FROM runs WHERE run_id != ?", (keep,))
+        else:
+            n = self.conn.execute("SELECT count(*) FROM runs").fetchone()[0]
+            self.conn.execute("DELETE FROM triggers")
+            self.conn.execute("DELETE FROM runs")
+        self.conn.commit()
+        return n
+
     def commit(self) -> None:
         self.conn.commit()
 

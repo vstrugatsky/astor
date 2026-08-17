@@ -120,6 +120,12 @@ async def cmd_replay(args: argparse.Namespace) -> int:
     scanner = Scanner(levels, setups, kwargs)
 
     store = TriggerStore(Path(args.db))
+    if args.purge:
+        # Rows, not the file: replacing the file would strand any open DataGrip
+        # connection on the old inode, where it would read stale rows forever.
+        removed = store.purge_runs()
+        if removed:
+            logger.info("Purged %d earlier run(s) from %s", removed, args.db)
     store.start_run(run_id, "replay", params)
 
     def on_trigger(t):
@@ -227,6 +233,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=14,
         help="Sessions used for ADR (default 14)",
+    )
+    r.add_argument(
+        "--purge",
+        action="store_true",
+        help="Clear earlier runs first, in place (keeps open DB connections valid)",
     )
     r.add_argument("--db", default="data/astor.db")
     r.add_argument("--cache-dir", default="data/bars")
