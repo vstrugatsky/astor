@@ -174,6 +174,108 @@ def test_run_replay_end_to_end() -> None:
     )
 
 
+def test_compute_adr_pct() -> None:
+    """Deepvue definition: mean of (High/Low - 1), as a percent."""
+    from astor.drivers.replay import compute_adr_pct
+
+    class B:
+        def __init__(self, h, low):
+            self.high, self.low = h, low
+
+    # Three sessions with ranges of exactly 10%, 20%, 30% -> mean 20%.
+    adr, used = compute_adr_pct([B(110, 100), B(120, 100), B(130, 100)], 3)
+    check("adr percent", adr, 20.0)
+    check("sessions used", used, 3)
+
+    # Only the last N sessions count.
+    adr2, used2 = compute_adr_pct([B(200, 100), B(110, 100), B(110, 100)], 2)
+    check("window respected", adr2, 10.0)
+    check("sessions used", used2, 2)
+
+    # A bad bar is skipped, not a division error; no usable bars -> 0.0.
+    adr3, used3 = compute_adr_pct([B(110, 0), B(120, 100)], 2)
+    check("bad low skipped", adr3, 20.0)
+    check("count excludes bad bar", used3, 1)
+    check("no usable bars", compute_adr_pct([B(110, 0)], 2), (0.0, 0))
+
+
+# ADR of 10% on a $100 prior close -> $10.00 of ADR.
+ADR_LEVELS = DailyLevels(
+    "TEST",
+    date(2026, 8, 13),
+    pdh=105.0,
+    pdl=100.0,
+    adr_pct=10.0,
+    prev_close=100.0,
+    adr_sessions=14,
+)
+
+
+def test_adr_property() -> None:
+    check("adr in dollars", ADR_LEVELS.adr, 10.0)
+    check("no adr data -> zero", LEVELS.adr, 0.0)
+
+
+def test_excursion_filter_rejects_shallow_breach() -> None:
+    """A 1-cent undercut is chop, not a setup, at a 0.1 ADR threshold."""
+    s = UndercutRally(min_excursion_adr=0.1)  # needs >= $1.00 of undercut
+    s.on_bar(bar(0, 100.5, 100.5, 99.99, 100.2), ADR_LEVELS)  # 0.01 deep -> armed
+    check(
+        "shallow breach suppressed",
+        s.on_bar(bar(1, 100.2, 101, 100.1, 100.9), ADR_LEVELS),
+        None,
+    )
+    # Still armed. A deeper push then a reclaim does fire.
+    s.on_bar(bar(2, 100.2, 100.2, 98.5, 98.8), ADR_LEVELS)  # now 1.50 deep
+    t = s.on_bar(bar(3, 98.8, 101, 98.8, 100.9), ADR_LEVELS)
+    assert t is not None, "expected fire once the undercut was deep enough"
+    check("excursion in adr units", t.extras["excursion_adr"], 0.15)
+
+
+def test_reclaim_filter_rejects_limp_reclaim() -> None:
+    """Closing a cent past the level is not a reclaim worth an alert."""
+    s = UndercutRally(min_reclaim_adr=0.1)  # needs close >= $1.00 above PDL
+    s.on_bar(bar(0, 101, 101, 97, 97.5), ADR_LEVELS)  # deep undercut, armed
+    check(
+        "limp reclaim suppressed",
+        s.on_bar(bar(1, 97.5, 100.2, 97.5, 100.01), ADR_LEVELS),
+        None,
+    )
+    # Stays armed, so a convincing reclaim later still fires.
+    t = s.on_bar(bar(2, 100.01, 101.5, 100.0, 101.2), ADR_LEVELS)
+    assert t is not None, "expected fire on a convincing reclaim"
+    check("reclaim in adr units", t.extras["reclaim_adr"], 0.12)
+
+
+def test_filters_apply_to_short_side() -> None:
+    s = OvershootFail(min_excursion_adr=0.1, min_reclaim_adr=0.1)
+    s.on_bar(bar(0, 105, 105.05, 105, 105.02), ADR_LEVELS)  # 0.05 over -> armed
+    check(
+        "shallow overshoot suppressed",
+        s.on_bar(bar(1, 105.02, 105.02, 104.9, 104.99), ADR_LEVELS),
+        None,
+    )
+    s.on_bar(bar(2, 105, 107, 105, 106.5), ADR_LEVELS)  # now 2.00 over
+    check(
+        "limp fail suppressed",
+        s.on_bar(bar(3, 106.5, 106.5, 104.9, 104.99), ADR_LEVELS),
+        None,
+    )
+    t = s.on_bar(bar(4, 104.99, 105, 103, 103.5), ADR_LEVELS)
+    assert t is not None, "expected fire on a decisive fail"
+    check("excursion adr", t.extras["excursion_adr"], 0.2)
+    check("reclaim adr", t.extras["reclaim_adr"], 0.15)
+
+
+def test_filters_skipped_without_adr() -> None:
+    """No ADR means no scale; filter rather than reject everything silently."""
+    s = UndercutRally(min_excursion_adr=99.0, min_reclaim_adr=99.0)
+    s.on_bar(bar(0, 101, 101, 99, 99.5), LEVELS)  # LEVELS has adr_pct 0
+    t = s.on_bar(bar(1, 99.5, 101, 99.5, 100.5), LEVELS)
+    assert t is not None, "unscalable filters must not silently suppress"
+    check("adr units unavailable", t.extras["excursion_adr"], None)
+
+
 def test_store_view_keeps_eastern_time() -> None:
     """The view must report the session's own clock, not UTC.
 

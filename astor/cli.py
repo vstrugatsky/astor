@@ -69,6 +69,9 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         "end": args.end,
         "setups": [s.name for s in setups],
         "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
+        "min_excursion_adr": args.min_excursion_adr,
+        "min_reclaim_adr": args.min_reclaim_adr,
+        "adr_sessions": args.adr_sessions,
     }
 
     ib = IB()
@@ -77,7 +80,7 @@ async def cmd_replay(args: argparse.Namespace) -> int:
     try:
         driver = ReplayDriver(ib, session, args.bar_size, Path(args.cache_dir))
         logger.info("Fetching PDH/PDL for %d symbols...", len(symbols))
-        levels = await driver.fetch_levels(symbols)
+        levels = await driver.fetch_levels(symbols, args.adr_sessions)
         logger.info("Fetching %s bars for %s...", args.bar_size, session)
         bars = await driver.fetch_bars(symbols)
     finally:
@@ -93,12 +96,27 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         ", ".join(str(s) for s in sorted(prior_sessions)),
     )
 
-    kwargs = {}
-    if args.allow_same_bar_reclaim:
-        kwargs = {
-            "U&R": {"allow_same_bar_reclaim": True},
-            "O&F": {"allow_same_bar_fail": True},
-        }
+    # Filters are scaled by ADR, so a symbol without ADR cannot be filtered.
+    # Surface that rather than letting it look like a clean unfiltered pass.
+    no_adr = sorted(s for s, lv in levels.items() if lv.adr <= 0)
+    if no_adr and (args.min_excursion_adr or args.min_reclaim_adr):
+        logger.warning(
+            "No ADR for %s -- filters cannot be scaled, these run unfiltered",
+            ", ".join(no_adr),
+        )
+
+    kwargs = {
+        "U&R": {
+            "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
+            "min_excursion_adr": args.min_excursion_adr,
+            "min_reclaim_adr": args.min_reclaim_adr,
+        },
+        "O&F": {
+            "allow_same_bar_fail": args.allow_same_bar_reclaim,
+            "min_excursion_adr": args.min_excursion_adr,
+            "min_reclaim_adr": args.min_reclaim_adr,
+        },
+    }
     scanner = Scanner(levels, setups, kwargs)
 
     store = TriggerStore(Path(args.db))
@@ -125,6 +143,16 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
     print(f"REPLAY {args.date}   run_id={run_id}")
     print("=" * 78)
     print(f"Symbols with levels : {len(levels)}")
+    adrs = [lv.adr_pct for lv in levels.values() if lv.adr_pct > 0]
+    if adrs:
+        print(
+            f"ADR({args.adr_sessions})          : "
+            f"{min(adrs):.2f}% - {max(adrs):.2f}% across symbols"
+        )
+    print(
+        f"Filters             : excursion >= {args.min_excursion_adr}x ADR, "
+        f"reclaim >= {args.min_reclaim_adr}x ADR"
+    )
     print(f"Bars fed to scanner : {fed}")
     print(f"Bars evaluated      : {scanner.bars_evaluated}")
     print(f"Dropped, zero volume: {scanner.skipped_zero_volume}")
@@ -181,6 +209,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-same-bar-reclaim",
         action="store_true",
         help="Let a single bar both breach and reclaim the level",
+    )
+    r.add_argument(
+        "--min-excursion-adr",
+        type=float,
+        default=0.1,
+        help="Minimum breach depth past the level, in ADR units (0 = off)",
+    )
+    r.add_argument(
+        "--min-reclaim-adr",
+        type=float,
+        default=0.1,
+        help="Minimum reclaim distance past the level, in ADR units (0 = off)",
+    )
+    r.add_argument(
+        "--adr-sessions",
+        type=int,
+        default=14,
+        help="Sessions used for ADR (default 14)",
     )
     r.add_argument("--db", default="data/astor.db")
     r.add_argument("--cache-dir", default="data/bars")

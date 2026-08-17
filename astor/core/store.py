@@ -70,6 +70,13 @@ SELECT
              json_extract(t.extras_json, '$.height_above_level')) AS excursion,
     COALESCE(json_extract(t.extras_json, '$.undercut_low'),
              json_extract(t.extras_json, '$.overshoot_high'))     AS extreme,
+    json_extract(t.extras_json, '$.reclaim_distance')             AS reclaim_dist,
+    -- Excursion and reclaim in ADR units: the scale the filters actually use,
+    -- and the one that is comparable across a watchlist.
+    json_extract(t.extras_json, '$.excursion_adr')                AS excursion_adr,
+    json_extract(t.extras_json, '$.reclaim_adr')                  AS reclaim_adr,
+    json_extract(t.extras_json, '$.adr')                          AS adr,
+    json_extract(t.extras_json, '$.adr_pct')                      AS adr_pct,
     t.bar_start,
     t.bar_end,
     t.detection_ts,

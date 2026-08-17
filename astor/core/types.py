@@ -33,12 +33,32 @@ class BarEvent:
 
 @dataclass(frozen=True, slots=True)
 class DailyLevels:
-    """Prior-session reference levels. RTH only, per the setup definitions."""
+    """Prior-session reference levels and volatility. RTH only, per the setups.
+
+    `adr_pct` is the Deepvue-compatible definition -- the mean of (High/Low - 1)
+    over the prior N sessions, as a percent. It is stored as a percent rather
+    than dollars so it reconciles with the research platform and stays
+    comparable across tickers; the dollar figure the filters actually use is
+    derived from it against the prior close.
+    """
 
     symbol: str
     session: date  # the session these levels were taken from
     pdh: float
     pdl: float
+    adr_pct: float = 0.0
+    prev_close: float = 0.0
+    adr_sessions: int = 0
+
+    @property
+    def adr(self) -> float:
+        """ADR in dollars, anchored to the prior close.
+
+        Anchored to the prior close rather than the live price so the filter
+        threshold is a constant for the whole session -- otherwise the bar that
+        triggers a setup would move the yardstick used to judge it.
+        """
+        return self.adr_pct / 100.0 * self.prev_close
 
 
 @dataclass(frozen=True, slots=True)

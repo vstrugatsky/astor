@@ -31,6 +31,30 @@ ET = __import__("zoneinfo").ZoneInfo("America/New_York")
 # request passes an explicit timeout and empty results are treated as failures.
 REQUEST_TIMEOUT = 60.0
 
+ADR_SESSIONS = 14
+
+# A cache entry written before ADR existed lacks these, so it must be refetched
+# rather than loaded with zeroed volatility -- which would silently disable the
+# filters instead of failing visibly.
+REQUIRED_LEVEL_KEYS = {"session", "pdh", "pdl", "adr_pct", "prev_close", "adr_sessions"}
+
+
+def compute_adr_pct(daily_bars, sessions: int = ADR_SESSIONS) -> tuple[float, int]:
+    """Deepvue-compatible ADR: mean of (High / Low - 1) over the last N sessions.
+
+    Returns (adr_pct, sessions_used). Bars with a non-positive low are skipped
+    rather than producing a division error; a symbol with no usable bars gets
+    0.0, which the setups read as "unscalable" and skip filtering for.
+    """
+    ratios = [
+        b.high / b.low - 1.0
+        for b in daily_bars[-sessions:]
+        if b.low and b.low > 0 and b.high and b.high > 0
+    ]
+    if not ratios:
+        return 0.0, 0
+    return round(sum(ratios) / len(ratios) * 100.0, 4), len(ratios)
+
 
 def parse_bar_seconds(bar_size: str) -> int:
     parts = bar_size.strip().split()
@@ -102,31 +126,45 @@ class ReplayDriver:
             logger.warning("Could not qualify: %s", ", ".join(missing))
         return good
 
-    async def fetch_levels(self, symbols: list[str]) -> dict[str, DailyLevels]:
-        """PDH/PDL from the RTH session *before* the replay day.
+    async def fetch_levels(
+        self, symbols: list[str], adr_sessions: int = ADR_SESSIONS
+    ) -> dict[str, DailyLevels]:
+        """PDH/PDL and ADR from RTH sessions *before* the replay day.
 
         Requesting daily bars that end at 00:00 on the replay date guarantees the
         replay day itself is excluded, so this cannot leak the day being
-        replayed into its own reference levels.
+        replayed into its own reference levels -- and equally cannot leak it into
+        the ADR used to judge that day's triggers.
+
+        ADR comes free from the same request that produces PDH/PDL, which is why
+        computing it here is cheaper than importing it: no second data source, no
+        CSV step before adding a ticker mid-session, and it is correct as of the
+        replayed date rather than as of whenever an export was taken.
         """
         contracts = await self._qualify(symbols)
         out: dict[str, DailyLevels] = {}
 
+        # Enough calendar days to cover adr_sessions trading days plus holidays.
+        duration_days = max(15, int(adr_sessions * 1.6) + 5)
+
         async def one(sym: str, contract) -> None:
             cached = self.cache.load("levels", sym, self.session, "1day")
-            if cached:
+            if cached and REQUIRED_LEVEL_KEYS <= set(cached):
                 out[sym] = DailyLevels(
                     sym,
                     date.fromisoformat(cached["session"]),
                     cached["pdh"],
                     cached["pdl"],
+                    cached["adr_pct"],
+                    cached["prev_close"],
+                    cached["adr_sessions"],
                 )
                 return
             async with self.sem:
                 bars = await self.ib.reqHistoricalDataAsync(
                     contract,
                     endDateTime=f"{self.session:%Y%m%d} 00:00:00 US/Eastern",
-                    durationStr="10 D",
+                    durationStr=f"{duration_days} D",
                     barSizeSetting="1 day",
                     whatToShow="TRADES",
                     useRTH=True,
@@ -148,8 +186,24 @@ class ReplayDriver:
                     self.session,
                 )
                 return
+
+            adr_pct, used = compute_adr_pct(bars, adr_sessions)
+            if used < adr_sessions:
+                logger.warning(
+                    "%s: only %d of %d sessions available for ADR",
+                    sym,
+                    used,
+                    adr_sessions,
+                )
+
             out[sym] = DailyLevels(
-                sym, prior_session, float(prior.high), float(prior.low)
+                sym,
+                prior_session,
+                float(prior.high),
+                float(prior.low),
+                adr_pct,
+                float(prior.close),
+                used,
             )
             self.cache.save(
                 "levels",
@@ -160,6 +214,9 @@ class ReplayDriver:
                     "session": prior_session.isoformat(),
                     "pdh": prior.high,
                     "pdl": prior.low,
+                    "adr_pct": adr_pct,
+                    "prev_close": prior.close,
+                    "adr_sessions": used,
                 },
             )
 
