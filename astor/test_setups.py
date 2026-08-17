@@ -400,11 +400,7 @@ def test_store_view_coalesces_short_setup() -> None:
             bar_end=OPEN + timedelta(minutes=1),
             level_name="PDH",
             level_value=105.0,
-            extras={
-                "bars_above": 2,
-                "height_above_level": 1.5,
-                "overshoot_high": 106.5,
-            },
+            extras={"bars_above": 2, "bars_armed": 3, "excursion_adr": 0.15},
         ),
         OPEN + timedelta(minutes=1),
     )
