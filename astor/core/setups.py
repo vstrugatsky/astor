@@ -60,7 +60,8 @@ class UndercutRally(Setup):
         self.min_reclaim_adr = min_reclaim_adr
         self._undercut_low: float | None = None
         self._undercut_start = None
-        self._bars_below = 0
+        self._bars_below = 0  # bars whose low actually broke the level
+        self._bars_armed = 0  # bars since the breach, however price behaved
 
     def on_bar(self, bar: BarEvent, levels: DailyLevels) -> Trigger | None:
         pdl = levels.pdl
@@ -71,11 +72,17 @@ class UndercutRally(Setup):
             self._undercut_low = bar.low
             self._undercut_start = bar.start
             self._bars_below = 1
+            self._bars_armed = 1
             if not (self.allow_same_bar_reclaim and bar.close > pdl):
                 return None
         else:
             self._undercut_low = min(self._undercut_low, bar.low)
-            self._bars_below += 1
+            self._bars_armed += 1
+            # Only bars that actually broke the level count as time spent below
+            # it. Counting every armed bar conflates "price held under the level
+            # for 39 minutes" with "the setup has been waiting 52 minutes".
+            if bar.low < pdl:
+                self._bars_below += 1
             if bar.close <= pdl:
                 return None
 
@@ -102,6 +109,7 @@ class UndercutRally(Setup):
                 "undercut_low": self._undercut_low,
                 "undercut_start": self._undercut_start.isoformat(),
                 "bars_below": self._bars_below,
+                "bars_armed": self._bars_armed,
                 "depth_below_level": round(excursion, 4),
                 "reclaim_close": bar.close,
                 "reclaim_distance": round(reclaim, 4),
@@ -114,6 +122,7 @@ class UndercutRally(Setup):
         self._undercut_low = None
         self._undercut_start = None
         self._bars_below = 0
+        self._bars_armed = 0
         return trigger
 
 
@@ -137,7 +146,8 @@ class OvershootFail(Setup):
         self.min_reclaim_adr = min_reclaim_adr
         self._overshoot_high: float | None = None
         self._overshoot_start = None
-        self._bars_above = 0
+        self._bars_above = 0  # bars whose high actually broke the level
+        self._bars_armed = 0  # bars since the breach, however price behaved
 
     def on_bar(self, bar: BarEvent, levels: DailyLevels) -> Trigger | None:
         pdh = levels.pdh
@@ -148,11 +158,14 @@ class OvershootFail(Setup):
             self._overshoot_high = bar.high
             self._overshoot_start = bar.start
             self._bars_above = 1
+            self._bars_armed = 1
             if not (self.allow_same_bar_fail and bar.close < pdh):
                 return None
         else:
             self._overshoot_high = max(self._overshoot_high, bar.high)
-            self._bars_above += 1
+            self._bars_armed += 1
+            if bar.high > pdh:
+                self._bars_above += 1
             if bar.close >= pdh:
                 return None
 
@@ -179,6 +192,7 @@ class OvershootFail(Setup):
                 "overshoot_high": self._overshoot_high,
                 "overshoot_start": self._overshoot_start.isoformat(),
                 "bars_above": self._bars_above,
+                "bars_armed": self._bars_armed,
                 "height_above_level": round(excursion, 4),
                 "fail_close": bar.close,
                 "reclaim_distance": round(reclaim, 4),
@@ -191,6 +205,7 @@ class OvershootFail(Setup):
         self._overshoot_high = None
         self._overshoot_start = None
         self._bars_above = 0
+        self._bars_armed = 0
         return trigger
 
 

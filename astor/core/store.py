@@ -71,6 +71,11 @@ SELECT
     COALESCE(json_extract(t.extras_json, '$.undercut_low'),
              json_extract(t.extras_json, '$.overshoot_high'))     AS extreme,
     json_extract(t.extras_json, '$.reclaim_distance')             AS reclaim_dist,
+    -- bars_beyond is time price actually held past the level; bars_armed is how
+    -- long the setup had been waiting. They diverge whenever a reclaim was
+    -- suppressed by a filter, and conflating them overstates how sustained the
+    -- breach was.
+    json_extract(t.extras_json, '$.bars_armed')                   AS bars_armed,
     -- Excursion and reclaim in ADR units: the scale the filters actually use,
     -- and the one that is comparable across a watchlist.
     json_extract(t.extras_json, '$.excursion_adr')                AS excursion_adr,

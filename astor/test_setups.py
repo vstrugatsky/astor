@@ -56,10 +56,12 @@ def test_undercut_rally_same_bar_flag() -> None:
 
     off = UndercutRally(allow_same_bar_reclaim=False)
     check("same-bar suppressed by default", off.on_bar(wick, LEVELS), None)
-    # It is armed though, so the next close above fires.
+    # It is armed though, so the next close above fires. That second bar never
+    # dips below PDL, so it is an armed bar but not a bar below the level.
     t = off.on_bar(bar(2, 100.8, 101.2, 100.7, 101.0), LEVELS)
     assert t is not None, "expected trigger on following bar"
-    check("bars below after wick", t.extras["bars_below"], 2)
+    check("only the wick bar broke the level", t.extras["bars_below"], 1)
+    check("but two bars elapsed since the breach", t.extras["bars_armed"], 2)
 
     on = UndercutRally(allow_same_bar_reclaim=True)
     t2 = on.on_bar(wick, LEVELS)
@@ -172,6 +174,64 @@ def test_run_replay_end_to_end() -> None:
         seen[0].bar_end,
         seen[0].bar_start + timedelta(minutes=1),
     )
+
+
+def test_bars_beyond_counts_only_bars_past_the_level() -> None:
+    """bars_below is time spent below the level, not time spent armed.
+
+    These diverge whenever a filter suppresses a reclaim: the setup stays armed
+    while price sits back above the level. Counting those bars as "below"
+    overstated how sustained the breach was -- AAPL reported 52 when only 39
+    bars had actually broken the level.
+    """
+    s = UndercutRally(min_reclaim_adr=0.1)  # needs $1.00 reclaim on $10 ADR
+    s.on_bar(bar(0, 101, 101, 97, 97.5), ADR_LEVELS)  # breaks level, armed
+    # Three bars back above PDL but reclaiming too weakly to fire. They are
+    # armed bars, not bars below the level.
+    for i in (1, 2, 3):
+        check(
+            f"weak reclaim bar {i} suppressed",
+            s.on_bar(bar(i, 100.2, 100.4, 100.1, 100.3), ADR_LEVELS),
+            None,
+        )
+    t = s.on_bar(bar(4, 100.3, 101.5, 100.2, 101.2), ADR_LEVELS)
+    assert t is not None, "expected fire once the reclaim was convincing"
+    check("bars actually below the level", t.extras["bars_below"], 1)
+    check("bars since the breach", t.extras["bars_armed"], 5)
+
+
+def test_bars_above_counts_only_bars_past_the_level() -> None:
+    s = OvershootFail(min_reclaim_adr=0.1)
+    s.on_bar(bar(0, 105, 108, 105, 107.5), ADR_LEVELS)  # breaks PDH, armed
+    for i in (1, 2):
+        check(
+            f"weak fail bar {i} suppressed",
+            s.on_bar(bar(i, 104.9, 104.95, 104.8, 104.9), ADR_LEVELS),
+            None,
+        )
+    t = s.on_bar(bar(3, 104.9, 104.9, 103, 103.5), ADR_LEVELS)
+    assert t is not None, "expected fire on a decisive fail"
+    check("bars actually above the level", t.extras["bars_above"], 1)
+    check("bars since the breach", t.extras["bars_armed"], 4)
+
+
+def test_reclaim_may_span_many_bars() -> None:
+    """A reclaim is not required to complete in one bar.
+
+    It is a point-in-time distance from the level, re-tested on every bar while
+    the setup stays armed, so price may grind up over many bars and fire when it
+    finally gets far enough past.
+    """
+    s = UndercutRally(min_reclaim_adr=0.1)  # needs close >= 101.00
+    s.on_bar(bar(0, 101, 101, 97, 97.5), ADR_LEVELS)
+    closes = [100.2, 100.5, 100.8, 100.95]  # creeping up, all short of 101.00
+    for i, c in enumerate(closes, start=1):
+        check(
+            f"still short at {c}", s.on_bar(bar(i, c, c, c - 0.1, c), ADR_LEVELS), None
+        )
+    t = s.on_bar(bar(5, 100.95, 101.3, 100.9, 101.05), ADR_LEVELS)
+    assert t is not None, "a gradual reclaim must still fire"
+    check("fired on the 6th bar of the sequence", t.extras["bars_armed"], 6)
 
 
 def test_compute_adr_pct() -> None:
