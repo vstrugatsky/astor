@@ -339,6 +339,116 @@ def test_filters_skipped_without_adr() -> None:
     check("adr units unavailable", t.extras["excursion_adr"], None)
 
 
+def test_excursion_pct_recovers_aeva() -> None:
+    """The exact case that motivated the OR: AEVA's real U&R on 2026-08-14.
+
+    PDL=22.25, ADR%=11.00 -> ADR$=2.4662. The undercut bottomed at 22.05, a
+    $0.20 breach -- 0.081x ADR, under a 0.1x threshold by five cents. As a
+    fraction of the level (0.20/22.25 = 0.899%) it clears a 0.5% floor easily.
+    ADR-only misses it; ADR-or-0.5%-of-level catches it.
+    """
+    aeva = DailyLevels(
+        "AEVA",
+        date(2026, 8, 13),
+        pdh=25.86,
+        pdl=22.25,
+        adr_pct=11.00,
+        prev_close=22.42,
+        adr_sessions=14,
+    )
+    adr_only = UndercutRally(min_excursion_adr=0.1, min_reclaim_adr=0.1)
+    check(
+        "ADR-only misses the real undercut",
+        adr_only.on_bar(bar(0, 22.35, 22.40, 22.05, 22.27), aeva),
+        None,
+    )
+    t = adr_only.on_bar(bar(1, 22.20, 22.35, 22.10, 22.30), aeva)
+    check("ADR-only: still misses on the follow-through bar", t, None)
+
+    both = UndercutRally(
+        min_excursion_adr=0.1, min_excursion_pct=0.5, min_reclaim_adr=0.1
+    )
+    both.on_bar(bar(0, 22.35, 22.40, 22.05, 22.27), aeva)  # arm, low=22.05
+    both.on_bar(bar(1, 22.20, 22.35, 22.10, 22.30), aeva)  # reclaim too weak yet
+    both.on_bar(bar(2, 22.39, 22.47, 22.21, 22.46), aeva)  # reclaim still short
+    t2 = both.on_bar(bar(3, 22.45, 22.69, 22.45, 22.57), aeva)  # reclaim clears 0.1x
+    assert t2 is not None, (
+        "the OR filter should catch the same undercut ADR-only missed"
+    )
+    check(
+        "excursion_adr still fails on its own", t2.extras["excursion_adr"] < 0.1, True
+    )
+    check("excursion_pct is what let it through", t2.extras["excursion_pct"], 0.8989)
+
+
+def test_excursion_or_semantics() -> None:
+    """Direct coverage of the OR helper's degenerate cases."""
+    from astor.core.setups import _excursion_passes
+
+    # Both configured, ADR passes, pct fails -> OR passes.
+    ok, pct = _excursion_passes(
+        excursion=2.0,
+        level_value=100.0,
+        adr=10.0,
+        min_excursion_adr=0.1,
+        min_excursion_pct=5.0,
+    )
+    check("adr side alone can carry the OR", ok, True)
+    check("pct computed regardless of which side passed", pct, 2.0)
+
+    # Both configured, ADR fails, pct passes -> OR passes (the AEVA shape).
+    ok2, _ = _excursion_passes(
+        excursion=1.0,
+        level_value=100.0,
+        adr=100.0,
+        min_excursion_adr=0.5,
+        min_excursion_pct=0.5,
+    )
+    check("pct side alone can carry the OR", ok2, True)
+
+    # Both configured, both fail -> rejected.
+    ok3, _ = _excursion_passes(
+        excursion=0.1,
+        level_value=100.0,
+        adr=100.0,
+        min_excursion_adr=0.5,
+        min_excursion_pct=5.0,
+    )
+    check("both failing rejects", ok3, False)
+
+    # Both configured, ADR unscalable (adr=0) -> degrades to pct-only, not
+    # auto-pass. This is the case that distinguishes "drop from the OR" from
+    # "count as a pass": if unscalable auto-passed, a bad pct would slip through.
+    ok4, _ = _excursion_passes(
+        excursion=0.1,
+        level_value=100.0,
+        adr=0.0,
+        min_excursion_adr=0.5,
+        min_excursion_pct=5.0,
+    )
+    check("unscalable ADR must not auto-pass when pct also fails", ok4, False)
+
+    ok5, _ = _excursion_passes(
+        excursion=1.0,
+        level_value=100.0,
+        adr=0.0,
+        min_excursion_adr=0.5,
+        min_excursion_pct=0.5,
+    )
+    check("unscalable ADR degrades cleanly to a real pct check", ok5, True)
+
+    # Neither configured -> filter fully off, matches pre-existing behaviour.
+    ok6, pct6 = _excursion_passes(
+        excursion=0.0001,
+        level_value=100.0,
+        adr=100.0,
+        min_excursion_adr=0.0,
+        min_excursion_pct=0.0,
+    )
+    check("no thresholds configured means no filtering at all", ok6, True)
+    check("excursion_pct is still reported even when unused as a filter", pct6, 0.0001)
+
+
 def test_store_view_keeps_eastern_time() -> None:
     """The view must report the session's own clock, not UTC.
 

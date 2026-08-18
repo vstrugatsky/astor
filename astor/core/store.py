@@ -65,6 +65,7 @@ SELECT
              json_extract(t.extras_json, '$.bars_above'))     AS bars_beyond,
     json_extract(t.extras_json, '$.bars_armed')               AS bars_armed,
     json_extract(t.extras_json, '$.excursion_adr')            AS excursion_adr,
+    json_extract(t.extras_json, '$.excursion_pct')            AS excursion_pct,
     json_extract(t.extras_json, '$.reclaim_adr')              AS reclaim_adr,
     json_extract(t.extras_json, '$.adr_pct')                  AS adr_pct,
     -- detection_ts equals bar_end exactly in Replay, so showing both is noise.

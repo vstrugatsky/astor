@@ -70,6 +70,7 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         "setups": [s.name for s in setups],
         "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
         "min_excursion_adr": args.min_excursion_adr,
+        "min_excursion_pct": args.min_excursion_pct,
         "min_reclaim_adr": args.min_reclaim_adr,
         "adr_sessions": args.adr_sessions,
     }
@@ -96,12 +97,20 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         ", ".join(str(s) for s in sorted(prior_sessions)),
     )
 
-    # Filters are scaled by ADR, so a symbol without ADR cannot be filtered.
-    # Surface that rather than letting it look like a clean unfiltered pass.
+    # Reclaim is ADR-only, so a symbol without ADR loses that filter outright.
+    # Excursion has a percent fallback, so it only goes unfiltered if neither
+    # measure is configured or applicable -- surface each case distinctly
+    # rather than letting either look like a clean, deliberately unfiltered pass.
     no_adr = sorted(s for s, lv in levels.items() if lv.adr <= 0)
-    if no_adr and (args.min_excursion_adr or args.min_reclaim_adr):
+    if no_adr and args.min_reclaim_adr:
         logger.warning(
-            "No ADR for %s -- filters cannot be scaled, these run unfiltered",
+            "No ADR for %s -- reclaim filter cannot be scaled, runs unfiltered",
+            ", ".join(no_adr),
+        )
+    if no_adr and args.min_excursion_adr and not args.min_excursion_pct:
+        logger.warning(
+            "No ADR for %s -- excursion filter cannot be scaled"
+            " (no --min-excursion-pct fallback configured), runs unfiltered",
             ", ".join(no_adr),
         )
 
@@ -109,11 +118,13 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         "U&R": {
             "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
             "min_excursion_adr": args.min_excursion_adr,
+            "min_excursion_pct": args.min_excursion_pct,
             "min_reclaim_adr": args.min_reclaim_adr,
         },
         "O&F": {
             "allow_same_bar_fail": args.allow_same_bar_reclaim,
             "min_excursion_adr": args.min_excursion_adr,
+            "min_excursion_pct": args.min_excursion_pct,
             "min_reclaim_adr": args.min_reclaim_adr,
         },
     }
@@ -156,7 +167,8 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
             f"{min(adrs):.2f}% - {max(adrs):.2f}% across symbols"
         )
     print(
-        f"Filters             : excursion >= {args.min_excursion_adr}x ADR, "
+        f"Filters             : excursion >= {args.min_excursion_adr}x ADR"
+        f" or {args.min_excursion_pct}% of level, "
         f"reclaim >= {args.min_reclaim_adr}x ADR"
     )
     print(f"Bars fed to scanner : {fed}")
@@ -169,19 +181,24 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
     if triggers:
         print(
             f"\n{'time':<9} {'symbol':<7} {'setup':<5} {'price':>9} {'level':>9}"
-            f" {'exc':>7} {'rec':>7} {'beyond':>7} {'armed':>6}"
+            f" {'exc(adr)':>9} {'exc(%)':>7} {'rec':>7} {'beyond':>7} {'armed':>6}"
         )
         print("-" * 78)
         for t in triggers:
             e = t.extras
             nbars = e.get("bars_below", e.get("bars_above"))
-            exc, rec = e.get("excursion_adr"), e.get("reclaim_adr")
+            exc, exc_pct, rec = (
+                e.get("excursion_adr"),
+                e.get("excursion_pct"),
+                e.get("reclaim_adr"),
+            )
             exc_s = f"{exc:.2f}x" if exc is not None else "-"
+            exc_pct_s = f"{exc_pct:.2f}%" if exc_pct is not None else "-"
             rec_s = f"{rec:.2f}x" if rec is not None else "-"
             print(
                 f"{t.bar_start:%H:%M:%S}  {t.symbol:<7} {t.setup:<5} "
                 f"{t.trigger_price:>9.2f} {t.level_value:>9.2f} "
-                f"{exc_s:>7} {rec_s:>7} {nbars:>7} {e.get('bars_armed', 0):>6}"
+                f"{exc_s:>9} {exc_pct_s:>7} {rec_s:>7} {nbars:>7} {e.get('bars_armed', 0):>6}"
             )
 
         by_symbol: dict[str, int] = {}
@@ -223,6 +240,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="Minimum breach depth past the level, in ADR units (0 = off)",
+    )
+    r.add_argument(
+        "--min-excursion-pct",
+        type=float,
+        default=0.5,
+        help="Minimum breach depth past the level, as %% of the level's price "
+        "(0 = off). Excursion passes on EITHER this OR --min-excursion-adr, "
+        "whichever is more lenient -- high-ADR names break their levels by a "
+        "smaller fraction of ADR, so ADR alone under-catches them.",
     )
     r.add_argument(
         "--min-reclaim-adr",
