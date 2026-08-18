@@ -181,24 +181,28 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
     if triggers:
         print(
             f"\n{'time':<9} {'symbol':<7} {'setup':<5} {'price':>9} {'level':>9}"
-            f" {'exc(adr)':>9} {'exc(%)':>7} {'rec':>7} {'beyond':>7} {'armed':>6}"
+            f" {'exc(adr)':>9} {'exc(%)':>7} {'rec(adr)':>9} {'rec(%)':>7}"
+            f" {'beyond':>7} {'armed':>6}"
         )
-        print("-" * 78)
+        print("-" * 88)
         for t in triggers:
             e = t.extras
             nbars = e.get("bars_below", e.get("bars_above"))
-            exc, exc_pct, rec = (
+            exc, exc_pct, rec, rec_pct = (
                 e.get("excursion_adr"),
                 e.get("excursion_pct"),
                 e.get("reclaim_adr"),
+                e.get("reclaim_pct"),
             )
             exc_s = f"{exc:.2f}x" if exc is not None else "-"
             exc_pct_s = f"{exc_pct:.2f}%" if exc_pct is not None else "-"
             rec_s = f"{rec:.2f}x" if rec is not None else "-"
+            rec_pct_s = f"{rec_pct:.2f}%" if rec_pct is not None else "-"
             print(
                 f"{t.bar_start:%H:%M:%S}  {t.symbol:<7} {t.setup:<5} "
                 f"{t.trigger_price:>9.2f} {t.level_value:>9.2f} "
-                f"{exc_s:>9} {exc_pct_s:>7} {rec_s:>7} {nbars:>7} {e.get('bars_armed', 0):>6}"
+                f"{exc_s:>9} {exc_pct_s:>7} {rec_s:>9} {rec_pct_s:>7}"
+                f" {nbars:>7} {e.get('bars_armed', 0):>6}"
             )
 
         by_symbol: dict[str, int] = {}

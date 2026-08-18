@@ -449,6 +449,84 @@ def test_excursion_or_semantics() -> None:
     check("excursion_pct is still reported even when unused as a filter", pct6, 0.0001)
 
 
+def test_reclaim_pct_recorded() -> None:
+    """reclaim_pct is a diagnostic, always recorded -- not gated by any filter,
+    same as excursion_pct."""
+    s = UndercutRally()
+    s.on_bar(bar(0, 101, 101, 99, 99.5), LEVELS)  # arm, PDL=100
+    t = s.on_bar(bar(1, 99.5, 101, 99.5, 100.5), LEVELS)  # close 0.5 above PDL
+    assert t is not None
+    check("reclaim_pct = 0.5/100*100", t.extras["reclaim_pct"], 0.5)
+
+    o = OvershootFail()
+    o.on_bar(bar(0, 104, 106, 104, 105.5), LEVELS)  # arm, PDH=105
+    t2 = o.on_bar(bar(1, 105.5, 105.5, 104.475, 104.475), LEVELS)  # 0.525 below PDH
+    assert t2 is not None
+    check("reclaim_pct = 0.525/105*100", t2.extras["reclaim_pct"], 0.5)
+
+
+def test_latest_triggers_spans_sessions_and_supersedes_reruns() -> None:
+    """latest_triggers is keyed on session, not global recency.
+
+    Two different sessions (Friday, then today) must both appear -- that is
+    the whole point of covering "more than one run". But a second replay of
+    the SAME session (a threshold rerun) must supersede the first, not add to
+    it, so the view never shows two conflicting versions of one session's
+    triggers side by side. trigger_detail keeps the full, undeduped history
+    for anyone who wants to audit an old run explicitly by run_id.
+    """
+    import tempfile
+
+    from astor.core.store import TriggerStore
+    from astor.core.types import Trigger
+
+    store = TriggerStore(Path(tempfile.mkdtemp()) / "t.db")
+
+    def record_run(run_id: str, session: str, price: float) -> None:
+        # The real replay driver always keeps bar dates matching the run's own
+        # --date (fetch_bars skips any bar whose date differs), so bar_start
+        # and the run's params session never disagree in practice. Deriving
+        # bar_start from `session` here keeps the fixture honest to that.
+        session_open = datetime.fromisoformat(f"{session}T09:30:00").replace(tzinfo=ET)
+        store.start_run(run_id, "replay", {"session": session})
+        store.record(
+            run_id,
+            Trigger(
+                symbol="TEST",
+                setup="U&R",
+                direction="long",
+                trigger_price=price,
+                bar_start=session_open,
+                bar_end=session_open + timedelta(minutes=1),
+                level_name="PDL",
+                level_value=100.0,
+                extras={"bars_below": 1, "bars_armed": 1, "excursion_adr": 0.2},
+            ),
+            session_open + timedelta(minutes=1),
+        )
+        store.commit()
+
+    record_run("s1-a", "2026-08-14", 100.1)  # first attempt at Friday
+    record_run("s2-a", "2026-08-17", 200.2)  # an unrelated later session
+    record_run("s1-b", "2026-08-14", 100.9)  # rerun of Friday: supersedes s1-a
+
+    rows = store.conn.execute(
+        "SELECT run_id, session, trigger_price FROM latest_triggers ORDER BY session"
+    ).fetchall()
+    check("two distinct sessions, reruns deduped to one row each", len(rows), 2)
+    by_session = {r[1]: (r[0], r[2]) for r in rows}
+    check(
+        "Friday shows the rerun, not the original",
+        by_session["2026-08-14"],
+        ("s1-b", 100.9),
+    )
+    check("today's single run shows too", by_session["2026-08-17"], ("s2-a", 200.2))
+
+    total = store.conn.execute("SELECT count(*) FROM trigger_detail").fetchone()[0]
+    check("trigger_detail retains the full history, undeduped", total, 3)
+    store.close()
+
+
 def test_store_view_keeps_eastern_time() -> None:
     """The view must report the session's own clock, not UTC.
 

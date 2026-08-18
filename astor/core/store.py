@@ -67,6 +67,7 @@ SELECT
     json_extract(t.extras_json, '$.excursion_adr')            AS excursion_adr,
     json_extract(t.extras_json, '$.excursion_pct')            AS excursion_pct,
     json_extract(t.extras_json, '$.reclaim_adr')              AS reclaim_adr,
+    json_extract(t.extras_json, '$.reclaim_pct')              AS reclaim_pct,
     json_extract(t.extras_json, '$.adr_pct')                  AS adr_pct,
     -- detection_ts equals bar_end exactly in Replay, so showing both is noise.
     -- The difference is the only part that carries information, and it is what
@@ -75,10 +76,34 @@ SELECT
                                                               AS latency_sec
 FROM triggers t;
 
+-- The most recent run *per session date*, not the single most recent run
+-- overall. Rerunning Friday and then today's session are different sessions,
+-- so latest_triggers should show both -- but rerunning the SAME session twice
+-- (a threshold tweak) should still show only the newer of the two, not both.
+-- Keying on session rather than global recency gets both properties: it grows
+-- to cover every session you have replayed, while a rerun of any one session
+-- transparently supersedes its own earlier attempt.
+DROP VIEW IF EXISTS latest_run_per_session;
+CREATE VIEW latest_run_per_session AS
+SELECT run_id, session, created_at FROM (
+    SELECT
+        r.run_id,
+        json_extract(r.params_json, '$.session') AS session,
+        r.created_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY json_extract(r.params_json, '$.session')
+            ORDER BY r.created_at DESC, r.run_id DESC
+        ) AS rn
+    FROM runs r
+    WHERE r.mode = 'replay'
+)
+WHERE rn = 1;
+
 DROP VIEW IF EXISTS latest_triggers;
 CREATE VIEW latest_triggers AS
 SELECT * FROM trigger_detail
-WHERE run_id = (SELECT run_id FROM runs ORDER BY created_at DESC, run_id DESC LIMIT 1);
+WHERE run_id IN (SELECT run_id FROM latest_run_per_session)
+ORDER BY session, trigger_time;
 """
 
 

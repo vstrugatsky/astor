@@ -53,6 +53,13 @@ from typing import ClassVar
 from astor.core.types import BarEvent, DailyLevels, Trigger
 
 
+def _pct_of_level(amount: float, level_value: float) -> float | None:
+    """amount expressed as a percent of the level price, e.g. excursion or
+    reclaim distance against PDL/PDH. Always computed where possible -- this is
+    a diagnostic recorded regardless of whether anything filters on it."""
+    return round(amount / level_value * 100.0, 4) if level_value > 0 else None
+
+
 def _excursion_passes(
     excursion: float,
     level_value: float,
@@ -70,9 +77,7 @@ def _excursion_passes(
     filter entirely, matching earlier ADR-only behaviour when only
     min_excursion_adr is set.
     """
-    excursion_pct = (
-        round(excursion / level_value * 100.0, 4) if level_value > 0 else None
-    )
+    excursion_pct = _pct_of_level(excursion, level_value)
 
     if min_excursion_adr <= 0 and min_excursion_pct <= 0:
         return True, excursion_pct
@@ -154,6 +159,7 @@ class UndercutRally(Setup):
         )
         if not excursion_ok:
             return None  # stay armed: too shallow by every applicable measure
+        reclaim_pct = _pct_of_level(reclaim, pdl)
         if adr > 0 and reclaim < self.min_reclaim_adr * adr:
             return None  # stay armed: wait for a more convincing reclaim
 
@@ -175,6 +181,7 @@ class UndercutRally(Setup):
                 "excursion_adr": round(excursion / adr, 4) if adr > 0 else None,
                 "excursion_pct": excursion_pct,
                 "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,
+                "reclaim_pct": reclaim_pct,
             },
         )
         self._undercut_low = None
@@ -238,6 +245,7 @@ class OvershootFail(Setup):
         )
         if not excursion_ok:
             return None
+        reclaim_pct = _pct_of_level(reclaim, pdh)
         if adr > 0 and reclaim < self.min_reclaim_adr * adr:
             return None
 
@@ -259,6 +267,7 @@ class OvershootFail(Setup):
                 "excursion_adr": round(excursion / adr, 4) if adr > 0 else None,
                 "excursion_pct": excursion_pct,
                 "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,
+                "reclaim_pct": reclaim_pct,
             },
         )
         self._overshoot_high = None
