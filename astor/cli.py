@@ -72,6 +72,7 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         "min_excursion_adr": args.min_excursion_adr,
         "min_excursion_pct": args.min_excursion_pct,
         "min_reclaim_adr": args.min_reclaim_adr,
+        "min_reclaim_pct": args.min_reclaim_pct,
         "adr_sessions": args.adr_sessions,
     }
 
@@ -97,20 +98,21 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         ", ".join(str(s) for s in sorted(prior_sessions)),
     )
 
-    # Reclaim is ADR-only, so a symbol without ADR loses that filter outright.
-    # Excursion has a percent fallback, so it only goes unfiltered if neither
-    # measure is configured or applicable -- surface each case distinctly
-    # rather than letting either look like a clean, deliberately unfiltered pass.
+    # Both excursion and reclaim have a percent fallback now, so either only
+    # goes unfiltered for a symbol if its ADR-scaled check is configured but
+    # unscalable AND no percent fallback is configured -- surface that case
+    # rather than letting it look like a clean, deliberately unfiltered pass.
     no_adr = sorted(s for s, lv in levels.items() if lv.adr <= 0)
-    if no_adr and args.min_reclaim_adr:
-        logger.warning(
-            "No ADR for %s -- reclaim filter cannot be scaled, runs unfiltered",
-            ", ".join(no_adr),
-        )
     if no_adr and args.min_excursion_adr and not args.min_excursion_pct:
         logger.warning(
             "No ADR for %s -- excursion filter cannot be scaled"
             " (no --min-excursion-pct fallback configured), runs unfiltered",
+            ", ".join(no_adr),
+        )
+    if no_adr and args.min_reclaim_adr and not args.min_reclaim_pct:
+        logger.warning(
+            "No ADR for %s -- reclaim filter cannot be scaled"
+            " (no --min-reclaim-pct fallback configured), runs unfiltered",
             ", ".join(no_adr),
         )
 
@@ -120,12 +122,14 @@ async def cmd_replay(args: argparse.Namespace) -> int:
             "min_excursion_adr": args.min_excursion_adr,
             "min_excursion_pct": args.min_excursion_pct,
             "min_reclaim_adr": args.min_reclaim_adr,
+            "min_reclaim_pct": args.min_reclaim_pct,
         },
         "O&F": {
             "allow_same_bar_fail": args.allow_same_bar_reclaim,
             "min_excursion_adr": args.min_excursion_adr,
             "min_excursion_pct": args.min_excursion_pct,
             "min_reclaim_adr": args.min_reclaim_adr,
+            "min_reclaim_pct": args.min_reclaim_pct,
         },
     }
     scanner = Scanner(levels, setups, kwargs)
@@ -169,7 +173,7 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
     print(
         f"Filters             : excursion >= {args.min_excursion_adr}x ADR"
         f" or {args.min_excursion_pct}% of level, "
-        f"reclaim >= {args.min_reclaim_adr}x ADR"
+        f"reclaim >= {args.min_reclaim_adr}x ADR or {args.min_reclaim_pct}% of level"
     )
     print(f"Bars fed to scanner : {fed}")
     print(f"Bars evaluated      : {scanner.bars_evaluated}")
@@ -259,6 +263,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="Minimum reclaim distance past the level, in ADR units (0 = off)",
+    )
+    r.add_argument(
+        "--min-reclaim-pct",
+        type=float,
+        default=0.5,
+        help="Minimum reclaim distance past the level, as %% of the level's "
+        "price (0 = off). Reclaim passes on EITHER this OR --min-reclaim-adr, "
+        "same OR logic as excursion.",
     )
     r.add_argument(
         "--adr-sessions",

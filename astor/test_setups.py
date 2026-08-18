@@ -310,6 +310,46 @@ def test_reclaim_filter_rejects_limp_reclaim() -> None:
     check("reclaim in adr units", t.extras["reclaim_adr"], 0.12)
 
 
+def test_reclaim_pct_recovers_a_low_adr_reclaim() -> None:
+    """Reclaim's OR mirrors excursion's: AAPL's real reclaim cleared 0.1x ADR
+    at only ~0.21-0.26% of level on both replayed sessions, while MARA/YSS
+    repeat-fires cleared 0.5% at as little as 0.064x ADR. Neither measure alone
+    is right for every name; this is the reclaim-side proof the OR helps both
+    ways, not just for excursion.
+    """
+    # A name whose reclaim is real by percent but weak by ADR: mirrors AEVA's
+    # excursion shape, transplanted onto reclaim.
+    hi_adr = DailyLevels(
+        "HIADR",
+        date(2026, 8, 13),
+        pdh=105.0,
+        pdl=100.0,
+        adr_pct=11.0,
+        prev_close=100.0,
+        adr_sessions=14,
+    )  # ADR$ = 11.00; 0.1x ADR needs a $1.10 reclaim
+    adr_only = UndercutRally(min_excursion_adr=0.1, min_reclaim_adr=0.1)
+    adr_only.on_bar(bar(0, 101, 101, 95, 95.5), hi_adr)  # deep undercut, armed
+    # Close $0.60 above PDL: 0.60% of level, clears a 0.5% bar; only 0.055x ADR.
+    check(
+        "ADR-only reclaim misses a real 0.60%-of-level reclaim",
+        adr_only.on_bar(bar(1, 95.5, 100.6, 95.4, 100.6), hi_adr),
+        None,
+    )
+
+    both = UndercutRally(
+        min_excursion_adr=0.1,
+        min_excursion_pct=0.5,
+        min_reclaim_adr=0.1,
+        min_reclaim_pct=0.5,
+    )
+    both.on_bar(bar(0, 101, 101, 95, 95.5), hi_adr)
+    t = both.on_bar(bar(1, 95.5, 100.6, 95.4, 100.6), hi_adr)
+    assert t is not None, "reclaim OR should catch what ADR-only reclaim missed"
+    check("reclaim_adr still fails on its own", t.extras["reclaim_adr"] < 0.1, True)
+    check("reclaim_pct is what let it through", t.extras["reclaim_pct"], 0.6)
+
+
 def test_filters_apply_to_short_side() -> None:
     s = OvershootFail(min_excursion_adr=0.1, min_reclaim_adr=0.1)
     s.on_bar(bar(0, 105, 105.05, 105, 105.02), ADR_LEVELS)  # 0.05 over -> armed
@@ -383,67 +423,67 @@ def test_excursion_pct_recovers_aeva() -> None:
 
 def test_excursion_or_semantics() -> None:
     """Direct coverage of the OR helper's degenerate cases."""
-    from astor.core.setups import _excursion_passes
+    from astor.core.setups import _adr_or_pct_passes
 
     # Both configured, ADR passes, pct fails -> OR passes.
-    ok, pct = _excursion_passes(
-        excursion=2.0,
+    ok, pct = _adr_or_pct_passes(
+        amount=2.0,
         level_value=100.0,
         adr=10.0,
-        min_excursion_adr=0.1,
-        min_excursion_pct=5.0,
+        min_adr=0.1,
+        min_pct=5.0,
     )
     check("adr side alone can carry the OR", ok, True)
     check("pct computed regardless of which side passed", pct, 2.0)
 
     # Both configured, ADR fails, pct passes -> OR passes (the AEVA shape).
-    ok2, _ = _excursion_passes(
-        excursion=1.0,
+    ok2, _ = _adr_or_pct_passes(
+        amount=1.0,
         level_value=100.0,
         adr=100.0,
-        min_excursion_adr=0.5,
-        min_excursion_pct=0.5,
+        min_adr=0.5,
+        min_pct=0.5,
     )
     check("pct side alone can carry the OR", ok2, True)
 
     # Both configured, both fail -> rejected.
-    ok3, _ = _excursion_passes(
-        excursion=0.1,
+    ok3, _ = _adr_or_pct_passes(
+        amount=0.1,
         level_value=100.0,
         adr=100.0,
-        min_excursion_adr=0.5,
-        min_excursion_pct=5.0,
+        min_adr=0.5,
+        min_pct=5.0,
     )
     check("both failing rejects", ok3, False)
 
     # Both configured, ADR unscalable (adr=0) -> degrades to pct-only, not
     # auto-pass. This is the case that distinguishes "drop from the OR" from
     # "count as a pass": if unscalable auto-passed, a bad pct would slip through.
-    ok4, _ = _excursion_passes(
-        excursion=0.1,
+    ok4, _ = _adr_or_pct_passes(
+        amount=0.1,
         level_value=100.0,
         adr=0.0,
-        min_excursion_adr=0.5,
-        min_excursion_pct=5.0,
+        min_adr=0.5,
+        min_pct=5.0,
     )
     check("unscalable ADR must not auto-pass when pct also fails", ok4, False)
 
-    ok5, _ = _excursion_passes(
-        excursion=1.0,
+    ok5, _ = _adr_or_pct_passes(
+        amount=1.0,
         level_value=100.0,
         adr=0.0,
-        min_excursion_adr=0.5,
-        min_excursion_pct=0.5,
+        min_adr=0.5,
+        min_pct=0.5,
     )
     check("unscalable ADR degrades cleanly to a real pct check", ok5, True)
 
     # Neither configured -> filter fully off, matches pre-existing behaviour.
-    ok6, pct6 = _excursion_passes(
-        excursion=0.0001,
+    ok6, pct6 = _adr_or_pct_passes(
+        amount=0.0001,
         level_value=100.0,
         adr=100.0,
-        min_excursion_adr=0.0,
-        min_excursion_pct=0.0,
+        min_adr=0.0,
+        min_pct=0.0,
     )
     check("no thresholds configured means no filtering at all", ok6, True)
     check("excursion_pct is still reported even when unused as a filter", pct6, 0.0001)
