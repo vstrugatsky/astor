@@ -136,6 +136,44 @@ Two consequences worth deciding before the scanner is written:
 **Still unknown, needs an RTH run:** live update cadence, bar-completion
 latency, whether live streams gap, and the real concurrent-subscription ceiling.
 
+## RTH findings (Mon 2026-08-17, 09:45-10:20 ET)
+
+The four questions the off-hours run above couldn't answer. `observe` ran 50
+tickers (the user's watchlist first, then filler to 50) for 20 minutes starting
+09:45 ET; `ramp` ran separately afterward, 10 tickers/wave up to the pool's
+limit, 60s dwell per wave. Raw events:
+`spike/results/observe_20260817_094354.jsonl`,
+`spike/results/ramp_20260817_102143.jsonl`.
+
+**6. Update cadence and bar-completion latency both hold, roughly.** Cadence:
+median 5.0s, mean 6.1s, p95 10.1s, max 60.2s (n=10,040) — close to the doc's
+4-6s claim, with a longer tail. Bar-completion latency — how long after a 1-min
+bar closes before Astor could act on it — median 5.8s, p95 6.0s, max 9.9s
+(n=1,018). **This is the floor on Notify latency**, before any of Astor's own
+processing: a setup that completes at bar-close is not alertable until roughly
+6s later, minimum, by IBKR's own delivery.
+
+**7. Zero live gaps, on this sample.** All 50 streams produced updates for the
+full 20-minute window, including the thin names (TII, SWMR, ZLAB) that showed
+heavy zero-volume padding in the Sunday historical pull (finding 5). That's
+some evidence the live/replay asymmetry flagged above is less severe than
+feared — but 20 minutes on 3 thin names outside the open is a small sample for
+a claim this load-bearing. Prefer the wall-clock-timer design regardless; it
+doesn't depend on the answer.
+
+**8. Concurrency ceiling is still unmeasured — but at least 70.** Every wave up
+to 70 concurrent `keepUpToDate` streams subscribed cleanly and produced updates
+during its dwell: zero subscribe failures, zero IBKR errors. The ramp didn't
+fail at 70 -- it ran out of *unique* tickers (the ticker file de-duplicated
+92 raw entries to 71 before anything reached IBKR, since several user tickers
+overlapped the filler list). So this proves "at least 70," not "exactly 70."
+Comfortably past the doc's assumed 50-ticker ceiling and past the user's
+current watchlist size either way.
+
+**Bottom line:** nothing here breaks the architecture. The one number worth
+keeping in mind going forward is the ~6s Notify latency floor — real, and not
+something Astor's own code can improve on.
+
 ## Known IBKR quirks this is built around
 
 - `keepUpToDate=True` requires `endDateTime=""`.
