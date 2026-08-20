@@ -22,11 +22,27 @@ from ib_async import IB
 from astor.core.scanner import Scanner
 from astor.core.store import TriggerStore
 from astor.core.types import BarEvent, Trigger
-from astor.drivers.replay import ET, REQUEST_TIMEOUT, ReplayDriver, parse_bar_seconds, to_et
+from astor.drivers.replay import ET, ReplayDriver, parse_bar_seconds, to_et
 
 logger = logging.getLogger(__name__)
 
 RTH_OPEN = time(9, 30)
+
+# How long to wait between activating successive symbols in a batch (open
+# transition, or a multi-symbol post-open `add`). `_subscribe`'s
+# reqHistoricalData(keepUpToDate=True) call is never gated by the request
+# semaphore the way every other IB call in this codebase is -- it returns
+# immediately rather than awaiting a response, so semaphore-style throttling
+# doesn't apply to it. Firing 30 of those plus their backfills at once (as
+# happened at the 2026-08-20 open) appears to overwhelm IB: every symbol in
+# that batch timed out. Pacing activation out, symbol by symbol, is the fix.
+ACTIVATION_PACE_SECONDS = 0.75
+
+# Backfill is opportunistic -- AVWAP/RVOL continuity, not correctness-critical
+# the way a stuck subscribe would be -- so it gets a much shorter timeout than
+# REQUEST_TIMEOUT. A backfill that's going to fail should fail fast, not eat
+# most of a second per symbol out of an already-paced activation batch.
+BACKFILL_TIMEOUT = 15.0
 
 
 def _format_trigger_line(t: Trigger) -> str:
@@ -129,12 +145,7 @@ class LiveDriver:
                 to_activate.append(sym)
 
         if to_activate:
-            await asyncio.gather(
-                *[
-                    self._activate(scanner, contracts[s], s, run_id, store)
-                    for s in to_activate
-                ]
-            )
+            await self._activate_all(scanner, contracts, to_activate, run_id, store)
             for s in to_activate:
                 results[s] = "live"
 
@@ -179,16 +190,29 @@ class LiveDriver:
             return
         contracts = await self._ref.qualify(to_activate)
         self._pending.clear()
-        await asyncio.gather(
-            *[
-                self._activate(scanner, contracts[s], s, run_id, store)
-                for s in to_activate
-                if s in contracts
-            ]
-        )
+        await self._activate_all(scanner, contracts, to_activate, run_id, store)
         logger.info("Open transition: %d symbol(s) now live", len(to_activate))
 
     # -- activation: backfill + subscribe ----------------------------------
+
+    async def _activate_all(
+        self,
+        scanner: Scanner,
+        contracts: dict[str, object],
+        symbols: list[str],
+        run_id: str,
+        store: TriggerStore,
+    ) -> None:
+        """Activate a batch of symbols one at a time, paced by
+        ACTIVATION_PACE_SECONDS -- see that constant's comment for why this
+        can't just be asyncio.gather'd like every other batch IB call here.
+        """
+        for sym in symbols:
+            contract = contracts.get(sym)
+            if contract is None:
+                continue
+            await self._activate(scanner, contract, sym, run_id, store)
+            await asyncio.sleep(ACTIVATION_PACE_SECONDS)
 
     async def _activate(
         self, scanner: Scanner, contract, symbol: str, run_id: str, store: TriggerStore
@@ -206,7 +230,7 @@ class LiveDriver:
                     whatToShow="TRADES",
                     useRTH=True,
                     formatDate=1,
-                    timeout=REQUEST_TIMEOUT,
+                    timeout=BACKFILL_TIMEOUT,
                 )
             for b in bars or []:
                 bar_event = self._to_bar_event(symbol, b)
@@ -215,7 +239,7 @@ class LiveDriver:
                 scanner.backfill_bar(bar_event)
                 self._last_bar_start[symbol] = bar_event.start
 
-        self._subscribe(scanner, contract, symbol, run_id, store)
+        await self._subscribe(scanner, contract, symbol, run_id, store)
 
     def _to_bar_event(self, symbol: str, ib_bar) -> BarEvent | None:
         start = to_et(ib_bar.date)
@@ -232,10 +256,17 @@ class LiveDriver:
             volume=float(ib_bar.volume),
         )
 
-    def _subscribe(
+    async def _subscribe(
         self, scanner: Scanner, contract, symbol: str, run_id: str, store: TriggerStore
     ) -> None:
-        live_bars = self.ib.reqHistoricalData(
+        # reqHistoricalData (no Async suffix) is a sync wrapper that runs its
+        # own loop.run_until_complete() internally -- calling it from code
+        # already running on an event loop (every caller here) hits asyncio's
+        # "this event loop is already running" guard and crashes the process.
+        # reqHistoricalDataAsync is the actual implementation underneath it
+        # and supports keepUpToDate identically; awaiting it directly avoids
+        # the nested-loop problem entirely.
+        live_bars = await self.ib.reqHistoricalDataAsync(
             contract,
             endDateTime="",
             durationStr="2 D",
