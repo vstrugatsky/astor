@@ -187,7 +187,7 @@ def test_bars_beyond_counts_only_bars_past_the_level() -> None:
     overstated how sustained the breach was -- AAPL reported 52 when only 39
     bars had actually broken the level.
     """
-    s = UndercutRally(min_reclaim_adr=0.1)  # needs $1.00 reclaim on $10 ADR
+    s = UndercutRally(min_reclaim_pct=1.0)  # needs a 1% reclaim on PDL=100
     s.on_bar(bar(0, 101, 101, 97, 97.5), ADR_LEVELS)  # breaks level, armed
     # Three bars back above PDL but reclaiming too weakly to fire. They are
     # armed bars, not bars below the level.
@@ -204,7 +204,7 @@ def test_bars_beyond_counts_only_bars_past_the_level() -> None:
 
 
 def test_bars_above_counts_only_bars_past_the_level() -> None:
-    s = OvershootFail(min_reclaim_adr=0.1)
+    s = OvershootFail(min_reclaim_pct=1.0)
     s.on_bar(bar(0, 105, 108, 105, 107.5), ADR_LEVELS)  # breaks PDH, armed
     for i in (1, 2):
         check(
@@ -225,7 +225,7 @@ def test_reclaim_may_span_many_bars() -> None:
     the setup stays armed, so price may grind up over many bars and fire when it
     finally gets far enough past.
     """
-    s = UndercutRally(min_reclaim_adr=0.1)  # needs close >= 101.00
+    s = UndercutRally(min_reclaim_pct=1.0)  # needs close >= 101.00 (PDL=100)
     s.on_bar(bar(0, 101, 101, 97, 97.5), ADR_LEVELS)
     closes = [100.2, 100.5, 100.8, 100.95]  # creeping up, all short of 101.00
     for i, c in enumerate(closes, start=1):
@@ -280,8 +280,8 @@ def test_adr_property() -> None:
 
 
 def test_excursion_filter_rejects_shallow_breach() -> None:
-    """A 1-cent undercut is chop, not a setup, at a 0.1 ADR threshold."""
-    s = UndercutRally(min_excursion_adr=0.1)  # needs >= $1.00 of undercut
+    """A 1-cent undercut is chop, not a setup, at a 1%-of-level threshold."""
+    s = UndercutRally(min_excursion_pct=1.0)  # needs >= $1.00 of undercut on PDL=100
     s.on_bar(bar(0, 100.5, 100.5, 99.99, 100.2), ADR_LEVELS)  # 0.01 deep -> armed
     check(
         "shallow breach suppressed",
@@ -297,7 +297,7 @@ def test_excursion_filter_rejects_shallow_breach() -> None:
 
 def test_reclaim_filter_rejects_limp_reclaim() -> None:
     """Closing a cent past the level is not a reclaim worth an alert."""
-    s = UndercutRally(min_reclaim_adr=0.1)  # needs close >= $1.00 above PDL
+    s = UndercutRally(min_reclaim_pct=1.0)  # needs close >= $1.00 above PDL (=100)
     s.on_bar(bar(0, 101, 101, 97, 97.5), ADR_LEVELS)  # deep undercut, armed
     check(
         "limp reclaim suppressed",
@@ -310,48 +310,8 @@ def test_reclaim_filter_rejects_limp_reclaim() -> None:
     check("reclaim in adr units", t.extras["reclaim_adr"], 0.12)
 
 
-def test_reclaim_pct_recovers_a_low_adr_reclaim() -> None:
-    """Reclaim's OR mirrors excursion's: AAPL's real reclaim cleared 0.1x ADR
-    at only ~0.21-0.26% of level on both replayed sessions, while MARA/YSS
-    repeat-fires cleared 0.5% at as little as 0.064x ADR. Neither measure alone
-    is right for every name; this is the reclaim-side proof the OR helps both
-    ways, not just for excursion.
-    """
-    # A name whose reclaim is real by percent but weak by ADR: mirrors AEVA's
-    # excursion shape, transplanted onto reclaim.
-    hi_adr = DailyLevels(
-        "HIADR",
-        date(2026, 8, 13),
-        pdh=105.0,
-        pdl=100.0,
-        adr_pct=11.0,
-        prev_close=100.0,
-        adr_sessions=14,
-    )  # ADR$ = 11.00; 0.1x ADR needs a $1.10 reclaim
-    adr_only = UndercutRally(min_excursion_adr=0.1, min_reclaim_adr=0.1)
-    adr_only.on_bar(bar(0, 101, 101, 95, 95.5), hi_adr)  # deep undercut, armed
-    # Close $0.60 above PDL: 0.60% of level, clears a 0.5% bar; only 0.055x ADR.
-    check(
-        "ADR-only reclaim misses a real 0.60%-of-level reclaim",
-        adr_only.on_bar(bar(1, 95.5, 100.6, 95.4, 100.6), hi_adr),
-        None,
-    )
-
-    both = UndercutRally(
-        min_excursion_adr=0.1,
-        min_excursion_pct=0.5,
-        min_reclaim_adr=0.1,
-        min_reclaim_pct=0.5,
-    )
-    both.on_bar(bar(0, 101, 101, 95, 95.5), hi_adr)
-    t = both.on_bar(bar(1, 95.5, 100.6, 95.4, 100.6), hi_adr)
-    assert t is not None, "reclaim OR should catch what ADR-only reclaim missed"
-    check("reclaim_adr still fails on its own", t.extras["reclaim_adr"] < 0.1, True)
-    check("reclaim_pct is what let it through", t.extras["reclaim_pct"], 0.6)
-
-
 def test_filters_apply_to_short_side() -> None:
-    s = OvershootFail(min_excursion_adr=0.1, min_reclaim_adr=0.1)
+    s = OvershootFail(min_excursion_pct=1.0, min_reclaim_pct=1.0)
     s.on_bar(bar(0, 105, 105.05, 105, 105.02), ADR_LEVELS)  # 0.05 over -> armed
     check(
         "shallow overshoot suppressed",
@@ -366,26 +326,28 @@ def test_filters_apply_to_short_side() -> None:
     )
     t = s.on_bar(bar(4, 104.99, 105, 103, 103.5), ADR_LEVELS)
     assert t is not None, "expected fire on a decisive fail"
+    # excursion_adr/reclaim_adr are recorded as diagnostics regardless of the
+    # (now percent-only) filter -- levels.adr is still available here.
     check("excursion adr", t.extras["excursion_adr"], 0.2)
     check("reclaim adr", t.extras["reclaim_adr"], 0.15)
 
 
-def test_filters_skipped_without_adr() -> None:
-    """No ADR means no scale; filter rather than reject everything silently."""
-    s = UndercutRally(min_excursion_adr=99.0, min_reclaim_adr=99.0)
-    s.on_bar(bar(0, 101, 101, 99, 99.5), LEVELS)  # LEVELS has adr_pct 0
+def test_filters_work_without_adr() -> None:
+    """Filtering is percent-only now, so it never depends on ADR being
+    available -- only the excursion_adr/reclaim_adr diagnostics do."""
+    s = UndercutRally(min_excursion_pct=0.5, min_reclaim_pct=0.5)
+    s.on_bar(bar(0, 101, 101, 99, 99.5), LEVELS)  # LEVELS has adr_pct 0, PDL=100
     t = s.on_bar(bar(1, 99.5, 101, 99.5, 100.5), LEVELS)
-    assert t is not None, "unscalable filters must not silently suppress"
-    check("adr units unavailable", t.extras["excursion_adr"], None)
+    assert t is not None, "percent filter must not depend on ADR availability"
+    check("adr diagnostic unavailable", t.extras["excursion_adr"], None)
 
 
-def test_excursion_pct_recovers_aeva() -> None:
-    """The exact case that motivated the OR: AEVA's real U&R on 2026-08-14.
-
-    PDL=22.25, ADR%=11.00 -> ADR$=2.4662. The undercut bottomed at 22.05, a
-    $0.20 breach -- 0.081x ADR, under a 0.1x threshold by five cents. As a
-    fraction of the level (0.20/22.25 = 0.899%) it clears a 0.5% floor easily.
-    ADR-only misses it; ADR-or-0.5%-of-level catches it.
+def test_excursion_pct_catches_aeva() -> None:
+    """AEVA's real U&R on 2026-08-14: PDL=22.25, undercut bottomed at 22.05, a
+    $0.20 breach -- 0.8989% of level, clears a 0.5% floor comfortably. This is
+    the case that originally motivated a flat-percent excursion measure
+    (ADR alone missed it by five cents) before ADR was dropped from filtering
+    entirely.
     """
     aeva = DailyLevels(
         "AEVA",
@@ -396,97 +358,49 @@ def test_excursion_pct_recovers_aeva() -> None:
         prev_close=22.42,
         adr_sessions=14,
     )
-    adr_only = UndercutRally(min_excursion_adr=0.1, min_reclaim_adr=0.1)
-    check(
-        "ADR-only misses the real undercut",
-        adr_only.on_bar(bar(0, 22.35, 22.40, 22.05, 22.27), aeva),
-        None,
-    )
-    t = adr_only.on_bar(bar(1, 22.20, 22.35, 22.10, 22.30), aeva)
-    check("ADR-only: still misses on the follow-through bar", t, None)
-
-    both = UndercutRally(
-        min_excursion_adr=0.1, min_excursion_pct=0.5, min_reclaim_adr=0.1
-    )
-    both.on_bar(bar(0, 22.35, 22.40, 22.05, 22.27), aeva)  # arm, low=22.05
-    both.on_bar(bar(1, 22.20, 22.35, 22.10, 22.30), aeva)  # reclaim too weak yet
-    both.on_bar(bar(2, 22.39, 22.47, 22.21, 22.46), aeva)  # reclaim still short
-    t2 = both.on_bar(bar(3, 22.45, 22.69, 22.45, 22.57), aeva)  # reclaim clears 0.1x
-    assert t2 is not None, (
-        "the OR filter should catch the same undercut ADR-only missed"
-    )
-    check(
-        "excursion_adr still fails on its own", t2.extras["excursion_adr"] < 0.1, True
-    )
-    check("excursion_pct is what let it through", t2.extras["excursion_pct"], 0.8989)
+    s = UndercutRally(min_excursion_pct=0.5)
+    s.on_bar(bar(0, 22.35, 22.40, 22.05, 22.27), aeva)  # arm, low=22.05
+    t = s.on_bar(bar(1, 22.20, 22.35, 22.10, 22.30), aeva)  # close 22.30
+    assert t is not None, "excursion clears the flat-percent floor"
+    check("excursion_pct", t.extras["excursion_pct"], 0.8989)
 
 
-def test_excursion_or_semantics() -> None:
-    """Direct coverage of the OR helper's degenerate cases."""
-    from astor.core.setups import _adr_or_pct_passes
+def test_min_pct_passes_semantics() -> None:
+    """Direct coverage of the percent-floor helper's degenerate cases."""
+    from astor.core.setups import _min_pct_passes
 
-    # Both configured, ADR passes, pct fails -> OR passes.
-    ok, pct = _adr_or_pct_passes(
-        amount=2.0,
-        level_value=100.0,
-        adr=10.0,
-        min_adr=0.1,
-        min_pct=5.0,
-    )
-    check("adr side alone can carry the OR", ok, True)
-    check("pct computed regardless of which side passed", pct, 2.0)
+    ok, pct = _min_pct_passes(amount=2.0, level_value=100.0, min_pct=1.0)
+    check("clears the floor", ok, True)
+    check("pct computed", pct, 2.0)
 
-    # Both configured, ADR fails, pct passes -> OR passes (the AEVA shape).
-    ok2, _ = _adr_or_pct_passes(
-        amount=1.0,
-        level_value=100.0,
-        adr=100.0,
-        min_adr=0.5,
-        min_pct=0.5,
-    )
-    check("pct side alone can carry the OR", ok2, True)
+    ok2, _ = _min_pct_passes(amount=0.5, level_value=100.0, min_pct=1.0)
+    check("short of the floor rejects", ok2, False)
 
-    # Both configured, both fail -> rejected.
-    ok3, _ = _adr_or_pct_passes(
-        amount=0.1,
-        level_value=100.0,
-        adr=100.0,
-        min_adr=0.5,
-        min_pct=5.0,
-    )
-    check("both failing rejects", ok3, False)
+    # min_pct <= 0 disables the check -- always passes, pct still reported.
+    ok3, pct3 = _min_pct_passes(amount=0.0001, level_value=100.0, min_pct=0.0)
+    check("no threshold configured means no filtering at all", ok3, True)
+    check("pct is still reported even when unused as a filter", pct3, 0.0001)
 
-    # Both configured, ADR unscalable (adr=0) -> degrades to pct-only, not
-    # auto-pass. This is the case that distinguishes "drop from the OR" from
-    # "count as a pass": if unscalable auto-passed, a bad pct would slip through.
-    ok4, _ = _adr_or_pct_passes(
-        amount=0.1,
-        level_value=100.0,
-        adr=0.0,
-        min_adr=0.5,
-        min_pct=5.0,
-    )
-    check("unscalable ADR must not auto-pass when pct also fails", ok4, False)
+    # level_value <= 0 means pct can't be computed; a configured floor fails
+    # closed rather than silently passing.
+    ok4, pct4 = _min_pct_passes(amount=1.0, level_value=0.0, min_pct=1.0)
+    check("unresolvable pct must not auto-pass a configured floor", ok4, False)
+    check("pct is None when the level is unusable", pct4, None)
 
-    ok5, _ = _adr_or_pct_passes(
-        amount=1.0,
-        level_value=100.0,
-        adr=0.0,
-        min_adr=0.5,
-        min_pct=0.5,
-    )
-    check("unscalable ADR degrades cleanly to a real pct check", ok5, True)
 
-    # Neither configured -> filter fully off, matches pre-existing behaviour.
-    ok6, pct6 = _adr_or_pct_passes(
-        amount=0.0001,
-        level_value=100.0,
-        adr=100.0,
-        min_adr=0.0,
-        min_pct=0.0,
-    )
-    check("no thresholds configured means no filtering at all", ok6, True)
-    check("excursion_pct is still reported even when unused as a filter", pct6, 0.0001)
+def test_combined_pct_filter_rejects_two_weak_halves() -> None:
+    """Excursion and reclaim can each clear their own floor while the whole
+    move is still small -- the combined floor catches that pair."""
+    s = UndercutRally(min_excursion_pct=0.6, min_reclaim_pct=0.6, min_combined_pct=1.5)
+    s.on_bar(bar(0, 100.6, 100.6, 99.35, 99.5), LEVELS)  # undercut_low=99.35
+    # excursion 0.65%, reclaim 0.65% -- each clears its own floor, sum 1.3%
+    # doesn't clear 1.5%.
+    t = s.on_bar(bar(1, 99.5, 100.65, 99.4, 100.65), LEVELS)
+    check("both halves pass individually but combined is too small", t, None)
+    # A deeper reclaim pushes the sum over 1.5% without changing excursion.
+    t2 = s.on_bar(bar(2, 100.65, 101.0, 100.6, 100.9), LEVELS)
+    assert t2 is not None, "combined floor should now clear"
+    check("combined_pct", t2.extras["combined_pct"], 1.55)
 
 
 def test_reclaim_pct_recorded() -> None:
@@ -503,6 +417,93 @@ def test_reclaim_pct_recorded() -> None:
     t2 = o.on_bar(bar(1, 105.5, 105.5, 104.475, 104.475), LEVELS)  # 0.525 below PDH
     assert t2 is not None
     check("reclaim_pct = 0.525/105*100", t2.extras["reclaim_pct"], 0.5)
+
+
+def test_session_indicators_avwap() -> None:
+    from astor.core.indicators import SessionIndicators
+
+    ind = SessionIndicators("TEST")
+    check("no avwap before any bar", ind.avwap, None)
+
+    ind.update(bar(0, 100, 102, 98, 100))  # typical=(102+98+100)/3=100, vol=1000
+    check("first bar's avwap is just its typical price", ind.avwap, 100.0)
+    check("first_bar_start is the first bar's start", ind.first_bar_start, OPEN)
+
+    ind.update(bar(1, 100, 104, 100, 102, v=2000))  # typical=102, vol=2000
+    # (100*1000 + 102*2000) / 3000 = 304000 / 3000
+    assert abs(ind.avwap - 101.3333) < 0.0001, f"avwap={ind.avwap}"
+    check("first_bar_start doesn't move on later bars", ind.first_bar_start, OPEN)
+
+
+def test_compute_rvol() -> None:
+    from astor.core.indicators import compute_rvol
+    from astor.core.types import VolumeCurve
+
+    curve = VolumeCurve(
+        "TEST", sessions=5, cum_volume_by_minute={time(9, 30): 1000.0, time(9, 31): 2500.0}
+    )
+    b0 = bar(0, 100, 101, 99, 100)  # start 09:30
+    check("double the average rounds to 2.00", compute_rvol(2000.0, b0, curve), 2.00)
+
+    b1 = bar(1, 100, 101, 99, 100)  # start 09:31
+    check("half the average rounds to 0.50", compute_rvol(1250.0, b1, curve), 0.50)
+
+    b2 = bar(2, 100, 101, 99, 100)  # start 09:32, not in the curve
+    check("no curve coverage for this minute -> None", compute_rvol(500.0, b2, curve), None)
+
+    zero_curve = VolumeCurve("TEST", sessions=0, cum_volume_by_minute={time(9, 30): 0.0})
+    check("zero average -> None, not a division error", compute_rvol(500.0, b0, zero_curve), None)
+
+
+def test_build_cum_volume_curve() -> None:
+    from astor.drivers.replay import build_cum_volume_curve
+
+    d1, d2 = date(2026, 8, 17), date(2026, 8, 18)
+
+    def row(d: date, hh: int, mm: int, v: float) -> dict:
+        return {"t": f"{d:%Y-%m-%d}T{hh:02d}:{mm:02d}:00-04:00", "v": v}
+
+    curve, used = build_cum_volume_curve(
+        {
+            d1: [row(d1, 9, 30, 100), row(d1, 9, 31, 50)],
+            d2: [row(d2, 9, 30, 200), row(d2, 9, 31, 100)],
+        }
+    )
+    check("both sessions contributed", used, 2)
+    check("09:30 average = (100+200)/2", curve[time(9, 30)], 150.0)
+    check("09:31 cumulative average = (150+300)/2", curve[time(9, 31)], 225.0)
+
+    # A session with no usable rows doesn't count, and a minute only some
+    # sessions have bars for is averaged over just those.
+    curve2, used2 = build_cum_volume_curve(
+        {
+            d1: [row(d1, 9, 30, 100), row(d1, 9, 31, 50)],
+            d2: [row(d2, 9, 30, 200)],  # missing 09:31
+            date(2026, 8, 19): [],  # no usable bars at all
+        }
+    )
+    check("only sessions with usable rows count", used2, 2)
+    check("09:30 averaged over both", curve2[time(9, 30)], 150.0)
+    check("09:31 averaged only over the session that has it", curve2[time(9, 31)], 150.0)
+
+
+def test_scanner_backfill_bar_updates_indicators_not_setups() -> None:
+    sc = Scanner({"TEST": LEVELS}, [UndercutRally])
+
+    b0 = bar(0, 101, 101, 99, 99.5)
+    sc.backfill_bar(b0)
+    check("indicators updated by backfill", sc.indicators["TEST"].cum_volume, b0.volume)
+    check("no setup state created by backfill", sc._state, {})
+    check("no triggers recorded by backfill", sc.triggers, [])
+
+    # Setup state starts clean: on_bar sees this as the FIRST bar it has ever
+    # evaluated for TEST, so it only arms (this bar's low is itself below
+    # PDL) -- it can't fire, because it never saw the backfilled undercut.
+    b1 = bar(1, 99.5, 101, 99.5, 100.5)
+    fired = sc.on_bar(b1)
+    check("setup starts clean -- this bar only arms it, can't fire yet", fired, [])
+    check("but indicators keep accumulating across backfill and live bars",
+          sc.indicators["TEST"].cum_volume, b0.volume + b1.volume)
 
 
 def test_latest_triggers_spans_sessions_and_supersedes_reruns() -> None:

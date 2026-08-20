@@ -21,7 +21,7 @@ from pathlib import Path
 from ib_async import IB, Stock
 
 from astor.core.scanner import Scanner
-from astor.core.types import BarEvent, DailyLevels
+from astor.core.types import BarEvent, DailyLevels, VolumeCurve
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,7 @@ ET = __import__("zoneinfo").ZoneInfo("America/New_York")
 REQUEST_TIMEOUT = 60.0
 
 ADR_SESSIONS = 14
+RVOL_SESSIONS = 20  # the user's own spec: "1-min bars for the last 20 days"
 
 # A cache entry written before ADR existed lacks these, so it must be refetched
 # rather than loaded with zeroed volatility -- which would silently disable the
@@ -54,6 +55,35 @@ def compute_adr_pct(daily_bars, sessions: int = ADR_SESSIONS) -> tuple[float, in
     if not ratios:
         return 0.0, 0
     return round(sum(ratios) / len(ratios) * 100.0, 4), len(ratios)
+
+
+def build_cum_volume_curve(
+    rows_by_session: dict[date, list[dict]],
+) -> tuple[dict[time, float], int]:
+    """The mean cumulative share volume by minute-of-day across a set of
+    sessions' 1-min bar rows (the `BarCache` "intraday" row shape: dicts with
+    at least "t" and "v"). Returns (cum_volume_by_minute, sessions_used) --
+    a session contributing no usable rows doesn't count toward the mean, and
+    a minute only some sessions have bars for is averaged over just those.
+    """
+    sums: dict[time, float] = {}
+    counts: dict[time, int] = {}
+    used = 0
+    for d, rows in rows_by_session.items():
+        cum = 0.0
+        contributed = False
+        for r in sorted(rows, key=lambda r: r["t"]):
+            start = datetime.fromisoformat(r["t"])
+            if start.date() != d:
+                continue  # guard against a request returning a neighbouring day
+            cum += float(r["v"])
+            key = start.timetz().replace(tzinfo=None)
+            sums[key] = sums.get(key, 0.0) + cum
+            counts[key] = counts.get(key, 0) + 1
+            contributed = True
+        if contributed:
+            used += 1
+    return {k: sums[k] / counts[k] for k in sums}, used
 
 
 def parse_bar_seconds(bar_size: str) -> int:
@@ -117,7 +147,7 @@ class ReplayDriver:
 
     # -- fetching ----------------------------------------------------------
 
-    async def _qualify(self, symbols: list[str]) -> dict[str, object]:
+    async def qualify(self, symbols: list[str]) -> dict[str, object]:
         raw = [Stock(s, "SMART", "USD") for s in symbols]
         qualified = await self.ib.qualifyContractsAsync(*raw)
         good = {c.symbol: c for c in qualified if c and getattr(c, "conId", 0) > 0}
@@ -141,7 +171,7 @@ class ReplayDriver:
         CSV step before adding a ticker mid-session, and it is correct as of the
         replayed date rather than as of whenever an export was taken.
         """
-        contracts = await self._qualify(symbols)
+        contracts = await self.qualify(symbols)
         out: dict[str, DailyLevels] = {}
 
         # Enough calendar days to cover adr_sessions trading days plus holidays.
@@ -224,7 +254,7 @@ class ReplayDriver:
         return out
 
     async def fetch_bars(self, symbols: list[str]) -> dict[str, list[BarEvent]]:
-        contracts = await self._qualify(symbols)
+        contracts = await self.qualify(symbols)
         out: dict[str, list[BarEvent]] = {}
 
         async def one(sym: str, contract) -> None:
@@ -276,6 +306,125 @@ class ReplayDriver:
                     )
                 )
             out[sym] = events
+
+        await asyncio.gather(*[one(s, c) for s, c in contracts.items()])
+        return out
+
+    async def fetch_volume_curve(
+        self, symbols: list[str], sessions: int = RVOL_SESSIONS
+    ) -> dict[str, VolumeCurve]:
+        """Expected cumulative share volume by minute-of-day, averaged over
+        each symbol's last `sessions` RTH sessions -- what RVOL divides
+        today's running volume against.
+
+        Discovers those session dates the same way `fetch_levels` finds the
+        prior session: a daily-bar request ending before `self.session`,
+        which is anchored to that end date rather than to "now", so this
+        behaves identically called the night before or minutes before the
+        open. Each session's 1-min bars go through the same `BarCache`
+        ("intraday", ...) shape `fetch_bars` writes, so a day already cached
+        by a Replay run -- or a previous curve build -- is never re-fetched
+        from IBKR, and a day this method fetches is usable by `fetch_bars`
+        later. The derived curve itself is also cached (kind "curve") so an
+        unchanged rolling window doesn't get rebuilt from its 20 days of
+        1-min bars on every call.
+        """
+        contracts = await self.qualify(symbols)
+        out: dict[str, VolumeCurve] = {}
+        duration_days = max(15, int(sessions * 1.6) + 5)
+
+        async def one(sym: str, contract) -> None:
+            cached = self.cache.load("curve", sym, self.session, self.bar_size)
+            if cached and cached.get("sessions") == sessions:
+                out[sym] = VolumeCurve(
+                    sym,
+                    cached["sessions"],
+                    {
+                        time.fromisoformat(t): v
+                        for t, v in cached["cum_volume_by_minute"].items()
+                    },
+                )
+                return
+
+            async with self.sem:
+                daily = await self.ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime=f"{self.session:%Y%m%d} 00:00:00 US/Eastern",
+                    durationStr=f"{duration_days} D",
+                    barSizeSetting="1 day",
+                    whatToShow="TRADES",
+                    useRTH=True,
+                    formatDate=1,
+                    timeout=REQUEST_TIMEOUT,
+                )
+            if not daily:
+                logger.warning("No daily bars for %s; cannot build a volume curve", sym)
+                return
+
+            session_dates: list[date] = []
+            for b in daily[-sessions:]:
+                d = b.date.date() if isinstance(b.date, datetime) else b.date
+                if isinstance(d, date) and d < self.session:
+                    session_dates.append(d)
+            if not session_dates:
+                logger.warning("No prior sessions for %s; skipping its curve", sym)
+                return
+
+            rows_by_session: dict[date, list[dict]] = {}
+            for d in session_dates:
+                rows = self.cache.load("intraday", sym, d, self.bar_size)
+                if rows is None:
+                    async with self.sem:
+                        bars = await self.ib.reqHistoricalDataAsync(
+                            contract,
+                            endDateTime=f"{d:%Y%m%d} 16:00:00 US/Eastern",
+                            durationStr="1 D",
+                            barSizeSetting=self.bar_size,
+                            whatToShow="TRADES",
+                            useRTH=True,
+                            formatDate=1,
+                            timeout=REQUEST_TIMEOUT,
+                        )
+                    if not bars:
+                        logger.warning(
+                            "No intraday bars for %s on %s; skipped for its curve",
+                            sym,
+                            d,
+                        )
+                        continue
+                    rows = [
+                        {
+                            "t": to_et(b.date).isoformat(),
+                            "o": b.open,
+                            "h": b.high,
+                            "l": b.low,
+                            "c": b.close,
+                            "v": b.volume,
+                        }
+                        for b in bars
+                        if to_et(b.date) is not None
+                    ]
+                    self.cache.save("intraday", sym, d, self.bar_size, rows)
+                rows_by_session[d] = rows
+
+            cum_volume_by_minute, used = build_cum_volume_curve(rows_by_session)
+            if not cum_volume_by_minute:
+                logger.warning("No usable sessions for %s; skipping its curve", sym)
+                return
+
+            out[sym] = VolumeCurve(sym, used, cum_volume_by_minute)
+            self.cache.save(
+                "curve",
+                sym,
+                self.session,
+                self.bar_size,
+                {
+                    "sessions": used,
+                    "cum_volume_by_minute": {
+                        k.isoformat(): v for k, v in cum_volume_by_minute.items()
+                    },
+                },
+            )
 
         await asyncio.gather(*[one(s, c) for s, c in contracts.items()])
         return out

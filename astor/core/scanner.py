@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import logging
 
+from astor.core.indicators import SessionIndicators
 from astor.core.setups import ALL_SETUPS, Setup
-from astor.core.types import BarEvent, DailyLevels, Trigger
+from astor.core.types import BarEvent, DailyLevels, Trigger, VolumeCurve
 
 logger = logging.getLogger(__name__)
 
@@ -31,29 +32,49 @@ class Scanner:
         self.setup_kwargs = setup_kwargs or {}
         self._state: dict[tuple[str, str], Setup] = {}
 
+        # Populated externally by the driver, same convention as `levels`.
+        # curves is read by a future RVOL-consuming setup; nothing here uses
+        # it directly yet.
+        self.indicators: dict[str, SessionIndicators] = {}
+        self.curves: dict[str, VolumeCurve] = {}
+
         self.triggers: list[Trigger] = []
         self.bars_seen = 0
         self.bars_evaluated = 0
         self.skipped_zero_volume = 0
         self.skipped_no_levels: set[str] = set()
 
-    def on_bar(self, bar: BarEvent) -> list[Trigger]:
-        """Feed one completed bar. Returns any triggers it produced."""
+    def _gate(self, bar: BarEvent) -> DailyLevels | None:
+        """Bookkeeping shared by on_bar and backfill_bar: count the bar,
+        drop zero-volume padding, and skip symbols with no reference levels
+        (not on the watchlist). Returns the bar's levels, or None if the bar
+        should go no further.
+        """
         self.bars_seen += 1
 
-        # Zero-volume bars are dropped before any setup sees them. IBKR pads
-        # thin tickers with zero-volume bars that carry OHLC forward, which
-        # would otherwise arm a setup on a minute in which nothing traded.
-        # Dropping them also deletes exactly the bars a live stream would never
-        # have emitted, which is what keeps Replay and Live in agreement.
+        # Zero-volume bars are dropped before any setup or indicator sees
+        # them. IBKR pads thin tickers with zero-volume bars that carry OHLC
+        # forward, which would otherwise arm a setup -- or skew AVWAP -- on a
+        # minute in which nothing traded. Dropping them also deletes exactly
+        # the bars a live stream would never have emitted, which is what
+        # keeps Replay and Live in agreement.
         if bar.volume <= 0:
             self.skipped_zero_volume += 1
-            return []
+            return None
 
         levels = self.levels.get(bar.symbol)
         if levels is None:
             self.skipped_no_levels.add(bar.symbol)
+            return None
+        return levels
+
+    def on_bar(self, bar: BarEvent) -> list[Trigger]:
+        """Feed one completed bar. Returns any triggers it produced."""
+        levels = self._gate(bar)
+        if levels is None:
             return []
+
+        self.indicators.setdefault(bar.symbol, SessionIndicators(bar.symbol)).update(bar)
 
         self.bars_evaluated += 1
         fired: list[Trigger] = []
@@ -69,3 +90,15 @@ class Scanner:
 
         self.triggers.extend(fired)
         return fired
+
+    def backfill_bar(self, bar: BarEvent) -> None:
+        """Feed one bar that happened before this symbol joined the live
+        scan (or before a Replay run's start-time window). Indicators (AVWAP,
+        RVOL's running volume) stay continuous from the first bar of the day;
+        Setup state does not -- a setup added mid-session starts clean, as if
+        the bars before it never happened, so it is never evaluated here.
+        """
+        levels = self._gate(bar)
+        if levels is None:
+            return
+        self.indicators.setdefault(bar.symbol, SessionIndicators(bar.symbol)).update(bar)

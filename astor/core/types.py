@@ -8,7 +8,7 @@ a Replay run and a Live run indistinguishable from inside a setup.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Any
 
 
@@ -59,6 +59,30 @@ class DailyLevels:
         triggers a setup would move the yardstick used to judge it.
         """
         return self.adr_pct / 100.0 * self.prev_close
+
+
+@dataclass(frozen=True, slots=True)
+class VolumeCurve:
+    """A symbol's expected cumulative share volume by minute-of-day, averaged
+    over its last N RTH sessions.
+
+    RVOL divides a bar's cumulative volume-to-date directly against this --
+    an absolute share count per minute bucket, not a percent of the day --
+    so no separate ADV figure is needed.
+
+    Keyed by bar *start* time-of-day (naive, tz stripped), matching how bars
+    are keyed everywhere else IB minute-of-day alignment matters (e.g.
+    ReplayDriver.stream). Sparse: a symbol with fewer than a full session's
+    cached bars simply has fewer keys, and lookups for a missing minute
+    return None rather than a fabricated value.
+    """
+
+    symbol: str
+    sessions: int  # how many sessions this curve was actually averaged over
+    cum_volume_by_minute: dict[time, float] = field(default_factory=dict)
+
+    def avg_cum_volume_at(self, t: time) -> float | None:
+        return self.cum_volume_by_minute.get(t)
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,51 +1,39 @@
 """Setup state machines.
 
-The shape of each setup is fixed; the thresholds are not. Both filters are
-expressed in ADR units rather than dollars or percent, so one number means the
-same thing on MARA ($0.79 ADR) as on AMD ($28.69 ADR) -- which is what makes a
-single watchlist-wide setting sensible.
+The shape of each setup is fixed; the thresholds are not.
 
-Each setup applies two independent tests at trigger time, and both now use the
-same ADR-OR-percent form:
+Each setup applies filters at trigger time, all expressed as a flat percent
+of the level price (PDL/PDH):
 
   excursion  how far past the level price actually went. Rejects the bar-scale
              chop that dominated the first replay -- 2 bars, a cent beyond.
   reclaim    how convincingly price came back. Rejects a close that limps a
              cent past the level and means nothing.
+  combined   excursion + reclaim together. Catches a move that clears both
+             floors individually but is still small overall -- two barely-
+             there halves that individually pass but never added up to a real
+             move.
 
-Both started ADR-only. Excursion under-caught high-ADR names first: AEVA (11%
-ADR) undercut PDL by $0.20 and rallied cleanly, a textbook U&R, but $0.20 was
-only 0.081x its $2.47 ADR against a 0.1x threshold -- missed by five cents.
-Checking watchlist-wide, excursion size in ADR units correlated negatively with
-ADR itself: the more volatile a name, the smaller a fraction of its ADR its
-undercuts tend to run. A single ADR coefficient therefore filters volatile
-names hardest, backwards from the intent. A flat percent-of-level floor doesn't
-have that problem, so excursion passes if EITHER measure clears its bar --
-whichever is more lenient for that name on that day. Reclaim was made
-symmetric for the same reason once real data showed the same asymmetry running
-in both directions: AAPL's reclaim cleared 0.1x ADR at only 0.21-0.26% of
-level, while MARA/YSS repeat-fires cleared 0.5% at as little as 0.064x ADR --
-no single measure was more correct, just differently permissive per name.
+These filters used to run in ADR units, or ADR-OR-percent once a flat-percent
+fallback was added to catch high-ADR names that ADR alone under-caught (a
+single ADR coefficient filters volatile names hardest, backwards from the
+intent -- excursion size in ADR units correlated negatively with ADR itself
+watchlist-wide). Analysis of replayed triggers found the ADR side added little:
+setup strength correlated with the flat percent-of-level move, not the
+ADR-scaled one. ADR filtering was dropped in favor of percent-only, with the
+combined floor added to catch weak-but-technically-passing pairs that the
+individual floors let through.
 
-Both ADR-unit and percent values are recorded regardless of which one (if
-either) decided the outcome, since a name that only cleared its filter via the
-percent side today may clear via ADR tomorrow -- the OR should stay legible in
-hindsight, not just as a pass/fail. The dollar figures they derive from are
-deliberately not stored: they are not comparable across a watchlist, and the
-absolute prices that do matter -- the level and the trigger -- are already
-columns on the trigger row.
+excursion_adr and reclaim_adr are still recorded on the trigger as pure
+diagnostics -- for hindsight, since a name that clears its percent filter
+today may or may not have cleared an ADR-scaled one too -- but neither
+decides the outcome anymore.
 
 A bar that breaches the level always arms the setup. The filters are applied
 when it would fire, against the *accumulated* excursion, so an undercut that
 deepens over several bars is judged on its full extent rather than its first
 bar. Failing a filter leaves the setup armed rather than resetting it: the
 breach is still real, we are simply still waiting for a reclaim worth reporting.
-
-If ADR is unavailable (adr <= 0), any ADR-scaled check that is configured drops
-out of its OR rather than auto-passing or auto-failing: a filter degrades to
-percent-only if that is also configured, or skips filtering for that symbol if
-neither applies. The CLI reports which symbols lack ADR so this is visible
-rather than inferred.
 
 Excursion currently has no ceiling. TSLA on 2026-08-14 fired O&F at 0.834x ADR
 / 2.82% excursion -- by the trader's read, that excursion is large enough that
@@ -64,40 +52,17 @@ from astor.core.types import BarEvent, DailyLevels, Trigger
 
 def _pct_of_level(amount: float, level_value: float) -> float | None:
     """amount expressed as a percent of the level price, e.g. excursion or
-    reclaim distance against PDL/PDH. Always computed where possible -- this is
-    a diagnostic recorded regardless of whether anything filters on it."""
+    reclaim distance against PDL/PDH."""
     return round(amount / level_value * 100.0, 4) if level_value > 0 else None
 
 
-def _adr_or_pct_passes(
-    amount: float,
-    level_value: float,
-    adr: float,
-    min_adr: float,
-    min_pct: float,
+def _min_pct_passes(
+    amount: float, level_value: float, min_pct: float
 ) -> tuple[bool, float | None]:
-    """Whether a dollar amount (excursion or reclaim distance) clears its
-    ADR-scaled OR flat-percent floor. Shared by both filters.
-
-    Each configured, applicable check contributes to an OR: passing either is
-    enough. A configured check that is inapplicable (ADR unscalable) is left
-    out of the OR rather than counted as a pass or a fail -- so with both
-    checks configured, an unscalable ADR degrades to percent-only rather than
-    silently disabling the whole filter. Configuring neither disables the
-    filter entirely.
-    """
+    """Whether a dollar amount (excursion or reclaim distance) clears a flat
+    percent-of-level floor. min_pct <= 0 disables the check."""
     pct = _pct_of_level(amount, level_value)
-
-    if min_adr <= 0 and min_pct <= 0:
-        return True, pct
-
-    checks = []
-    if min_adr > 0 and adr > 0:
-        checks.append(amount >= min_adr * adr)
-    if min_pct > 0 and pct is not None:
-        checks.append(pct >= min_pct)
-
-    passes = True if not checks else any(checks)
+    passes = min_pct <= 0 or (pct is not None and pct >= min_pct)
     return passes, pct
 
 
@@ -123,16 +88,14 @@ class UndercutRally(Setup):
     def __init__(
         self,
         allow_same_bar_reclaim: bool = False,
-        min_excursion_adr: float = 0.0,
         min_excursion_pct: float = 0.0,
-        min_reclaim_adr: float = 0.0,
         min_reclaim_pct: float = 0.0,
+        min_combined_pct: float = 0.0,
     ):
         self.allow_same_bar_reclaim = allow_same_bar_reclaim
-        self.min_excursion_adr = min_excursion_adr
         self.min_excursion_pct = min_excursion_pct
-        self.min_reclaim_adr = min_reclaim_adr
         self.min_reclaim_pct = min_reclaim_pct
+        self.min_combined_pct = min_combined_pct
         self._undercut_low: float | None = None
         self._undercut_start = None
         self._bars_below = 0  # bars whose low actually broke the level
@@ -165,16 +128,23 @@ class UndercutRally(Setup):
         reclaim = bar.close - pdl
         adr = levels.adr
 
-        excursion_ok, excursion_pct = _adr_or_pct_passes(
-            excursion, pdl, adr, self.min_excursion_adr, self.min_excursion_pct
+        excursion_ok, excursion_pct = _min_pct_passes(
+            excursion, pdl, self.min_excursion_pct
         )
         if not excursion_ok:
-            return None  # stay armed: too shallow by every applicable measure
-        reclaim_ok, reclaim_pct = _adr_or_pct_passes(
-            reclaim, pdl, adr, self.min_reclaim_adr, self.min_reclaim_pct
-        )
+            return None  # stay armed: too shallow
+        reclaim_ok, reclaim_pct = _min_pct_passes(reclaim, pdl, self.min_reclaim_pct)
         if not reclaim_ok:
             return None  # stay armed: wait for a more convincing reclaim
+        combined_pct = (
+            round(excursion_pct + reclaim_pct, 4)
+            if excursion_pct is not None and reclaim_pct is not None
+            else None
+        )
+        if self.min_combined_pct > 0 and (
+            combined_pct is None or combined_pct < self.min_combined_pct
+        ):
+            return None  # stay armed: each half is fine, the whole move isn't
 
         trigger = Trigger(
             symbol=bar.symbol,
@@ -195,6 +165,7 @@ class UndercutRally(Setup):
                 "excursion_pct": excursion_pct,
                 "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,
                 "reclaim_pct": reclaim_pct,
+                "combined_pct": combined_pct,
             },
         )
         self._undercut_low = None
@@ -216,16 +187,14 @@ class OvershootFail(Setup):
     def __init__(
         self,
         allow_same_bar_fail: bool = False,
-        min_excursion_adr: float = 0.0,
         min_excursion_pct: float = 0.0,
-        min_reclaim_adr: float = 0.0,
         min_reclaim_pct: float = 0.0,
+        min_combined_pct: float = 0.0,
     ):
         self.allow_same_bar_fail = allow_same_bar_fail
-        self.min_excursion_adr = min_excursion_adr
         self.min_excursion_pct = min_excursion_pct
-        self.min_reclaim_adr = min_reclaim_adr
         self.min_reclaim_pct = min_reclaim_pct
+        self.min_combined_pct = min_combined_pct
         self._overshoot_high: float | None = None
         self._overshoot_start = None
         self._bars_above = 0  # bars whose high actually broke the level
@@ -255,16 +224,23 @@ class OvershootFail(Setup):
         reclaim = pdh - bar.close
         adr = levels.adr
 
-        excursion_ok, excursion_pct = _adr_or_pct_passes(
-            excursion, pdh, adr, self.min_excursion_adr, self.min_excursion_pct
+        excursion_ok, excursion_pct = _min_pct_passes(
+            excursion, pdh, self.min_excursion_pct
         )
         if not excursion_ok:
-            return None
-        reclaim_ok, reclaim_pct = _adr_or_pct_passes(
-            reclaim, pdh, adr, self.min_reclaim_adr, self.min_reclaim_pct
-        )
+            return None  # stay armed: too shallow
+        reclaim_ok, reclaim_pct = _min_pct_passes(reclaim, pdh, self.min_reclaim_pct)
         if not reclaim_ok:
-            return None
+            return None  # stay armed: wait for a more convincing fail
+        combined_pct = (
+            round(excursion_pct + reclaim_pct, 4)
+            if excursion_pct is not None and reclaim_pct is not None
+            else None
+        )
+        if self.min_combined_pct > 0 and (
+            combined_pct is None or combined_pct < self.min_combined_pct
+        ):
+            return None  # stay armed: each half is fine, the whole move isn't
 
         trigger = Trigger(
             symbol=bar.symbol,
@@ -285,6 +261,7 @@ class OvershootFail(Setup):
                 "excursion_pct": excursion_pct,
                 "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,
                 "reclaim_pct": reclaim_pct,
+                "combined_pct": combined_pct,
             },
         )
         self._overshoot_high = None

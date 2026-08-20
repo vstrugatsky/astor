@@ -1,8 +1,11 @@
-"""Astor CLI. For now: replay.
+"""Astor CLI: replay and live.
 
     uv run python -m astor.cli replay --date 2026-08-14 --tickers AAPL,NVDA,TSLA
     uv run python -m astor.cli replay --date 2026-08-14 --tickers-file watchlist.txt \
         --start 09:30 --end 11:00
+
+    uv run python -m astor.cli live --tickers-file watchlist.txt
+        (then at the '> ' prompt: 'add TSLA,NVDA', 'remove TSLA', 'quit')
 """
 
 from __future__ import annotations
@@ -19,9 +22,33 @@ from ib_async import IB
 from astor.core.scanner import Scanner
 from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME
 from astor.core.store import TriggerStore
-from astor.drivers.replay import ReplayDriver, run_replay
+from astor.drivers.live import LiveDriver
+from astor.drivers.replay import ET, ReplayDriver, run_replay
 
 logger = logging.getLogger("astor")
+
+
+class _ETFormatter(logging.Formatter):
+    """Log timestamps in ET, not the operator's local clock.
+
+    Every other clock in this codebase -- bar timestamps, session dates,
+    RTH_OPEN, the store's trigger_time column -- is ET; a trader running this
+    from a different timezone reading local-time log lines next to ET-anchored
+    behavior (open transitions, IB's own nightly maintenance window) is a real
+    source of confusion, not a hypothetical one.
+    """
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        dt = datetime.fromtimestamp(record.created, tz=ET)
+        return dt.strftime(datefmt or "%H:%M:%S")
+
+
+def split_symbols(raw: str) -> list[str]:
+    syms = [item.upper().replace(".", " ") for item in raw.replace(",", " ").split()]
+    seen: dict[str, None] = {}
+    for s in syms:
+        seen.setdefault(s, None)
+    return list(seen)
 
 
 def parse_symbols(args: argparse.Namespace) -> list[str]:
@@ -33,11 +60,30 @@ def parse_symbols(args: argparse.Namespace) -> list[str]:
         )
     if args.tickers:
         raw += "\n" + args.tickers
-    syms = [item.upper().replace(".", " ") for item in raw.replace(",", " ").split()]
-    seen: dict[str, None] = {}
-    for s in syms:
-        seen.setdefault(s, None)
-    return list(seen)
+    return split_symbols(raw)
+
+
+def _setups_and_kwargs(args: argparse.Namespace):
+    setups = (
+        [SETUPS_BY_NAME[n] for n in args.setups.split(",")]
+        if args.setups
+        else ALL_SETUPS
+    )
+    kwargs = {
+        "U&R": {
+            "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
+            "min_excursion_pct": args.min_excursion_pct,
+            "min_reclaim_pct": args.min_reclaim_pct,
+            "min_combined_pct": args.min_combined_pct,
+        },
+        "O&F": {
+            "allow_same_bar_fail": args.allow_same_bar_reclaim,
+            "min_excursion_pct": args.min_excursion_pct,
+            "min_reclaim_pct": args.min_reclaim_pct,
+            "min_combined_pct": args.min_combined_pct,
+        },
+    }
+    return setups, kwargs
 
 
 def parse_hhmm(value: str | None) -> time | None:
@@ -54,11 +100,7 @@ async def cmd_replay(args: argparse.Namespace) -> int:
 
     session = date.fromisoformat(args.date)
     start_t, end_t = parse_hhmm(args.start), parse_hhmm(args.end)
-    setups = (
-        [SETUPS_BY_NAME[n] for n in args.setups.split(",")]
-        if args.setups
-        else ALL_SETUPS
-    )
+    setups, kwargs = _setups_and_kwargs(args)
 
     run_id = f"{session:%Y%m%d}-replay-{uuid.uuid4().hex[:8]}"
     params = {
@@ -69,10 +111,9 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         "end": args.end,
         "setups": [s.name for s in setups],
         "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
-        "min_excursion_adr": args.min_excursion_adr,
         "min_excursion_pct": args.min_excursion_pct,
-        "min_reclaim_adr": args.min_reclaim_adr,
         "min_reclaim_pct": args.min_reclaim_pct,
+        "min_combined_pct": args.min_combined_pct,
         "adr_sessions": args.adr_sessions,
     }
 
@@ -98,40 +139,6 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         ", ".join(str(s) for s in sorted(prior_sessions)),
     )
 
-    # Both excursion and reclaim have a percent fallback now, so either only
-    # goes unfiltered for a symbol if its ADR-scaled check is configured but
-    # unscalable AND no percent fallback is configured -- surface that case
-    # rather than letting it look like a clean, deliberately unfiltered pass.
-    no_adr = sorted(s for s, lv in levels.items() if lv.adr <= 0)
-    if no_adr and args.min_excursion_adr and not args.min_excursion_pct:
-        logger.warning(
-            "No ADR for %s -- excursion filter cannot be scaled"
-            " (no --min-excursion-pct fallback configured), runs unfiltered",
-            ", ".join(no_adr),
-        )
-    if no_adr and args.min_reclaim_adr and not args.min_reclaim_pct:
-        logger.warning(
-            "No ADR for %s -- reclaim filter cannot be scaled"
-            " (no --min-reclaim-pct fallback configured), runs unfiltered",
-            ", ".join(no_adr),
-        )
-
-    kwargs = {
-        "U&R": {
-            "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
-            "min_excursion_adr": args.min_excursion_adr,
-            "min_excursion_pct": args.min_excursion_pct,
-            "min_reclaim_adr": args.min_reclaim_adr,
-            "min_reclaim_pct": args.min_reclaim_pct,
-        },
-        "O&F": {
-            "allow_same_bar_fail": args.allow_same_bar_reclaim,
-            "min_excursion_adr": args.min_excursion_adr,
-            "min_excursion_pct": args.min_excursion_pct,
-            "min_reclaim_adr": args.min_reclaim_adr,
-            "min_reclaim_pct": args.min_reclaim_pct,
-        },
-    }
     scanner = Scanner(levels, setups, kwargs)
 
     store = TriggerStore(Path(args.db))
@@ -171,9 +178,9 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
             f"{min(adrs):.2f}% - {max(adrs):.2f}% across symbols"
         )
     print(
-        f"Filters             : excursion >= {args.min_excursion_adr}x ADR"
-        f" or {args.min_excursion_pct}% of level, "
-        f"reclaim >= {args.min_reclaim_adr}x ADR or {args.min_reclaim_pct}% of level"
+        f"Filters             : excursion >= {args.min_excursion_pct}% of level, "
+        f"reclaim >= {args.min_reclaim_pct}% of level, "
+        f"excursion+reclaim >= {args.min_combined_pct}%"
     )
     print(f"Bars fed to scanner : {fed}")
     print(f"Bars evaluated      : {scanner.bars_evaluated}")
@@ -185,27 +192,25 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
     if triggers:
         print(
             f"\n{'time':<9} {'symbol':<7} {'setup':<5} {'price':>9} {'level':>9}"
-            f" {'exc(adr)':>9} {'exc(%)':>7} {'rec(adr)':>9} {'rec(%)':>7}"
+            f" {'exc(%)':>7} {'rec(%)':>7} {'sum(%)':>7}"
             f" {'beyond':>7} {'armed':>6}"
         )
         print("-" * 88)
         for t in triggers:
             e = t.extras
             nbars = e.get("bars_below", e.get("bars_above"))
-            exc, exc_pct, rec, rec_pct = (
-                e.get("excursion_adr"),
+            exc_pct, rec_pct, sum_pct = (
                 e.get("excursion_pct"),
-                e.get("reclaim_adr"),
                 e.get("reclaim_pct"),
+                e.get("combined_pct"),
             )
-            exc_s = f"{exc:.2f}x" if exc is not None else "-"
             exc_pct_s = f"{exc_pct:.2f}%" if exc_pct is not None else "-"
-            rec_s = f"{rec:.2f}x" if rec is not None else "-"
             rec_pct_s = f"{rec_pct:.2f}%" if rec_pct is not None else "-"
+            sum_pct_s = f"{sum_pct:.2f}%" if sum_pct is not None else "-"
             print(
                 f"{t.bar_start:%H:%M:%S}  {t.symbol:<7} {t.setup:<5} "
                 f"{t.trigger_price:>9.2f} {t.level_value:>9.2f} "
-                f"{exc_s:>9} {exc_pct_s:>7} {rec_s:>9} {rec_pct_s:>7}"
+                f"{exc_pct_s:>7} {rec_pct_s:>7} {sum_pct_s:>7}"
                 f" {nbars:>7} {e.get('bars_armed', 0):>6}"
             )
 
@@ -216,6 +221,136 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
         print("\nMost active: " + ", ".join(f"{s} ({n})" for s, n in busiest))
 
     print(f"\nStored in {args.db}  (run_id={run_id})")
+
+
+async def cmd_live(args: argparse.Namespace) -> int:
+    symbols = parse_symbols(args)
+    setups, kwargs = _setups_and_kwargs(args)
+    scanner = Scanner({}, setups, kwargs)
+
+    ib = IB()
+    logger.info("Connecting to %s:%d...", args.host, args.port)
+    await ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=15)
+
+    try:
+        driver = LiveDriver(ib, Path(args.cache_dir), args.bar_size)
+        run_id = f"{driver.session:%Y%m%d}-live-{uuid.uuid4().hex[:8]}"
+        logger.info("Live session target: %s (run_id=%s)", driver.session, run_id)
+
+        store = TriggerStore(Path(args.db))
+        if args.purge:
+            removed = store.purge_runs()
+            if removed:
+                logger.info("Purged %d earlier run(s) from %s", removed, args.db)
+        store.start_run(
+            run_id,
+            "live",
+            {
+                "session": str(driver.session),
+                "bar_size": args.bar_size,
+                "setups": [s.name for s in setups],
+                "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
+                "min_excursion_pct": args.min_excursion_pct,
+                "min_reclaim_pct": args.min_reclaim_pct,
+                "min_combined_pct": args.min_combined_pct,
+            },
+        )
+
+        if symbols:
+            results = await driver.add_symbols(scanner, symbols, run_id, store)
+            for sym, status in results.items():
+                logger.info("%s: %s", sym, status)
+
+        open_task = asyncio.create_task(
+            driver.run_open_transition(scanner, run_id, store)
+        )
+        try:
+            await _live_console(driver, scanner, run_id, store, args.max_tickers)
+        finally:
+            open_task.cancel()
+            store.commit()
+            store.close()
+    finally:
+        ib.disconnect()
+
+    print(
+        f"\n{len(scanner.triggers)} trigger(s) recorded this run. "
+        f"Stored in {args.db}  (run_id={run_id})"
+    )
+    return 0
+
+
+async def _live_console(
+    driver: LiveDriver,
+    scanner: Scanner,
+    run_id: str,
+    store: TriggerStore,
+    cap: int,
+) -> None:
+    """Interactive add/remove prompt. Runs on the same event loop as IB's
+    bar-completion callbacks -- `input()` is blocking, so it runs in an
+    executor thread rather than stalling those callbacks between commands.
+    """
+    loop = asyncio.get_event_loop()
+    print(
+        f"Live scan running (session {driver.session}). "
+        f"Tracking {driver.symbol_count()}/{cap or '∞'}. "
+        "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'list', 'quit'."
+    )
+    while True:
+        try:
+            line = await loop.run_in_executor(None, input, "> ")
+        except EOFError:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        cmd, _, rest = line.partition(" ")
+        cmd = cmd.lower()
+
+        if cmd in ("quit", "exit"):
+            break
+
+        if cmd == "add":
+            symbols = split_symbols(rest)
+            if not symbols:
+                print("Usage: add SYM1,SYM2,...")
+                continue
+            room = cap - driver.symbol_count() if cap else None
+            if room is not None and len(symbols) > room:
+                print(
+                    f"Only room for {room} more (cap {cap}, currently "
+                    f"{driver.symbol_count()}) -- add fewer or remove some first."
+                )
+                continue
+            results = await driver.add_symbols(scanner, symbols, run_id, store)
+            for sym, status in results.items():
+                print(f"  {sym}: {status}")
+            print(f"Tracking {driver.symbol_count()}/{cap or '∞'}")
+        elif cmd == "remove":
+            symbols = split_symbols(rest)
+            if not symbols:
+                print("Usage: remove SYM1,SYM2,...")
+                continue
+            results = await driver.remove_symbols(symbols)
+            for sym, status in results.items():
+                print(f"  {sym}: {status}")
+            print(f"Tracking {driver.symbol_count()}/{cap or '∞'}")
+        elif cmd in ("list", "status", "tickers"):
+            tracked = driver.status()
+            total = len(tracked["live"]) + len(tracked["pending"])
+            print(f"Tracking {total}/{cap or '∞'}")
+            if tracked["live"]:
+                print(f"  live    ({len(tracked['live'])}): {', '.join(tracked['live'])}")
+            if tracked["pending"]:
+                print(
+                    f"  pending ({len(tracked['pending'])}): "
+                    f"{', '.join(tracked['pending'])}"
+                )
+            if not total:
+                print("  (none yet)")
+        else:
+            print("Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'list', 'quit'.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -244,39 +379,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Let a single bar both breach and reclaim the level",
     )
     r.add_argument(
-        "--min-excursion-adr",
-        type=float,
-        default=0.1,
-        help="Minimum breach depth past the level, in ADR units (0 = off)",
-    )
-    r.add_argument(
         "--min-excursion-pct",
         type=float,
-        default=0.5,
+        default=0.6,
         help="Minimum breach depth past the level, as %% of the level's price "
-        "(0 = off). Excursion passes on EITHER this OR --min-excursion-adr, "
-        "whichever is more lenient -- high-ADR names break their levels by a "
-        "smaller fraction of ADR, so ADR alone under-catches them.",
-    )
-    r.add_argument(
-        "--min-reclaim-adr",
-        type=float,
-        default=0.1,
-        help="Minimum reclaim distance past the level, in ADR units (0 = off)",
+        "(0 = off).",
     )
     r.add_argument(
         "--min-reclaim-pct",
         type=float,
-        default=0.5,
+        default=0.6,
         help="Minimum reclaim distance past the level, as %% of the level's "
-        "price (0 = off). Reclaim passes on EITHER this OR --min-reclaim-adr, "
-        "same OR logic as excursion.",
+        "price (0 = off).",
+    )
+    r.add_argument(
+        "--min-combined-pct",
+        type=float,
+        default=1.5,
+        help="Minimum excursion + reclaim combined, as %% of the level's "
+        "price (0 = off). Catches a move that clears both individual floors "
+        "but is still small overall.",
     )
     r.add_argument(
         "--adr-sessions",
         type=int,
         default=14,
-        help="Sessions used for ADR (default 14)",
+        help="Sessions used for ADR (default 14). ADR is no longer used to "
+        "filter triggers -- it is still fetched for the watchlist-wide ADR "
+        "range in the report header and recorded as a diagnostic on each "
+        "trigger.",
     )
     r.add_argument(
         "--purge",
@@ -288,17 +419,84 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--host", default="127.0.0.1")
     r.add_argument("--port", type=int, default=4001)
     r.add_argument("--client-id", type=int, default=21)
+
+    lv = sub.add_parser(
+        "live", help="Run a live scan against IBKR with an interactive add/remove prompt"
+    )
+    lv.add_argument(
+        "--tickers", default="", help="Comma or space separated, initial watchlist"
+    )
+    lv.add_argument("--tickers-file", default="")
+    lv.add_argument(
+        "--bar-size",
+        default="1 min",
+        help="Also the update frequency: setups evaluate on bar completion",
+    )
+    lv.add_argument(
+        "--setups", default="", help="Comma separated, e.g. 'U&R'. Default: all"
+    )
+    lv.add_argument(
+        "--allow-same-bar-reclaim",
+        action="store_true",
+        help="Let a single bar both breach and reclaim the level",
+    )
+    lv.add_argument(
+        "--min-excursion-pct",
+        type=float,
+        default=0.6,
+        help="Minimum breach depth past the level, as %% of the level's price "
+        "(0 = off).",
+    )
+    lv.add_argument(
+        "--min-reclaim-pct",
+        type=float,
+        default=0.6,
+        help="Minimum reclaim distance past the level, as %% of the level's "
+        "price (0 = off).",
+    )
+    lv.add_argument(
+        "--min-combined-pct",
+        type=float,
+        default=1.5,
+        help="Minimum excursion + reclaim combined, as %% of the level's "
+        "price (0 = off).",
+    )
+    lv.add_argument(
+        "--max-tickers",
+        type=int,
+        default=50,
+        help="Cap enforced by the add/remove console (0 = no cap)",
+    )
+    lv.add_argument(
+        "--purge",
+        action="store_true",
+        help="Clear earlier runs first, in place (keeps open DB connections valid)",
+    )
+    lv.add_argument("--db", default="data/astor.db")
+    lv.add_argument("--cache-dir", default="data/bars")
+    lv.add_argument("--host", default="127.0.0.1")
+    lv.add_argument("--port", type=int, default=4001)
+    # Different default from replay's so a live run and a replay backtest
+    # can point at the same IB Gateway/TWS at once without a clientId clash.
+    lv.add_argument("--client-id", type=int, default=22)
+
     return p
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%H:%M:%S",
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        _ETFormatter("%(asctime)s ET %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
     )
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    # ib_async logs its own account/portfolio sync (IB pushes a full update
+    # roughly every 3 minutes once connected) at INFO -- silence that so it
+    # doesn't bury our own INFO/WARNING lines, while keeping ib_async's own
+    # WARNING/ERROR (e.g. "reqHistoricalData: Timeout for ...") visible.
+    logging.getLogger("ib_async").setLevel(logging.WARNING)
     args = build_parser().parse_args()
-    raise SystemExit(asyncio.run(cmd_replay(args)))
+    cmd = {"replay": cmd_replay, "live": cmd_live}[args.command]
+    raise SystemExit(asyncio.run(cmd(args)))
 
 
 if __name__ == "__main__":
