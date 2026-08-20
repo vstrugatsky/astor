@@ -21,12 +21,22 @@ from ib_async import IB
 
 from astor.core.scanner import Scanner
 from astor.core.store import TriggerStore
-from astor.core.types import BarEvent
+from astor.core.types import BarEvent, Trigger
 from astor.drivers.replay import ET, REQUEST_TIMEOUT, ReplayDriver, parse_bar_seconds, to_et
 
 logger = logging.getLogger(__name__)
 
 RTH_OPEN = time(9, 30)
+
+
+def _format_trigger_line(t: Trigger) -> str:
+    avwap, rvol = t.extras.get("avwap"), t.extras.get("rvol")
+    avwap_s = f"{avwap:.2f}" if avwap is not None else "-"
+    rvol_s = f"{rvol:.2f}" if rvol is not None else "-"
+    return (
+        f"[{t.bar_start:%H:%M:%S} ET] TRIGGER {t.symbol:<6} {t.setup:<4} {t.direction:<5} "
+        f"@ {t.trigger_price:.2f}  avwap={avwap_s}  rvol={rvol_s}"
+    )
 
 
 def _target_session(now_et: datetime) -> date:
@@ -265,6 +275,7 @@ class LiveDriver:
                     # is exactly what makes a commit here safe to do this often
                     # without blocking a concurrent reader.
                     store.commit()
+                    print(_format_trigger_line(trigger))
             except Exception:
                 # This runs inside ib_async's event dispatch, off the normal
                 # call stack -- an uncaught exception here is easy to lose

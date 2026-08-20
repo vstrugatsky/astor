@@ -193,6 +193,7 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
         print(
             f"\n{'time':<9} {'symbol':<7} {'setup':<5} {'price':>9} {'level':>9}"
             f" {'exc(%)':>7} {'rec(%)':>7} {'sum(%)':>7}"
+            f" {'avwap':>9} {'rvol':>6}"
             f" {'beyond':>7} {'armed':>6}"
         )
         print("-" * 88)
@@ -204,13 +205,17 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
                 e.get("reclaim_pct"),
                 e.get("combined_pct"),
             )
+            avwap, rvol = e.get("avwap"), e.get("rvol")
             exc_pct_s = f"{exc_pct:.2f}%" if exc_pct is not None else "-"
             rec_pct_s = f"{rec_pct:.2f}%" if rec_pct is not None else "-"
             sum_pct_s = f"{sum_pct:.2f}%" if sum_pct is not None else "-"
+            avwap_s = f"{avwap:.2f}" if avwap is not None else "-"
+            rvol_s = f"{rvol:.2f}" if rvol is not None else "-"
             print(
                 f"{t.bar_start:%H:%M:%S}  {t.symbol:<7} {t.setup:<5} "
                 f"{t.trigger_price:>9.2f} {t.level_value:>9.2f} "
                 f"{exc_pct_s:>7} {rec_pct_s:>7} {sum_pct_s:>7}"
+                f" {avwap_s:>9} {rvol_s:>6}"
                 f" {nbars:>7} {e.get('bars_armed', 0):>6}"
             )
 

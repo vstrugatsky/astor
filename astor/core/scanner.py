@@ -74,7 +74,9 @@ class Scanner:
         if levels is None:
             return []
 
-        self.indicators.setdefault(bar.symbol, SessionIndicators(bar.symbol)).update(bar)
+        indicators = self.indicators.setdefault(bar.symbol, SessionIndicators(bar.symbol))
+        indicators.update(bar)
+        curve = self.curves.get(bar.symbol)
 
         self.bars_evaluated += 1
         fired: list[Trigger] = []
@@ -84,7 +86,7 @@ class Scanner:
             if setup is None:
                 setup = cls(**self.setup_kwargs.get(cls.name, {}))
                 self._state[key] = setup
-            trigger = setup.on_bar(bar, levels)
+            trigger = setup.on_bar(bar, levels, indicators, curve)
             if trigger is not None:
                 fired.append(trigger)
 

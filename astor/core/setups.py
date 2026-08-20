@@ -29,6 +29,14 @@ diagnostics -- for hindsight, since a name that clears its percent filter
 today may or may not have cleared an ADR-scaled one too -- but neither
 decides the outcome anymore.
 
+avwap and rvol are recorded the same way: pure diagnostics, not filtered on.
+Both are context a future setup will likely want as an actual condition
+(price vs. AVWAP, an RVOL floor), but no setup does yet, so for now they are
+just visible on every trigger for hindsight. They come from Scanner's running
+per-symbol state (astor.core.indicators), not from anything a Setup computes
+itself -- a Setup only ever reads them, same relationship it already has
+with DailyLevels.
+
 A bar that breaches the level always arms the setup. The filters are applied
 when it would fire, against the *accumulated* excursion, so an undercut that
 deepens over several bars is judged on its full extent rather than its first
@@ -47,7 +55,8 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from astor.core.types import BarEvent, DailyLevels, Trigger
+from astor.core.indicators import SessionIndicators, compute_rvol
+from astor.core.types import BarEvent, DailyLevels, Trigger, VolumeCurve
 
 
 def _pct_of_level(amount: float, level_value: float) -> float | None:
@@ -72,7 +81,13 @@ class Setup:
     name: ClassVar[str]
     direction: ClassVar[str]
 
-    def on_bar(self, bar: BarEvent, levels: DailyLevels) -> Trigger | None:
+    def on_bar(
+        self,
+        bar: BarEvent,
+        levels: DailyLevels,
+        indicators: SessionIndicators | None = None,
+        curve: VolumeCurve | None = None,
+    ) -> Trigger | None:
         raise NotImplementedError
 
 
@@ -101,7 +116,13 @@ class UndercutRally(Setup):
         self._bars_below = 0  # bars whose low actually broke the level
         self._bars_armed = 0  # bars since the breach, however price behaved
 
-    def on_bar(self, bar: BarEvent, levels: DailyLevels) -> Trigger | None:
+    def on_bar(
+        self,
+        bar: BarEvent,
+        levels: DailyLevels,
+        indicators: SessionIndicators | None = None,
+        curve: VolumeCurve | None = None,
+    ) -> Trigger | None:
         pdl = levels.pdl
 
         if self._undercut_low is None:
@@ -166,6 +187,10 @@ class UndercutRally(Setup):
                 "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,
                 "reclaim_pct": reclaim_pct,
                 "combined_pct": combined_pct,
+                "avwap": indicators.avwap if indicators else None,
+                "rvol": compute_rvol(indicators.cum_volume, bar, curve)
+                if indicators and curve
+                else None,
             },
         )
         self._undercut_low = None
@@ -200,7 +225,13 @@ class OvershootFail(Setup):
         self._bars_above = 0  # bars whose high actually broke the level
         self._bars_armed = 0  # bars since the breach, however price behaved
 
-    def on_bar(self, bar: BarEvent, levels: DailyLevels) -> Trigger | None:
+    def on_bar(
+        self,
+        bar: BarEvent,
+        levels: DailyLevels,
+        indicators: SessionIndicators | None = None,
+        curve: VolumeCurve | None = None,
+    ) -> Trigger | None:
         pdh = levels.pdh
 
         if self._overshoot_high is None:
@@ -262,6 +293,10 @@ class OvershootFail(Setup):
                 "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,
                 "reclaim_pct": reclaim_pct,
                 "combined_pct": combined_pct,
+                "avwap": indicators.avwap if indicators else None,
+                "rvol": compute_rvol(indicators.cum_volume, bar, curve)
+                if indicators and curve
+                else None,
             },
         )
         self._overshoot_high = None

@@ -506,6 +506,36 @@ def test_scanner_backfill_bar_updates_indicators_not_setups() -> None:
           sc.indicators["TEST"].cum_volume, b0.volume + b1.volume)
 
 
+def test_trigger_extras_include_avwap_and_rvol() -> None:
+    """Scanner wires its running indicators/curve into Setup.on_bar, so every
+    trigger carries the current AVWAP and RVOL as diagnostics -- no setup
+    filters on them yet, but they're useful context for all of them."""
+    from astor.core.types import VolumeCurve
+
+    curve = VolumeCurve("TEST", sessions=5, cum_volume_by_minute={time(9, 31): 500.0})
+    sc = Scanner({"TEST": LEVELS}, [UndercutRally])
+    sc.curves["TEST"] = curve
+
+    sc.on_bar(bar(0, 101, 101, 99, 99.5))  # arm, also seeds indicators
+    fired = sc.on_bar(bar(1, 99.5, 101, 99.5, 100.5))  # fire
+    assert fired, "expected a trigger"
+    t = fired[0]
+    assert t.extras["avwap"] is not None, "avwap should be populated from indicators"
+    check("rvol = cum_volume(2000) / curve avg at 09:31(500)", t.extras["rvol"], 4.0)
+
+
+def test_setup_on_bar_defaults_indicators_and_curve_to_none() -> None:
+    """Direct on_bar calls (as every other test in this file makes) must keep
+    working without indicators/curve -- Scanner is the only caller expected
+    to supply them."""
+    s = UndercutRally()
+    s.on_bar(bar(0, 101, 101, 99, 99.5), LEVELS)
+    t = s.on_bar(bar(1, 99.5, 101, 99.5, 100.5), LEVELS)
+    assert t is not None
+    check("avwap is None without indicators", t.extras["avwap"], None)
+    check("rvol is None without indicators/curve", t.extras["rvol"], None)
+
+
 def test_latest_triggers_spans_sessions_and_supersedes_reruns() -> None:
     """latest_triggers is keyed on session, not global recency.
 
