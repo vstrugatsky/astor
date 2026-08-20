@@ -15,3 +15,6 @@ claude-personal
 
 # Generated: replay bar cache and trigger database
 data/
+
+# Personal watchlist, rebuilt every session
+astor/tickers.txt
