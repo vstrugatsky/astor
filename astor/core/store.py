@@ -86,6 +86,12 @@ FROM triggers t;
 -- Keying on session rather than global recency gets both properties: it grows
 -- to cover every session you have replayed, while a rerun of any one session
 -- transparently supersedes its own earlier attempt.
+--
+-- Not filtered by mode: a 'live' run is exactly as much "a run of that
+-- session" as a 'replay' of the same date, and the same supersession logic
+-- should apply across them -- e.g. a replay of today's date run that evening
+-- (to retune filters against today's real triggers) supersedes that
+-- morning's live run for the same session, same as any other rerun would.
 DROP VIEW IF EXISTS latest_run_per_session;
 CREATE VIEW latest_run_per_session AS
 SELECT run_id, session, created_at FROM (
@@ -98,7 +104,6 @@ SELECT run_id, session, created_at FROM (
             ORDER BY r.created_at DESC, r.run_id DESC
         ) AS rn
     FROM runs r
-    WHERE r.mode = 'replay'
 )
 WHERE rn = 1;
 

@@ -598,6 +598,45 @@ def test_latest_triggers_spans_sessions_and_supersedes_reruns() -> None:
     store.close()
 
 
+def test_latest_triggers_includes_live_runs() -> None:
+    """latest_run_per_session must not filter by mode -- a 'live' run is a
+    run of its session exactly like a 'replay' is. This is the regression
+    test for a real bug: the view's WHERE mode='replay' silently excluded
+    every live trigger from latest_triggers (visible only in trigger_detail)
+    until the first live session found it in practice.
+    """
+    import tempfile
+
+    from astor.core.store import TriggerStore
+    from astor.core.types import Trigger
+
+    store = TriggerStore(Path(tempfile.mkdtemp()) / "t.db")
+    session_open = datetime.fromisoformat("2026-08-20T09:30:00").replace(tzinfo=ET)
+    store.start_run("live-1", "live", {"session": "2026-08-20"})
+    store.record(
+        "live-1",
+        Trigger(
+            symbol="ABAT",
+            setup="O&F",
+            direction="short",
+            trigger_price=2.40,
+            bar_start=session_open,
+            bar_end=session_open + timedelta(minutes=1),
+            level_name="PDH",
+            level_value=2.50,
+            extras={"bars_above": 1, "bars_armed": 1},
+        ),
+        session_open + timedelta(minutes=21),
+    )
+    store.commit()
+
+    rows = store.conn.execute(
+        "SELECT run_id, symbol FROM latest_triggers WHERE session = '2026-08-20'"
+    ).fetchall()
+    check("the live run's trigger shows up in latest_triggers", rows, [("live-1", "ABAT")])
+    store.close()
+
+
 def test_store_view_keeps_eastern_time() -> None:
     """The view must report the session's own clock, not UTC.
 
