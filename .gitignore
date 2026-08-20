@@ -17,4 +17,4 @@ claude-personal
 data/
 
 # Personal watchlist, rebuilt every session
-astor/tickers.txt
+tickers.txt
