@@ -755,6 +755,57 @@ def test_latest_triggers_includes_live_runs() -> None:
     store.close()
 
 
+def test_latest_triggers_keeps_live_alongside_the_latest_replay() -> None:
+    """latest_run_per_session partitions by (session, mode), not just
+    session -- a live run for a session is never superseded by a later
+    replay of the same date, or vice versa. Each mode keeps its own
+    latest-wins slot: a live run and a replay of the same session both
+    surface together for side-by-side comparison, while two replays of that
+    same session still collapse to just the newest one.
+    """
+    import tempfile
+
+    from astor.core.store import TriggerStore
+    from astor.core.types import Trigger
+
+    store = TriggerStore(Path(tempfile.mkdtemp()) / "t.db")
+
+    def record_run(run_id: str, mode: str, price: float) -> None:
+        session_open = datetime.fromisoformat("2026-08-20T09:30:00").replace(tzinfo=ET)
+        store.start_run(run_id, mode, {"session": "2026-08-20"})
+        store.record(
+            run_id,
+            Trigger(
+                symbol="TEST",
+                setup="U&R",
+                direction="long",
+                trigger_price=price,
+                bar_start=session_open,
+                bar_end=session_open + timedelta(minutes=1),
+                level_name="PDL",
+                level_value=100.0,
+                extras={"bars_below": 1, "bars_armed": 1},
+            ),
+            session_open + timedelta(minutes=1),
+        )
+        store.commit()
+
+    record_run("live-1", "live", 100.1)  # the morning's live run
+    record_run("replay-1", "replay", 100.2)  # first evening replay attempt
+    record_run("replay-2", "replay", 100.3)  # rerun: supersedes replay-1, not live-1
+
+    rows = store.conn.execute(
+        "SELECT run_id, trigger_price FROM latest_triggers"
+        " WHERE session = '2026-08-20' ORDER BY run_id"
+    ).fetchall()
+    check(
+        "live stays, plus only the newest replay -- not the superseded one",
+        rows,
+        [("live-1", 100.1), ("replay-2", 100.3)],
+    )
+    store.close()
+
+
 def test_store_view_keeps_eastern_time() -> None:
     """The view must report the session's own clock, not UTC.
 

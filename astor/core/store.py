@@ -93,19 +93,22 @@ SELECT
                                                               AS latency_sec
 FROM triggers t;
 
--- The most recent run *per session date*, not the single most recent run
--- overall. Rerunning Friday and then today's session are different sessions,
--- so latest_triggers should show both -- but rerunning the SAME session twice
--- (a threshold tweak) should still show only the newer of the two, not both.
--- Keying on session rather than global recency gets both properties: it grows
--- to cover every session you have replayed, while a rerun of any one session
--- transparently supersedes its own earlier attempt.
+-- The most recent run *per session date, per mode*, not the single most
+-- recent run overall. Rerunning Friday and then today's session are
+-- different sessions, so latest_triggers should show both -- but rerunning
+-- the SAME session in the SAME mode twice (a threshold tweak) should still
+-- show only the newer of the two, not both. Keying on (session, mode) gets
+-- both properties within a mode: it grows to cover every session you have
+-- run, while a rerun of any one session in that mode transparently
+-- supersedes its own earlier attempt in that mode.
 --
--- Not filtered by mode: a 'live' run is exactly as much "a run of that
--- session" as a 'replay' of the same date, and the same supersession logic
--- should apply across them -- e.g. a replay of today's date run that evening
--- (to retune filters against today's real triggers) supersedes that
--- morning's live run for the same session, same as any other rerun would.
+-- Partitioned by mode, not just session: a live run is never superseded by
+-- a later replay of the same date, or vice versa -- they answer different
+-- questions (what was actually caught in real time vs. a full reprocessing
+-- after the fact) and are worth comparing side by side, not clobbering one
+-- another. A rerun *within* the same mode still supersedes as before, so
+-- replaying the same day twice to retune filters doesn't leave two replay
+-- attempts sitting side by side.
 DROP VIEW IF EXISTS latest_run_per_session;
 CREATE VIEW latest_run_per_session AS
 SELECT run_id, session, created_at FROM (
@@ -114,7 +117,7 @@ SELECT run_id, session, created_at FROM (
         json_extract(r.params_json, '$.session') AS session,
         r.created_at,
         ROW_NUMBER() OVER (
-            PARTITION BY json_extract(r.params_json, '$.session')
+            PARTITION BY json_extract(r.params_json, '$.session'), r.mode
             ORDER BY r.created_at DESC, r.run_id DESC
         ) AS rn
     FROM runs r
