@@ -129,6 +129,8 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         levels = await driver.fetch_levels(symbols, args.adr_sessions)
         logger.info("Fetching %s bars for %s...", args.bar_size, session)
         bars = await driver.fetch_bars(symbols)
+        logger.info("Fetching volume curves for RVOL...")
+        curves = await driver.fetch_volume_curve(symbols)
     finally:
         ib.disconnect()
 
@@ -143,6 +145,7 @@ async def cmd_replay(args: argparse.Namespace) -> int:
     )
 
     scanner = Scanner(levels, setups, kwargs)
+    scanner.curves = curves
 
     store = TriggerStore(Path(args.db))
     if args.purge:
