@@ -199,6 +199,7 @@ class UndercutRally(Setup):
 
         avwap = indicators.avwap if indicators else None
         avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
+        level_stop_pct = _pct_of_level(bar.close - pdl, pdl)
         level_shares, level_dollars = _position_size(bar.close, pdl, self.max_loss_dollars)
         session_low = indicators.session_low if indicators else None
         session_extreme_pct = (
@@ -236,6 +237,7 @@ class UndercutRally(Setup):
                 if indicators and curve
                 else None,
                 "max_loss_dollars": self.max_loss_dollars,
+                "level_stop_pct": level_stop_pct,
                 "level_stop_shares": level_shares,
                 "level_stop_dollars": level_dollars,
                 "session_extreme": session_low,
@@ -328,6 +330,7 @@ class OvershootFail(Setup):
 
         avwap = indicators.avwap if indicators else None
         avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
+        level_stop_pct = _pct_of_level(bar.close - pdh, pdh)
         level_shares, level_dollars = _position_size(bar.close, pdh, self.max_loss_dollars)
         session_high = indicators.session_high if indicators else None
         session_extreme_pct = (
@@ -365,6 +368,7 @@ class OvershootFail(Setup):
                 if indicators and curve
                 else None,
                 "max_loss_dollars": self.max_loss_dollars,
+                "level_stop_pct": level_stop_pct,
                 "level_stop_shares": level_shares,
                 "level_stop_dollars": level_dollars,
                 "session_extreme": session_high,

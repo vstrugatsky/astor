@@ -79,6 +79,7 @@ SELECT
     -- the session's actual high/low, which can be much farther for a wide
     -- excursion.
     json_extract(t.extras_json, '$.max_loss_dollars')         AS max_loss_dollars,
+    json_extract(t.extras_json, '$.level_stop_pct')           AS level_stop_pct,
     json_extract(t.extras_json, '$.level_stop_shares')        AS level_stop_shares,
     json_extract(t.extras_json, '$.level_stop_dollars')       AS level_stop_dollars,
     json_extract(t.extras_json, '$.session_extreme')          AS session_extreme,

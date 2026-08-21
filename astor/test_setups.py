@@ -559,6 +559,8 @@ def test_trigger_extras_include_notify_fields() -> None:
     assert t is not None, "expected a fire on the reclaim"
 
     check("avwap_pct is populated", t.extras["avwap_pct"] is not None, True)
+    # entry=102 vs PDL=100 -> (102-100)/100*100, signed like session_extreme_pct
+    check("level_stop_pct", t.extras["level_stop_pct"], 2.0)
     # level stop at PDL=100, entry=102 -> $2 risk/share -> 50 shares @ $102
     check("level_stop_shares", t.extras["level_stop_shares"], 50)
     check("level_stop_dollars", t.extras["level_stop_dollars"], 5100.0)
