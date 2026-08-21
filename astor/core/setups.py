@@ -37,15 +37,22 @@ per-symbol state (astor.core.indicators), not from anything a Setup computes
 itself -- a Setup only ever reads them, same relationship it already has
 with DailyLevels.
 
-Trade-decision context (avwap_pct, the two stop/position-size pairs, the
-session extreme) is the same kind of thing: computed from state the Setup
-already has access to (DailyLevels, SessionIndicators, its own local
-overshoot/undercut), never filtered on, just there for whoever reads the
-trigger. Two stops are offered because they answer different questions: PDH/
-PDL is the technical level the setup is anchored to, while the session's
+Trade-decision context (avwap_pct, level_stop_pct, the two stop/position-size
+pairs, the session extreme) is the same kind of thing: computed from state
+the Setup already has access to (DailyLevels, SessionIndicators, its own
+local overshoot/undercut), never filtered on, just there for whoever reads
+the trigger. Two stops are offered because they answer different questions:
+PDH/PDL is the technical level the setup is anchored to, while the session's
 actual high/low is where price really got to -- for a big excursion those
 diverge a lot, and a trader sizing off the level alone could be sizing for a
 tighter stop than the move already proved it could reach.
+
+avwap_pct is signed (positive = above, negative = below) since that's a
+meaningfully directional comparison. level_stop_pct and session_extreme_pct
+are unsigned: a stop's distance is a positive number a trader thinks in, not
+something whose sign should carry the long/short direction -- and a clean
+positive distance is also what padding a stop by some percent (likely coming
+later) will want to add to.
 
 A bar that breaches the level always arms the setup. The filters are applied
 when it would fire, against the *accumulated* excursion, so an undercut that
@@ -73,6 +80,18 @@ def _pct_of_level(amount: float, level_value: float) -> float | None:
     """amount expressed as a percent of the level price, e.g. excursion or
     reclaim distance against PDL/PDH."""
     return round(amount / level_value * 100.0, 4) if level_value > 0 else None
+
+
+def _abs_pct_of_level(amount: float, level_value: float) -> float | None:
+    """Magnitude version of _pct_of_level, for stop-distance fields
+    (level_stop_pct, session_extreme_pct) -- a trader thinks of a stop's
+    distance as a positive number, not something whose sign carries the
+    long/short direction. (Left as a separate helper, not baked into those
+    two call sites, since padding a stop by some percent is likely coming
+    and will want to add to a clean positive distance, not fight a sign.)
+    """
+    pct = _pct_of_level(amount, level_value)
+    return abs(pct) if pct is not None else None
 
 
 def _min_pct_passes(
@@ -199,11 +218,11 @@ class UndercutRally(Setup):
 
         avwap = indicators.avwap if indicators else None
         avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
-        level_stop_pct = _pct_of_level(bar.close - pdl, pdl)
+        level_stop_pct = _abs_pct_of_level(bar.close - pdl, pdl)
         level_shares, level_dollars = _position_size(bar.close, pdl, self.max_loss_dollars)
         session_low = indicators.session_low if indicators else None
         session_extreme_pct = (
-            _pct_of_level(bar.close - session_low, session_low) if session_low else None
+            _abs_pct_of_level(bar.close - session_low, session_low) if session_low else None
         )
         session_shares, session_dollars = (
             _position_size(bar.close, session_low, self.max_loss_dollars)
@@ -330,11 +349,11 @@ class OvershootFail(Setup):
 
         avwap = indicators.avwap if indicators else None
         avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
-        level_stop_pct = _pct_of_level(bar.close - pdh, pdh)
+        level_stop_pct = _abs_pct_of_level(bar.close - pdh, pdh)
         level_shares, level_dollars = _position_size(bar.close, pdh, self.max_loss_dollars)
         session_high = indicators.session_high if indicators else None
         session_extreme_pct = (
-            _pct_of_level(bar.close - session_high, session_high) if session_high else None
+            _abs_pct_of_level(bar.close - session_high, session_high) if session_high else None
         )
         session_shares, session_dollars = (
             _position_size(bar.close, session_high, self.max_loss_dollars)

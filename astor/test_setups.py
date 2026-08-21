@@ -559,7 +559,7 @@ def test_trigger_extras_include_notify_fields() -> None:
     assert t is not None, "expected a fire on the reclaim"
 
     check("avwap_pct is populated", t.extras["avwap_pct"] is not None, True)
-    # entry=102 vs PDL=100 -> (102-100)/100*100, signed like session_extreme_pct
+    # entry=102 vs PDL=100 -> abs((102-100)/100*100)
     check("level_stop_pct", t.extras["level_stop_pct"], 2.0)
     # level stop at PDL=100, entry=102 -> $2 risk/share -> 50 shares @ $102
     check("level_stop_shares", t.extras["level_stop_shares"], 50)
@@ -569,6 +569,34 @@ def test_trigger_extras_include_notify_fields() -> None:
     check("session_stop_shares", t.extras["session_stop_shares"], 25)
     check("session_stop_dollars", t.extras["session_stop_dollars"], 2550.0)
     check("max_loss_dollars recorded", t.extras["max_loss_dollars"], 100.0)
+
+
+def test_notify_pct_fields_are_unsigned_for_short_setups() -> None:
+    """level_stop_pct/session_extreme_pct are a stop's distance -- a trader
+    thinks of that as a positive number regardless of direction, unlike
+    avwap_pct, which stays signed since above/below AVWAP is meaningfully
+    directional. For a short (O&F), (close - PDH)/PDH and (close - session
+    high)/session high are both naturally negative; this locks in that they
+    get reported as positive magnitudes anyway.
+    """
+    from astor.core.indicators import SessionIndicators
+
+    ind = SessionIndicators("TEST")
+    s = OvershootFail(max_loss_dollars=100.0)
+
+    b0 = bar(0, 104, 106, 104, 105.5)  # arm, high=106 -> overshoot_high=106
+    ind.update(b0)
+    s.on_bar(b0, LEVELS, ind)
+
+    b1 = bar(1, 105.5, 107, 104.5, 104.0)  # session high -> 107, close=104 -> fire
+    ind.update(b1)
+    t = s.on_bar(b1, LEVELS, ind)
+    assert t is not None, "expected a fire on the fail"
+
+    # close=104 vs PDH=105 -> abs((104-105)/105*100)
+    check("level_stop_pct is a positive magnitude", t.extras["level_stop_pct"], 0.9524)
+    # session high = 107 (set by b1) -> abs((104-107)/107*100)
+    check("session_extreme_pct is a positive magnitude", t.extras["session_extreme_pct"], 2.8037)
 
 
 def test_format_trigger_line() -> None:
@@ -589,10 +617,11 @@ def test_format_trigger_line() -> None:
             "adr_pct": 8.2,
             "rvol": 1.5,
             "reclaim_pct": 0.85,
+            "level_stop_pct": 0.85,
             "level_stop_shares": 417,
             "level_stop_dollars": 1000.80,
             "session_extreme": 2.55,
-            "session_extreme_pct": -5.23,
+            "session_extreme_pct": 5.23,  # unsigned -- a stop distance, not a direction
             "session_stop_shares": 196,
             "session_stop_dollars": 470.40,
         },
