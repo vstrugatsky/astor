@@ -58,6 +58,7 @@ SELECT
     substr(t.bar_start, 12, 8) AS trigger_time,
     t.symbol,
     t.setup,
+    t.direction,
     t.trigger_price,
     t.level_value,
     -- U&R and O&F record mirrored key names; coalescing gives one column each.
@@ -71,7 +72,19 @@ SELECT
     json_extract(t.extras_json, '$.combined_pct')             AS combined_pct,
     json_extract(t.extras_json, '$.adr_pct')                  AS adr_pct,
     json_extract(t.extras_json, '$.avwap')                    AS avwap,
+    json_extract(t.extras_json, '$.avwap_pct')                AS avwap_pct,
     json_extract(t.extras_json, '$.rvol')                     AS rvol,
+    -- Notify's trade-decision fields: two stop/position-size framings, one
+    -- off the technical level (PDH/PDL, in level_value already) and one off
+    -- the session's actual high/low, which can be much farther for a wide
+    -- excursion.
+    json_extract(t.extras_json, '$.max_loss_dollars')         AS max_loss_dollars,
+    json_extract(t.extras_json, '$.level_stop_shares')        AS level_stop_shares,
+    json_extract(t.extras_json, '$.level_stop_dollars')       AS level_stop_dollars,
+    json_extract(t.extras_json, '$.session_extreme')          AS session_extreme,
+    json_extract(t.extras_json, '$.session_extreme_pct')      AS session_extreme_pct,
+    json_extract(t.extras_json, '$.session_stop_shares')      AS session_stop_shares,
+    json_extract(t.extras_json, '$.session_stop_dollars')     AS session_stop_dollars,
     -- detection_ts equals bar_end exactly in Replay, so showing both is noise.
     -- The difference is the only part that carries information, and it is what
     -- Live will populate: how long after the bar closed the trigger was seen.

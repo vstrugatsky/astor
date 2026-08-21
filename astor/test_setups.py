@@ -524,6 +524,86 @@ def test_trigger_extras_include_avwap_and_rvol() -> None:
     check("rvol = cum_volume(2000) / curve avg at 09:31(500)", t.extras["rvol"], 4.0)
 
 
+def test_position_size() -> None:
+    from astor.core.setups import _position_size
+
+    shares, dollars = _position_size(entry=100.0, stop=98.0, max_loss=100.0)
+    check("shares = floor(100 / 2)", shares, 50)
+    check("dollars = 50 * entry", dollars, 5000.0)
+
+    check("zero risk per share -> no size", _position_size(100.0, 100.0, 100.0), (None, None))
+    check(
+        "risk too wide for even one share -> no size",
+        _position_size(100.0, 50.0, 10.0),
+        (None, None),
+    )
+    check("non-positive max_loss -> no size", _position_size(100.0, 98.0, 0.0), (None, None))
+
+
+def test_trigger_extras_include_notify_fields() -> None:
+    """avwap_pct and both stop/position-size pairs (technical level, session
+    extreme) are computed the same way avwap/rvol are -- from Scanner-
+    supplied indicators, recorded but never filtered on."""
+    from astor.core.indicators import SessionIndicators
+
+    ind = SessionIndicators("TEST")
+    s = UndercutRally(max_loss_dollars=100.0)
+
+    b0 = bar(0, 101, 101, 99, 99.5)  # arm, low=99
+    ind.update(b0)
+    s.on_bar(b0, LEVELS, ind)
+
+    b1 = bar(1, 99.5, 101, 98, 102)  # session low drops to 98, close=102 -> fire
+    ind.update(b1)
+    t = s.on_bar(b1, LEVELS, ind)
+    assert t is not None, "expected a fire on the reclaim"
+
+    check("avwap_pct is populated", t.extras["avwap_pct"] is not None, True)
+    # level stop at PDL=100, entry=102 -> $2 risk/share -> 50 shares @ $102
+    check("level_stop_shares", t.extras["level_stop_shares"], 50)
+    check("level_stop_dollars", t.extras["level_stop_dollars"], 5100.0)
+    # session low is 98 (set by b1), entry=102 -> $4 risk/share -> 25 shares
+    check("session_extreme is the session low", t.extras["session_extreme"], 98)
+    check("session_stop_shares", t.extras["session_stop_shares"], 25)
+    check("session_stop_dollars", t.extras["session_stop_dollars"], 2550.0)
+    check("max_loss_dollars recorded", t.extras["max_loss_dollars"], 100.0)
+
+
+def test_format_trigger_line() -> None:
+    from astor.core.types import Trigger
+    from astor.drivers.live import _format_trigger_line
+
+    t = Trigger(
+        symbol="ABAT",
+        setup="O&F",
+        direction="short",
+        trigger_price=2.40,
+        bar_start=OPEN,
+        bar_end=OPEN + timedelta(minutes=1),
+        level_name="PDH",
+        level_value=2.50,
+        extras={
+            "avwap_pct": -3.1,
+            "adr_pct": 8.2,
+            "rvol": 1.5,
+            "reclaim_pct": 0.85,
+            "level_stop_shares": 417,
+            "level_stop_dollars": 1000.80,
+            "session_extreme": 2.55,
+            "session_extreme_pct": -5.23,
+            "session_stop_shares": 196,
+            "session_stop_dollars": 470.40,
+        },
+    )
+    line = _format_trigger_line(t)
+    check("headline present", "TRIGGER ABAT" in line, True)
+    check("avwap shown signed", "avwap -3.10%" in line, True)
+    check("level line reads as a magnitude + word, short -> below", "PDH 0.85% below" in line, True)
+    check("level position size shown", "417 sh ($1,001)" in line, True)
+    check("session line uses CDH for a short, aligned with PDH", "CDH 5.23% below" in line, True)
+    check("session position size shown", "196 sh ($470)" in line, True)
+
+
 def test_setup_on_bar_defaults_indicators_and_curve_to_none() -> None:
     """Direct on_bar calls (as every other test in this file makes) must keep
     working without indicators/curve -- Scanner is the only caller expected
@@ -534,6 +614,13 @@ def test_setup_on_bar_defaults_indicators_and_curve_to_none() -> None:
     assert t is not None
     check("avwap is None without indicators", t.extras["avwap"], None)
     check("rvol is None without indicators/curve", t.extras["rvol"], None)
+    check("avwap_pct is None without indicators", t.extras["avwap_pct"], None)
+    check("session_extreme is None without indicators", t.extras["session_extreme"], None)
+    check("session_stop_shares is None without indicators", t.extras["session_stop_shares"], None)
+    # level_stop_shares/dollars don't need indicators -- PDL and trigger_price
+    # are already known -- so they should still be populated here. close=100.5,
+    # PDL=100 -> $0.50 risk/share, $100 max loss -> 200 shares.
+    check("level_stop_shares still computed from levels alone", t.extras["level_stop_shares"], 200)
 
 
 def test_latest_triggers_spans_sessions_and_supersedes_reruns() -> None:

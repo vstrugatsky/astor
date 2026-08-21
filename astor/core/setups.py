@@ -37,6 +37,16 @@ per-symbol state (astor.core.indicators), not from anything a Setup computes
 itself -- a Setup only ever reads them, same relationship it already has
 with DailyLevels.
 
+Trade-decision context (avwap_pct, the two stop/position-size pairs, the
+session extreme) is the same kind of thing: computed from state the Setup
+already has access to (DailyLevels, SessionIndicators, its own local
+overshoot/undercut), never filtered on, just there for whoever reads the
+trigger. Two stops are offered because they answer different questions: PDH/
+PDL is the technical level the setup is anchored to, while the session's
+actual high/low is where price really got to -- for a big excursion those
+diverge a lot, and a trader sizing off the level alone could be sizing for a
+tighter stop than the move already proved it could reach.
+
 A bar that breaches the level always arms the setup. The filters are applied
 when it would fire, against the *accumulated* excursion, so an undercut that
 deepens over several bars is judged on its full extent rather than its first
@@ -75,6 +85,24 @@ def _min_pct_passes(
     return passes, pct
 
 
+def _position_size(
+    entry: float, stop: float, max_loss: float
+) -> tuple[int | None, float | None]:
+    """Shares and notional dollars sized so that a stop-out at `stop` loses
+    at most `max_loss`, entering at `entry`. (None, None) if that can't be
+    done meaningfully: no distance between entry and stop (division by zero,
+    or the setup and the stop reference happen to coincide), or the risk per
+    share is too large to buy even one share within the budget.
+    """
+    risk_per_share = abs(entry - stop)
+    if risk_per_share <= 0 or max_loss <= 0:
+        return None, None
+    shares = int(max_loss / risk_per_share)
+    if shares <= 0:
+        return None, None
+    return shares, round(shares * entry, 2)
+
+
 class Setup:
     """One setup tracked for one symbol. Instances are stateful."""
 
@@ -106,11 +134,13 @@ class UndercutRally(Setup):
         min_excursion_pct: float = 0.0,
         min_reclaim_pct: float = 0.0,
         min_combined_pct: float = 0.0,
+        max_loss_dollars: float = 100.0,
     ):
         self.allow_same_bar_reclaim = allow_same_bar_reclaim
         self.min_excursion_pct = min_excursion_pct
         self.min_reclaim_pct = min_reclaim_pct
         self.min_combined_pct = min_combined_pct
+        self.max_loss_dollars = max_loss_dollars
         self._undercut_low: float | None = None
         self._undercut_start = None
         self._bars_below = 0  # bars whose low actually broke the level
@@ -167,6 +197,19 @@ class UndercutRally(Setup):
         ):
             return None  # stay armed: each half is fine, the whole move isn't
 
+        avwap = indicators.avwap if indicators else None
+        avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
+        level_shares, level_dollars = _position_size(bar.close, pdl, self.max_loss_dollars)
+        session_low = indicators.session_low if indicators else None
+        session_extreme_pct = (
+            _pct_of_level(bar.close - session_low, session_low) if session_low else None
+        )
+        session_shares, session_dollars = (
+            _position_size(bar.close, session_low, self.max_loss_dollars)
+            if session_low
+            else (None, None)
+        )
+
         trigger = Trigger(
             symbol=bar.symbol,
             setup=self.name,
@@ -187,10 +230,18 @@ class UndercutRally(Setup):
                 "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,
                 "reclaim_pct": reclaim_pct,
                 "combined_pct": combined_pct,
-                "avwap": indicators.avwap if indicators else None,
+                "avwap": avwap,
+                "avwap_pct": avwap_pct,
                 "rvol": compute_rvol(indicators.cum_volume, bar, curve)
                 if indicators and curve
                 else None,
+                "max_loss_dollars": self.max_loss_dollars,
+                "level_stop_shares": level_shares,
+                "level_stop_dollars": level_dollars,
+                "session_extreme": session_low,
+                "session_extreme_pct": session_extreme_pct,
+                "session_stop_shares": session_shares,
+                "session_stop_dollars": session_dollars,
             },
         )
         self._undercut_low = None
@@ -215,11 +266,13 @@ class OvershootFail(Setup):
         min_excursion_pct: float = 0.0,
         min_reclaim_pct: float = 0.0,
         min_combined_pct: float = 0.0,
+        max_loss_dollars: float = 100.0,
     ):
         self.allow_same_bar_fail = allow_same_bar_fail
         self.min_excursion_pct = min_excursion_pct
         self.min_reclaim_pct = min_reclaim_pct
         self.min_combined_pct = min_combined_pct
+        self.max_loss_dollars = max_loss_dollars
         self._overshoot_high: float | None = None
         self._overshoot_start = None
         self._bars_above = 0  # bars whose high actually broke the level
@@ -273,6 +326,19 @@ class OvershootFail(Setup):
         ):
             return None  # stay armed: each half is fine, the whole move isn't
 
+        avwap = indicators.avwap if indicators else None
+        avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
+        level_shares, level_dollars = _position_size(bar.close, pdh, self.max_loss_dollars)
+        session_high = indicators.session_high if indicators else None
+        session_extreme_pct = (
+            _pct_of_level(bar.close - session_high, session_high) if session_high else None
+        )
+        session_shares, session_dollars = (
+            _position_size(bar.close, session_high, self.max_loss_dollars)
+            if session_high
+            else (None, None)
+        )
+
         trigger = Trigger(
             symbol=bar.symbol,
             setup=self.name,
@@ -293,10 +359,18 @@ class OvershootFail(Setup):
                 "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,
                 "reclaim_pct": reclaim_pct,
                 "combined_pct": combined_pct,
-                "avwap": indicators.avwap if indicators else None,
+                "avwap": avwap,
+                "avwap_pct": avwap_pct,
                 "rvol": compute_rvol(indicators.cum_volume, bar, curve)
                 if indicators and curve
                 else None,
+                "max_loss_dollars": self.max_loss_dollars,
+                "level_stop_shares": level_shares,
+                "level_stop_dollars": level_dollars,
+                "session_extreme": session_high,
+                "session_extreme_pct": session_extreme_pct,
+                "session_stop_shares": session_shares,
+                "session_stop_dollars": session_dollars,
             },
         )
         self._overshoot_high = None

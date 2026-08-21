@@ -75,12 +75,14 @@ def _setups_and_kwargs(args: argparse.Namespace):
             "min_excursion_pct": args.min_excursion_pct,
             "min_reclaim_pct": args.min_reclaim_pct,
             "min_combined_pct": args.min_combined_pct,
+            "max_loss_dollars": args.max_loss,
         },
         "O&F": {
             "allow_same_bar_fail": args.allow_same_bar_reclaim,
             "min_excursion_pct": args.min_excursion_pct,
             "min_reclaim_pct": args.min_reclaim_pct,
             "min_combined_pct": args.min_combined_pct,
+            "max_loss_dollars": args.max_loss,
         },
     }
     return setups, kwargs
@@ -115,6 +117,7 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         "min_reclaim_pct": args.min_reclaim_pct,
         "min_combined_pct": args.min_combined_pct,
         "adr_sessions": args.adr_sessions,
+        "max_loss": args.max_loss,
     }
 
     ib = IB()
@@ -258,6 +261,7 @@ async def cmd_live(args: argparse.Namespace) -> int:
                 "min_excursion_pct": args.min_excursion_pct,
                 "min_reclaim_pct": args.min_reclaim_pct,
                 "min_combined_pct": args.min_combined_pct,
+                "max_loss": args.max_loss,
             },
         )
 
@@ -415,6 +419,14 @@ def build_parser() -> argparse.ArgumentParser:
         "trigger.",
     )
     r.add_argument(
+        "--max-loss",
+        type=float,
+        default=100.0,
+        help="Max loss in dollars a stop-out is assumed to cost, for the "
+        "position-size diagnostics recorded on each trigger (both a stop at "
+        "PDH/PDL and a stop at the session's actual high/low are sized).",
+    )
+    r.add_argument(
         "--purge",
         action="store_true",
         help="Clear earlier runs first, in place (keeps open DB connections valid)",
@@ -465,6 +477,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.5,
         help="Minimum excursion + reclaim combined, as %% of the level's "
         "price (0 = off).",
+    )
+    lv.add_argument(
+        "--max-loss",
+        type=float,
+        default=100.0,
+        help="Max loss in dollars a stop-out is assumed to cost, for the "
+        "position-size diagnostics on each trigger (both a stop at PDH/PDL "
+        "and a stop at the session's actual high/low are sized).",
     )
     lv.add_argument(
         "--max-tickers",

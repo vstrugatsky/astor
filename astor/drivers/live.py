@@ -46,13 +46,63 @@ BACKFILL_TIMEOUT = 15.0
 
 
 def _format_trigger_line(t: Trigger) -> str:
-    avwap, rvol = t.extras.get("avwap"), t.extras.get("rvol")
-    avwap_s = f"{avwap:.2f}" if avwap is not None else "-"
-    rvol_s = f"{rvol:.2f}" if rvol is not None else "-"
-    return (
+    """Everything Notify shows for a fired trigger: the headline, then the
+    two stop/position-size framings (technical level vs. the session's
+    actual extreme) side by side, so a wide excursion's real risk is visible
+    right next to the tighter, level-only view.
+    """
+    e = t.extras
+    avwap_pct, adr_pct, rvol = e.get("avwap_pct"), e.get("adr_pct"), e.get("rvol")
+    level_pct = e.get("reclaim_pct")  # already a clean "how far the good way" magnitude
+    level_shares, level_dollars = e.get("level_stop_shares"), e.get("level_stop_dollars")
+    session_extreme = e.get("session_extreme")
+    session_pct = e.get("session_extreme_pct")
+    session_shares, session_dollars = e.get("session_stop_shares"), e.get("session_stop_dollars")
+
+    toward = "below" if t.direction == "short" else "above"
+    # CDH/CDL (current-day high/low) -- same 3-letter shape as PDH/PDL so the
+    # two lines line up.
+    session_label = "CDH" if t.direction == "short" else "CDL"
+
+    def signed(v: float | None) -> str:
+        return f"{v:+.2f}%" if v is not None else "n/a"
+
+    def magnitude(v: float | None) -> str:
+        return f"{abs(v):.2f}%" if v is not None else "n/a"
+
+    def sized(shares: int | None, dollars: float | None) -> str:
+        return f"{shares} sh (${dollars:,.0f})" if shares is not None else "no size (risk too wide)"
+
+    lines = [
         f"[{t.bar_start:%H:%M:%S} ET] TRIGGER {t.symbol:<6} {t.setup:<4} {t.direction:<5} "
-        f"@ {t.trigger_price:.2f}  avwap={avwap_s}  rvol={rvol_s}"
-    )
+        f"@ {t.trigger_price:.2f}   avwap {signed(avwap_pct)}   adr {magnitude(adr_pct)}"
+        f"   rvol {rvol if rvol is not None else 'n/a'}",
+        f"    {t.level_name:<3} {magnitude(level_pct)} {toward}, stop {t.level_value:.2f}"
+        f"  ->  {sized(level_shares, level_dollars)}",
+    ]
+    if session_extreme is not None:
+        lines.append(
+            f"    {session_label:<3} {magnitude(session_pct)} {toward}, stop {session_extreme:.2f}"
+            f"  ->  {sized(session_shares, session_dollars)}"
+        )
+    return "\n".join(lines)
+
+
+# Terminal bell -- most terminals (Terminal.app, iTerm2) sound it without any
+# extra dependency, but it's a per-terminal setting: check yours isn't set to
+# silent or visual-only if you don't hear it.
+_BELL = "\a"
+_ANSI_BOLD = "\033[1m"
+_ANSI_GREEN = "\033[92m"
+_ANSI_RED = "\033[91m"
+_ANSI_RESET = "\033[0m"
+
+
+def _print_trigger_alert(t: Trigger) -> None:
+    """Bell + bold color, not just a plain print -- a trigger scrolling by
+    silently in a wall of other output is exactly what this is for."""
+    color = _ANSI_GREEN if t.direction == "long" else _ANSI_RED
+    print(f"{_BELL}{_ANSI_BOLD}{color}{_format_trigger_line(t)}{_ANSI_RESET}")
 
 
 def _target_session(now_et: datetime) -> date:
@@ -306,7 +356,7 @@ class LiveDriver:
                     # is exactly what makes a commit here safe to do this often
                     # without blocking a concurrent reader.
                     store.commit()
-                    print(_format_trigger_line(trigger))
+                    _print_trigger_alert(trigger)
             except Exception:
                 # This runs inside ib_async's event dispatch, off the normal
                 # call stack -- an uncaught exception here is easy to lose

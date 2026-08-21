@@ -14,15 +14,24 @@ from astor.core.types import BarEvent, VolumeCurve
 
 @dataclass
 class SessionIndicators:
-    """AVWAP and the running volume this symbol's RVOL is computed from,
-    anchored to the first bar this instance ever sees -- the caller (Scanner)
-    is responsible for starting a fresh instance at the first bar of the day.
+    """AVWAP, the running volume this symbol's RVOL is computed from, and the
+    session's true high/low -- all anchored to the first bar this instance
+    ever sees. The caller (Scanner) is responsible for starting a fresh
+    instance at the first bar of the day.
+
+    session_high/session_low are the day's actual intraday extremes, distinct
+    from a Setup's own overshoot_high/undercut_low: those reset every time a
+    setup fires and re-arms, so a second O&F later in the day only reflects
+    its own local overshoot, not necessarily the day's real high if an
+    earlier, bigger spike happened before this arming.
     """
 
     symbol: str
     cum_volume: float = 0.0
     cum_vol_price: float = 0.0  # sum(volume * typical_price)
     first_bar_start: datetime | None = None
+    session_high: float | None = None
+    session_low: float | None = None
 
     def update(self, bar: BarEvent) -> None:
         typical = (bar.high + bar.low + bar.close) / 3.0
@@ -30,6 +39,12 @@ class SessionIndicators:
         self.cum_vol_price += bar.volume * typical
         if self.first_bar_start is None:
             self.first_bar_start = bar.start
+        self.session_high = bar.high if self.session_high is None else max(
+            self.session_high, bar.high
+        )
+        self.session_low = bar.low if self.session_low is None else min(
+            self.session_low, bar.low
+        )
 
     @property
     def avwap(self) -> float | None:
