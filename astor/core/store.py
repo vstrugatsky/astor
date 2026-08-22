@@ -141,6 +141,22 @@ CREATE VIEW latest_triggers AS
 SELECT * FROM trigger_detail
 WHERE run_id IN (SELECT run_id FROM latest_run_per_session)
 ORDER BY session, trigger_time;
+
+-- Every other column here is derived (from triggers/runs, or computed by a
+-- run) -- only is_tradeable/notes are meant to be hand-edited, so this is
+-- the one write path the trigger allows. DROP VIEW already drops any
+-- trigger defined on it, but this still needs re-creating here since it is
+-- itself dropped and rebuilt right along with the view every connect.
+DROP TRIGGER IF EXISTS latest_triggers_review_update;
+CREATE TRIGGER latest_triggers_review_update
+INSTEAD OF UPDATE ON latest_triggers
+FOR EACH ROW
+BEGIN
+    UPDATE triggers
+    SET is_tradeable = NEW.is_tradeable,
+        notes = NEW.notes
+    WHERE id = OLD.id;
+END;
 """
 
 

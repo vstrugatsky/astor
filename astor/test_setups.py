@@ -770,6 +770,51 @@ def test_is_tradeable_defaults_to_n_and_notes_is_editable() -> None:
     store.close()
 
 
+def test_latest_triggers_review_columns_editable_through_the_view() -> None:
+    """latest_triggers is a plain view (joins, a WHERE-IN subquery, an ORDER
+    BY) -- SQLite treats that as read-only unless an INSTEAD OF trigger says
+    otherwise. DataGrip users edit grid cells straight on latest_triggers, so
+    an UPDATE issued against the view (not the underlying triggers table)
+    must actually take, redirected by id to the one row it names."""
+    import tempfile
+
+    from astor.core.store import TriggerStore
+    from astor.core.types import Trigger
+
+    store = TriggerStore(Path(tempfile.mkdtemp()) / "t.db")
+    store.start_run("r1", "replay", {"session": "2026-08-14"})
+    store.record(
+        "r1",
+        Trigger(
+            symbol="TEST",
+            setup="U&R",
+            direction="long",
+            trigger_price=100.1,
+            bar_start=OPEN,
+            bar_end=OPEN + timedelta(minutes=1),
+            level_name="PDL",
+            level_value=100.0,
+            extras={},
+        ),
+        OPEN + timedelta(minutes=1),
+    )
+    store.commit()
+
+    row_id = store.conn.execute("SELECT id FROM triggers").fetchone()[0]
+    store.conn.execute(
+        "UPDATE latest_triggers SET is_tradeable = 'Y', notes = 'via view' WHERE id = ?",
+        (row_id,),
+    )
+    store.commit()
+
+    row = store.conn.execute(
+        "SELECT is_tradeable, notes FROM triggers WHERE id = ?", (row_id,)
+    ).fetchone()
+    check("is_tradeable written through the view", row[0], "Y")
+    check("notes written through the view", row[1], "via view")
+    store.close()
+
+
 def test_migrate_adds_review_columns_to_a_pre_existing_db() -> None:
     """A database created before is_tradeable/notes existed must gain them
     on the next open -- CREATE TABLE IF NOT EXISTS alone would leave an
