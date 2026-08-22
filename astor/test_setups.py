@@ -569,6 +569,11 @@ def test_trigger_extras_include_notify_fields() -> None:
     check("session_stop_shares", t.extras["session_stop_shares"], 25)
     check("session_stop_dollars", t.extras["session_stop_dollars"], 2550.0)
     check("max_loss_dollars recorded", t.extras["max_loss_dollars"], 100.0)
+    # session_open is b0's open (101); session_high is b1's high (101, unchanged
+    # since b1's high never beat b0's), session_low is b1's low (98)
+    check("session_open recorded", t.extras["session_open"], 101)
+    check("session_high recorded", t.extras["session_high"], 101)
+    check("session_low recorded", t.extras["session_low"], 98)
 
 
 def test_notify_pct_fields_are_unsigned_for_short_setups() -> None:
@@ -597,6 +602,9 @@ def test_notify_pct_fields_are_unsigned_for_short_setups() -> None:
     check("level_stop_pct is a positive magnitude", t.extras["level_stop_pct"], 0.9524)
     # session high = 107 (set by b1) -> abs((104-107)/107*100)
     check("session_extreme_pct is a positive magnitude", t.extras["session_extreme_pct"], 2.8037)
+    check("session_open recorded", t.extras["session_open"], 104)
+    check("session_high recorded", t.extras["session_high"], 107)
+    check("session_low recorded", t.extras["session_low"], 104)
 
 
 def test_format_trigger_line() -> None:
@@ -713,6 +721,80 @@ def test_latest_triggers_spans_sessions_and_supersedes_reruns() -> None:
 
     total = store.conn.execute("SELECT count(*) FROM trigger_detail").fetchone()[0]
     check("trigger_detail retains the full history, undeduped", total, 3)
+    store.close()
+
+
+def test_is_tradeable_defaults_to_n_and_notes_is_editable() -> None:
+    """is_tradeable/notes are the trader's own post-hoc review, entered by
+    editing the row directly (e.g. in DataGrip) -- record() never sets them,
+    so every new trigger must default to 'N'/NULL until reviewed."""
+    import tempfile
+
+    from astor.core.store import TriggerStore
+    from astor.core.types import Trigger
+
+    store = TriggerStore(Path(tempfile.mkdtemp()) / "t.db")
+    store.start_run("r1", "replay", {"session": "2026-08-14"})
+    store.record(
+        "r1",
+        Trigger(
+            symbol="TEST",
+            setup="U&R",
+            direction="long",
+            trigger_price=100.1,
+            bar_start=OPEN,
+            bar_end=OPEN + timedelta(minutes=1),
+            level_name="PDL",
+            level_value=100.0,
+            extras={},
+        ),
+        OPEN + timedelta(minutes=1),
+    )
+    store.commit()
+
+    row = store.conn.execute(
+        "SELECT is_tradeable, notes FROM latest_triggers"
+    ).fetchone()
+    check("is_tradeable defaults to N", row[0], "N")
+    check("notes defaults to NULL", row[1], None)
+
+    store.conn.execute(
+        "UPDATE triggers SET is_tradeable = 'Y', notes = 'clean break' WHERE run_id = 'r1'"
+    )
+    store.commit()
+    row = store.conn.execute(
+        "SELECT is_tradeable, notes FROM latest_triggers"
+    ).fetchone()
+    check("is_tradeable is editable", row[0], "Y")
+    check("notes is editable", row[1], "clean break")
+    store.close()
+
+
+def test_migrate_adds_review_columns_to_a_pre_existing_db() -> None:
+    """A database created before is_tradeable/notes existed must gain them
+    on the next open -- CREATE TABLE IF NOT EXISTS alone would leave an
+    already-existing triggers table without the new columns."""
+    import sqlite3
+    import tempfile
+
+    from astor.core.store import SCHEMA, TriggerStore
+
+    path = Path(tempfile.mkdtemp()) / "old.db"
+    old_schema = SCHEMA.replace(
+        "    extras_json   TEXT NOT NULL,\n"
+        "    is_tradeable  TEXT NOT NULL DEFAULT 'N', -- the trader's own call, 'Y' | 'N'\n"
+        "    notes         TEXT                       -- the trader's own notes\n",
+        "    extras_json   TEXT NOT NULL\n",
+    )
+    conn = sqlite3.connect(path)
+    conn.executescript(old_schema)
+    conn.commit()
+    conn.close()
+
+    store = TriggerStore(path)
+    columns = {row[1] for row in store.conn.execute("PRAGMA table_info(triggers)")}
+    check("is_tradeable added by migration", "is_tradeable" in columns, True)
+    check("notes added by migration", "notes" in columns, True)
     store.close()
 
 

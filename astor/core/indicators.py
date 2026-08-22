@@ -24,12 +24,16 @@ class SessionIndicators:
     setup fires and re-arms, so a second O&F later in the day only reflects
     its own local overshoot, not necessarily the day's real high if an
     earlier, bigger spike happened before this arming.
+
+    session_open is just the first bar's open -- fixed for the rest of the
+    session, unlike session_high/session_low which keep moving.
     """
 
     symbol: str
     cum_volume: float = 0.0
     cum_vol_price: float = 0.0  # sum(volume * typical_price)
     first_bar_start: datetime | None = None
+    session_open: float | None = None
     session_high: float | None = None
     session_low: float | None = None
 
@@ -39,6 +43,7 @@ class SessionIndicators:
         self.cum_vol_price += bar.volume * typical
         if self.first_bar_start is None:
             self.first_bar_start = bar.start
+            self.session_open = bar.open
         self.session_high = bar.high if self.session_high is None else max(
             self.session_high, bar.high
         )

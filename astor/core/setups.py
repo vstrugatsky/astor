@@ -220,6 +220,8 @@ class UndercutRally(Setup):
         avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
         level_stop_pct = _abs_pct_of_level(bar.close - pdl, pdl)
         level_shares, level_dollars = _position_size(bar.close, pdl, self.max_loss_dollars)
+        session_open = indicators.session_open if indicators else None
+        session_high = indicators.session_high if indicators else None
         session_low = indicators.session_low if indicators else None
         session_extreme_pct = (
             _abs_pct_of_level(bar.close - session_low, session_low) if session_low else None
@@ -259,6 +261,9 @@ class UndercutRally(Setup):
                 "level_stop_pct": level_stop_pct,
                 "level_stop_shares": level_shares,
                 "level_stop_dollars": level_dollars,
+                "session_open": session_open,
+                "session_high": session_high,
+                "session_low": session_low,
                 "session_extreme": session_low,
                 "session_extreme_pct": session_extreme_pct,
                 "session_stop_shares": session_shares,
@@ -351,7 +356,9 @@ class OvershootFail(Setup):
         avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
         level_stop_pct = _abs_pct_of_level(bar.close - pdh, pdh)
         level_shares, level_dollars = _position_size(bar.close, pdh, self.max_loss_dollars)
+        session_open = indicators.session_open if indicators else None
         session_high = indicators.session_high if indicators else None
+        session_low = indicators.session_low if indicators else None
         session_extreme_pct = (
             _abs_pct_of_level(bar.close - session_high, session_high) if session_high else None
         )
@@ -390,6 +397,9 @@ class OvershootFail(Setup):
                 "level_stop_pct": level_stop_pct,
                 "level_stop_shares": level_shares,
                 "level_stop_dollars": level_dollars,
+                "session_open": session_open,
+                "session_high": session_high,
+                "session_low": session_low,
                 "session_extreme": session_high,
                 "session_extreme_pct": session_extreme_pct,
                 "session_stop_shares": session_shares,

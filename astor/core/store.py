@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS triggers (
     detection_ts  TEXT NOT NULL,        -- when this run detected it
     level_name    TEXT NOT NULL,        -- 'PDH' | 'PDL'
     level_value   REAL NOT NULL,
-    extras_json   TEXT NOT NULL
+    extras_json   TEXT NOT NULL,
+    is_tradeable  TEXT NOT NULL DEFAULT 'N', -- the trader's own call, 'Y' | 'N'
+    notes         TEXT                       -- the trader's own notes
 );
 
 CREATE INDEX IF NOT EXISTS idx_triggers_run ON triggers(run_id);
@@ -61,6 +63,11 @@ SELECT
     t.direction,
     t.trigger_price,
     t.level_value,
+    -- The trader's own review, entered after the fact (DataGrip-editable real
+    -- columns, not extras_json -- a rerun of the same session never touches
+    -- an existing row's review, since record() only ever inserts new rows).
+    t.is_tradeable,
+    t.notes,
     -- U&R and O&F record mirrored key names; coalescing gives one column each.
     COALESCE(json_extract(t.extras_json, '$.bars_below'),
              json_extract(t.extras_json, '$.bars_above'))     AS bars_beyond,
@@ -82,6 +89,11 @@ SELECT
     json_extract(t.extras_json, '$.level_stop_pct')           AS level_stop_pct,
     json_extract(t.extras_json, '$.level_stop_shares')        AS level_stop_shares,
     json_extract(t.extras_json, '$.level_stop_dollars')       AS level_stop_dollars,
+    -- Session open/high/low -- the day's actual range, independent of setup
+    -- direction, so applicable the same way to every setup.
+    json_extract(t.extras_json, '$.session_open')              AS session_open,
+    json_extract(t.extras_json, '$.session_high')              AS session_high,
+    json_extract(t.extras_json, '$.session_low')               AS session_low,
     json_extract(t.extras_json, '$.session_extreme')          AS session_extreme,
     json_extract(t.extras_json, '$.session_extreme_pct')      AS session_extreme_pct,
     json_extract(t.extras_json, '$.session_stop_shares')      AS session_stop_shares,
@@ -142,8 +154,21 @@ class TriggerStore:
         # persisted in the database file, so it survives reconnects.
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.executescript(VIEWS)
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """CREATE TABLE IF NOT EXISTS only sets up a table the first time --
+        a column added here later needs its own ALTER TABLE to reach a
+        database file created before that column existed."""
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(triggers)")}
+        if "is_tradeable" not in columns:
+            self.conn.execute(
+                "ALTER TABLE triggers ADD COLUMN is_tradeable TEXT NOT NULL DEFAULT 'N'"
+            )
+        if "notes" not in columns:
+            self.conn.execute("ALTER TABLE triggers ADD COLUMN notes TEXT")
 
     def start_run(self, run_id: str, mode: str, params: dict) -> None:
         self.conn.execute(
