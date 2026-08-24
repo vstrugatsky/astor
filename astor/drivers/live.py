@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 
 from ib_async import IB
@@ -23,7 +23,13 @@ from astor.core.grading import NOTIFY_GRADE_THRESHOLD
 from astor.core.scanner import Scanner
 from astor.core.store import TriggerStore
 from astor.core.types import BarEvent, Trigger
-from astor.drivers.replay import ET, ReplayDriver, parse_bar_seconds, to_et
+from astor.drivers.replay import (
+    ET,
+    ReplayDriver,
+    next_trading_session,
+    parse_bar_seconds,
+    to_et,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,30 +114,12 @@ def _print_trigger_alert(t: Trigger) -> None:
     print(f"{_BELL}{_ANSI_BOLD}{color}{_format_trigger_line(t)}{_ANSI_RESET}")
 
 
-def _target_session(now_et: datetime) -> date:
-    """The trading day this process is scanning for.
-
-    Before today's close, that's today (covers "started mid-session" and
-    every pre-open case). At/after today's close, it's the next weekday --
-    the night-before-prep case. This does not know about market holidays: a
-    holiday immediately after a live run would roll to a closed day. Low
-    blast radius if it happens (a cache-key/label mismatch, not a wrong PDH/
-    PDL -- the "last N sessions" lookups already skip closed days on their
-    own since IBKR simply has no bars for them), and not worth a market
-    calendar for a first pass.
-    """
-    d = now_et.date() if now_et.time() < time(16, 0) else now_et.date() + timedelta(days=1)
-    while d.weekday() >= 5:  # Saturday=5, Sunday=6
-        d += timedelta(days=1)
-    return d
-
-
 class LiveDriver:
     def __init__(self, ib: IB, cache_dir: Path, bar_size: str = "1 min"):
         self.ib = ib
         self.bar_size = bar_size
         self.bar_seconds = parse_bar_seconds(bar_size)
-        self.session = _target_session(datetime.now(ET))
+        self.session = next_trading_session(datetime.now(ET))
         # Composition, not inheritance: fetch_bars/stream/run_replay are
         # replay-specific and don't apply here, but qualify/fetch_levels/
         # fetch_volume_curve/BarCache/the request semaphore all do.

@@ -122,6 +122,25 @@ def to_et(dt) -> datetime | None:
     return dt.replace(tzinfo=ET) if dt.tzinfo is None else dt.astimezone(ET)
 
 
+def next_trading_session(now_et: datetime) -> date:
+    """The trading day a process starting right now should target.
+
+    Before today's close, that's today (covers "started mid-session" and
+    every pre-open case). At/after today's close, it's the next weekday --
+    the night-before-prep case, which is also what a cron-scheduled
+    warm-cache run wants by default. This does not know about market
+    holidays: a holiday immediately after would roll to a closed day. Low
+    blast radius if it happens (a cache-key/label mismatch, not a wrong PDH/
+    PDL -- the "last N sessions" lookups already skip closed days on their
+    own since IBKR simply has no bars for them), and not worth a market
+    calendar for a first pass.
+    """
+    d = now_et.date() if now_et.time() < time(16, 0) else now_et.date() + timedelta(days=1)
+    while d.weekday() >= 5:  # Saturday=5, Sunday=6
+        d += timedelta(days=1)
+    return d
+
+
 class BarCache:
     def __init__(self, root: Path):
         self.root = root
@@ -156,6 +175,7 @@ class ReplayDriver:
         bar_size: str = "1 min",
         cache_dir: Path | None = None,
         concurrency: int = 10,
+        request_pace_seconds: float = 0.0,
     ):
         self.ib = ib
         self.session = session
@@ -163,6 +183,14 @@ class ReplayDriver:
         self.bar_seconds = parse_bar_seconds(bar_size)
         self.cache = BarCache(cache_dir or Path("data/bars"))
         self.sem = asyncio.Semaphore(concurrency)
+        # A per-slot delay after each historical-data request, on top of the
+        # concurrency cap -- unset (0.0, no change in behavior) for
+        # interactive Replay/Live runs, set by astor.cli's warm-cache
+        # command for a cold pass across hundreds of symbols, where IBKR's
+        # pacing limits -- not modeled anywhere in this codebase, but real,
+        # per ACTIVATION_PACE_SECONDS in live.py existing because of one --
+        # are the actual constraint, not local concurrency.
+        self.request_pace_seconds = request_pace_seconds
 
     # -- fetching ----------------------------------------------------------
 
@@ -174,6 +202,20 @@ class ReplayDriver:
         if missing:
             logger.warning("Could not qualify: %s", ", ".join(missing))
         return good
+
+    async def _historical(self, contract, **kwargs):
+        """One reqHistoricalDataAsync call, gated by the concurrency
+        semaphore and (if set) paced by request_pace_seconds. The one choke
+        point every historical-data request in this class goes through, so
+        pacing applies uniformly regardless of which fetch method is
+        calling."""
+        async with self.sem:
+            result = await self.ib.reqHistoricalDataAsync(
+                contract, timeout=REQUEST_TIMEOUT, **kwargs
+            )
+            if self.request_pace_seconds:
+                await asyncio.sleep(self.request_pace_seconds)
+            return result
 
     async def fetch_levels(
         self, symbols: list[str], adr_sessions: int = ADR_SESSIONS
@@ -210,17 +252,15 @@ class ReplayDriver:
                     cached["adv"],
                 )
                 return
-            async with self.sem:
-                bars = await self.ib.reqHistoricalDataAsync(
-                    contract,
-                    endDateTime=f"{self.session:%Y%m%d} 00:00:00 US/Eastern",
-                    durationStr=f"{duration_days} D",
-                    barSizeSetting="1 day",
-                    whatToShow="TRADES",
-                    useRTH=True,
-                    formatDate=1,
-                    timeout=REQUEST_TIMEOUT,
-                )
+            bars = await self._historical(
+                contract,
+                endDateTime=f"{self.session:%Y%m%d} 00:00:00 US/Eastern",
+                durationStr=f"{duration_days} D",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
             if not bars:
                 logger.warning("No daily bars for %s; cannot derive PDH/PDL", sym)
                 return
@@ -283,17 +323,15 @@ class ReplayDriver:
         async def one(sym: str, contract) -> None:
             rows = self.cache.load("intraday", sym, self.session, self.bar_size)
             if rows is None:
-                async with self.sem:
-                    bars = await self.ib.reqHistoricalDataAsync(
-                        contract,
-                        endDateTime=f"{self.session:%Y%m%d} 16:00:00 US/Eastern",
-                        durationStr="1 D",
-                        barSizeSetting=self.bar_size,
-                        whatToShow="TRADES",
-                        useRTH=True,
-                        formatDate=1,
-                        timeout=REQUEST_TIMEOUT,
-                    )
+                bars = await self._historical(
+                    contract,
+                    endDateTime=f"{self.session:%Y%m%d} 16:00:00 US/Eastern",
+                    durationStr="1 D",
+                    barSizeSetting=self.bar_size,
+                    whatToShow="TRADES",
+                    useRTH=True,
+                    formatDate=1,
+                )
                 if not bars:
                     logger.warning("No intraday bars for %s on %s", sym, self.session)
                     return
@@ -369,17 +407,15 @@ class ReplayDriver:
                 )
                 return
 
-            async with self.sem:
-                daily = await self.ib.reqHistoricalDataAsync(
-                    contract,
-                    endDateTime=f"{self.session:%Y%m%d} 00:00:00 US/Eastern",
-                    durationStr=f"{duration_days} D",
-                    barSizeSetting="1 day",
-                    whatToShow="TRADES",
-                    useRTH=True,
-                    formatDate=1,
-                    timeout=REQUEST_TIMEOUT,
-                )
+            daily = await self._historical(
+                contract,
+                endDateTime=f"{self.session:%Y%m%d} 00:00:00 US/Eastern",
+                durationStr=f"{duration_days} D",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
             if not daily:
                 logger.warning("No daily bars for %s; cannot build a volume curve", sym)
                 return
@@ -397,17 +433,15 @@ class ReplayDriver:
             for d in session_dates:
                 rows = self.cache.load("intraday", sym, d, self.bar_size)
                 if rows is None:
-                    async with self.sem:
-                        bars = await self.ib.reqHistoricalDataAsync(
-                            contract,
-                            endDateTime=f"{d:%Y%m%d} 16:00:00 US/Eastern",
-                            durationStr="1 D",
-                            barSizeSetting=self.bar_size,
-                            whatToShow="TRADES",
-                            useRTH=True,
-                            formatDate=1,
-                            timeout=REQUEST_TIMEOUT,
-                        )
+                    bars = await self._historical(
+                        contract,
+                        endDateTime=f"{d:%Y%m%d} 16:00:00 US/Eastern",
+                        durationStr="1 D",
+                        barSizeSetting=self.bar_size,
+                        whatToShow="TRADES",
+                        useRTH=True,
+                        formatDate=1,
+                    )
                     if not bars:
                         logger.warning(
                             "No intraday bars for %s on %s; skipped for its curve",

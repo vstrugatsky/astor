@@ -6,6 +6,9 @@
 
     uv run python -m astor.cli live --tickers-file watchlist.txt
         (then at the '> ' prompt: 'add TSLA,NVDA', 'remove TSLA', 'quit')
+
+    uv run python -m astor.cli warm-cache --tickers-file broad_watchlist.txt
+        (run overnight via cron so a mid-session Live 'add' hits disk, not IBKR)
 """
 
 from __future__ import annotations
@@ -23,7 +26,14 @@ from astor.core.scanner import Scanner
 from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME
 from astor.core.store import TriggerStore
 from astor.drivers.live import LiveDriver
-from astor.drivers.replay import ET, ReplayDriver, run_replay
+from astor.drivers.replay import (
+    ADR_SESSIONS,
+    ET,
+    RVOL_SESSIONS,
+    ReplayDriver,
+    next_trading_session,
+    run_replay,
+)
 
 logger = logging.getLogger("astor")
 
@@ -234,6 +244,82 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
         print("\nMost active: " + ", ".join(f"{s} ({n})" for s, n in busiest))
 
     print(f"\nStored in {args.db}  (run_id={run_id})")
+
+
+async def cmd_warm_cache(args: argparse.Namespace) -> int:
+    """Pre-fetch PDH/PDL/ADR/ADV and the RVOL volume curve for a whole
+    watchlist into BarCache (data/bars), so a symbol added mid-session in
+    Live hits disk instead of IBKR.
+
+    Meant to run overnight via cron against a broad watchlist (hundreds of
+    tickers) that's mostly a research/screening list, not the smaller set
+    actually tracked live -- so a name spotted moving pre-market (e.g. via
+    Deepvue's RVOL-sorted broad-watchlist view) can be added to Live without
+    the ~20s/ticker cost of a cold fetch_volume_curve. Only fetch_levels and
+    fetch_volume_curve run here -- fetch_bars (today's own bars) is useless
+    to warm before today's bars exist.
+
+    Concurrency/pacing default far more conservative than replay/live's:
+    this is hundreds of symbols x up to ~20 requests each on a cold cache,
+    which risks an IBKR pacing violation at replay's defaults (see
+    ReplayDriver.request_pace_seconds). After the first run, only one new
+    trading day rolls into each symbol's window per night, so subsequent
+    runs are far cheaper and pacing matters less -- but the conservative
+    default costs only time, not correctness, so it stays conservative
+    every night rather than needing a separate "first run" mode.
+    """
+    symbols = parse_symbols(args)
+    if not symbols:
+        logger.error("No tickers given. Use --tickers or --tickers-file.")
+        return 2
+
+    session = (
+        date.fromisoformat(args.date)
+        if args.date
+        else next_trading_session(datetime.now(ET))
+    )
+
+    ib = IB()
+    logger.info("Connecting to %s:%d...", args.host, args.port)
+    await ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=15)
+    start = asyncio.get_running_loop().time()
+    try:
+        driver = ReplayDriver(
+            ib,
+            session,
+            args.bar_size,
+            Path(args.cache_dir),
+            concurrency=args.concurrency,
+            request_pace_seconds=args.request_pace,
+        )
+        logger.info(
+            "Warming PDH/PDL/ADR/ADV for %d symbols (session=%s)...",
+            len(symbols),
+            session,
+        )
+        levels = await driver.fetch_levels(symbols, args.adr_sessions)
+        logger.info(
+            "Warming %d-session RVOL curves for %d symbols...",
+            args.rvol_sessions,
+            len(symbols),
+        )
+        curves = await driver.fetch_volume_curve(symbols, args.rvol_sessions)
+    finally:
+        ib.disconnect()
+    elapsed = asyncio.get_running_loop().time() - start
+
+    missing_levels = sorted(set(symbols) - set(levels))
+    missing_curves = sorted(set(symbols) - set(curves))
+    print(
+        f"\nWarmed levels for {len(levels)}/{len(symbols)} symbols, "
+        f"curves for {len(curves)}/{len(symbols)}, in {elapsed:.0f}s "
+        f"(session={session}, cache={args.cache_dir})"
+    )
+    if missing_levels:
+        print(f"No levels: {', '.join(missing_levels)}")
+    if missing_curves:
+        print(f"No curve : {', '.join(missing_curves)}")
+    return 0
 
 
 async def cmd_live(args: argparse.Namespace) -> int:
@@ -510,6 +596,51 @@ def build_parser() -> argparse.ArgumentParser:
     # can point at the same IB Gateway/TWS at once without a clientId clash.
     lv.add_argument("--client-id", type=int, default=22)
 
+    wc = sub.add_parser(
+        "warm-cache",
+        help="Pre-fetch PDH/PDL/ADR/ADV and RVOL curves for a watchlist into "
+        "BarCache, so a mid-session Live add hits disk instead of IBKR",
+    )
+    wc.add_argument("--tickers", default="", help="Comma or space separated")
+    wc.add_argument(
+        "--tickers-file", default="", help="e.g. a broad research/screening watchlist"
+    )
+    wc.add_argument(
+        "--date",
+        default="",
+        help="Session to warm for, YYYY-MM-DD (default: the next trading day -- "
+        "what a cron run the night before wants)",
+    )
+    wc.add_argument(
+        "--bar-size",
+        default="1 min",
+        help="Must match what Replay/Live will request, or the cache misses",
+    )
+    wc.add_argument("--adr-sessions", type=int, default=ADR_SESSIONS)
+    wc.add_argument("--rvol-sessions", type=int, default=RVOL_SESSIONS)
+    wc.add_argument(
+        "--concurrency",
+        type=int,
+        default=3,
+        help="Concurrent IBKR historical-data requests (default 3, well below "
+        "Replay/Live's 10 -- a cold run across hundreds of symbols is the "
+        "case that actually risks an IBKR pacing violation)",
+    )
+    wc.add_argument(
+        "--request-pace",
+        type=float,
+        default=0.5,
+        help="Seconds to wait after each historical-data request completes, "
+        "per concurrency slot, before that slot takes another (default 0.5; "
+        "0 disables pacing entirely)",
+    )
+    wc.add_argument("--cache-dir", default="data/bars")
+    wc.add_argument("--host", default="127.0.0.1")
+    wc.add_argument("--port", type=int, default=4001)
+    # Distinct from replay's (21) and live's (22) so a scheduled overnight
+    # warm-cache run never clashes with an interactive session left open.
+    wc.add_argument("--client-id", type=int, default=23)
+
     return p
 
 
@@ -525,7 +656,11 @@ def main() -> None:
     # WARNING/ERROR (e.g. "reqHistoricalData: Timeout for ...") visible.
     logging.getLogger("ib_async").setLevel(logging.WARNING)
     args = build_parser().parse_args()
-    cmd = {"replay": cmd_replay, "live": cmd_live}[args.command]
+    cmd = {
+        "replay": cmd_replay,
+        "live": cmd_live,
+        "warm-cache": cmd_warm_cache,
+    }[args.command]
     raise SystemExit(asyncio.run(cmd(args)))
 
 

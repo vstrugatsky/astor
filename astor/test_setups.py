@@ -288,6 +288,38 @@ def test_compute_adv() -> None:
     check("no usable bars", compute_adv([B(10, 0)], 2), (0.0, 0))
 
 
+def test_next_trading_session() -> None:
+    """Before today's close -> today; at/after close -> the next weekday,
+    skipping Sat/Sun. Shared by LiveDriver's own session anchor and
+    warm-cache's default --date."""
+    from astor.drivers.replay import next_trading_session
+
+    # Wednesday mid-session -> targets today.
+    check(
+        "mid-session -> today",
+        next_trading_session(datetime(2026, 8, 19, 10, 0, tzinfo=ET)),
+        date(2026, 8, 19),
+    )
+    # Wednesday after the close -> Thursday.
+    check(
+        "after close -> next weekday",
+        next_trading_session(datetime(2026, 8, 19, 17, 0, tzinfo=ET)),
+        date(2026, 8, 20),
+    )
+    # Friday after the close -> Monday, not Saturday.
+    check(
+        "Friday after close -> Monday",
+        next_trading_session(datetime(2026, 8, 21, 17, 0, tzinfo=ET)),
+        date(2026, 8, 24),
+    )
+    # Sunday (e.g. a night-before-prep run) -> Monday.
+    check(
+        "Sunday -> Monday",
+        next_trading_session(datetime(2026, 8, 23, 20, 0, tzinfo=ET)),
+        date(2026, 8, 24),
+    )
+
+
 # ADR of 10% on a $100 prior close -> $10.00 of ADR.
 ADR_LEVELS = DailyLevels(
     "TEST",
