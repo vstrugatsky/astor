@@ -262,6 +262,32 @@ def test_compute_adr_pct() -> None:
     check("no usable bars", compute_adr_pct([B(110, 0)], 2), (0.0, 0))
 
 
+def test_compute_adv() -> None:
+    """Average Dollar Volume: mean of (close * volume) over the last N
+    sessions, in dollars -- feeds grade_trigger's rvol tiers."""
+    from astor.drivers.replay import compute_adv
+
+    class B:
+        def __init__(self, close, volume):
+            self.close, self.volume = close, volume
+
+    # $10 * 1M and $20 * 2M -> mean $25M.
+    adv, used = compute_adv([B(10, 1_000_000), B(20, 2_000_000)], 2)
+    check("adv dollars", adv, 25_000_000.0)
+    check("sessions used", used, 2)
+
+    # Only the last N sessions count.
+    adv2, used2 = compute_adv([B(1000, 1_000_000), B(10, 1_000_000)], 1)
+    check("window respected", adv2, 10_000_000.0)
+    check("sessions used", used2, 1)
+
+    # A zero-volume bar is skipped, not a division error; no usable bars -> 0.0.
+    adv3, used3 = compute_adv([B(10, 0), B(20, 1_000_000)], 2)
+    check("zero-volume skipped", adv3, 20_000_000.0)
+    check("count excludes bad bar", used3, 1)
+    check("no usable bars", compute_adv([B(10, 0)], 2), (0.0, 0))
+
+
 # ADR of 10% on a $100 prior close -> $10.00 of ADR.
 ADR_LEVELS = DailyLevels(
     "TEST",
@@ -607,6 +633,164 @@ def test_notify_pct_fields_are_unsigned_for_short_setups() -> None:
     check("session_low recorded", t.extras["session_low"], 104)
 
 
+def _grading_fixture(**overrides):
+    """A long (U&R) trigger with every grade_trigger factor set to *miss*:
+    price below session_open and below PDC, rvol below every tier's
+    threshold, fired at minute 200 (outside both the early window and the
+    last hour). Grade should come out to the base of 1. Override kwargs to
+    flip individual factors on."""
+    from astor.core.indicators import SessionIndicators
+    from astor.core.types import Trigger
+
+    minute = overrides.pop("minute", 200)
+    levels = DailyLevels(
+        "TEST",
+        date(2026, 8, 13),
+        pdh=105.0,
+        pdl=100.0,
+        prev_close=overrides.pop("prev_close", 104.0),
+        adv=overrides.pop("adv", 1_000_000.0),  # smallest tier: rvol > 1.5
+    )
+    ind = SessionIndicators("TEST")
+    ind.session_open = overrides.pop("session_open", 102.0)
+    trigger = Trigger(
+        symbol="TEST",
+        setup="U&R",
+        direction=overrides.pop("direction", "long"),
+        trigger_price=overrides.pop("price", 101.0),
+        bar_start=OPEN + timedelta(minutes=minute),
+        bar_end=OPEN + timedelta(minutes=minute + 1),
+        level_name="PDL",
+        level_value=100.0,
+        extras={"rvol": overrides.pop("rvol", 1.0)},
+    )
+    is_first = overrides.pop("is_first", True)
+    assert not overrides, f"unused overrides: {overrides}"
+    return trigger, levels, ind, is_first
+
+
+def test_grade_trigger_base_case_is_one() -> None:
+    """Every factor missing -> the base grade, never lower."""
+    from astor.core.grading import grade_trigger
+
+    t, levels, ind, is_first = _grading_fixture()
+    check("all factors miss -> base grade", grade_trigger(t, levels, ind, is_first), 1)
+
+
+def test_grade_trigger_adds() -> None:
+    """Each add-1 factor, applied alone against the all-miss baseline,
+    bumps the grade from 1 to 2."""
+    from astor.core.grading import grade_trigger
+
+    t, levels, ind, is_first = _grading_fixture(price=103.0)  # > open (102), still < PDC (104)
+    check("price beyond open", grade_trigger(t, levels, ind, is_first), 2)
+
+    # 104.5 clears PDC (104); raise open above it to isolate the PDC add alone.
+    t, levels, ind, is_first = _grading_fixture(price=104.5, session_open=110.0)
+    check("price beyond PDC", grade_trigger(t, levels, ind, is_first), 2)
+
+    t, levels, ind, is_first = _grading_fixture(rvol=1.6)  # > smallest-tier threshold (1.5)
+    check("rvol beyond threshold", grade_trigger(t, levels, ind, is_first), 2)
+
+    t, levels, ind, is_first = _grading_fixture(minute=5)  # start of the early window
+    check("early window, lower bound", grade_trigger(t, levels, ind, is_first), 2)
+
+    t, levels, ind, is_first = _grading_fixture(minute=90)  # end of the early window
+    check("early window, upper bound", grade_trigger(t, levels, ind, is_first), 2)
+
+    t, levels, ind, is_first = _grading_fixture(minute=91)  # just past the window
+    check("just past the early window -> no add", grade_trigger(t, levels, ind, is_first), 1)
+
+    t, levels, ind, is_first = _grading_fixture(minute=4)  # just before the window
+    check("just before the early window -> no add", grade_trigger(t, levels, ind, is_first), 1)
+
+
+def test_grade_trigger_subtracts() -> None:
+    from astor.core.grading import grade_trigger
+
+    t, levels, ind, is_first = _grading_fixture(is_first=False)
+    check("not first trigger for the ticker", grade_trigger(t, levels, ind, is_first), 1)  # clamped, was already 1
+
+    # Push the base up first (price beyond open) so the last-hour penalty is
+    # visible instead of clamped away.
+    t, levels, ind, is_first = _grading_fixture(price=103.0, minute=330)  # 15:00 ET, last hour starts
+    check("last hour, lower bound", grade_trigger(t, levels, ind, is_first), 1)
+
+    t, levels, ind, is_first = _grading_fixture(price=103.0, minute=329)
+    check("just before the last hour -> no subtract", grade_trigger(t, levels, ind, is_first), 2)
+
+
+def test_grade_trigger_rvol_tiers_scale_with_adv() -> None:
+    """The same rvol clears a higher-ADV name's lower threshold but misses a
+    lower-ADV name's higher one."""
+    from astor.core.grading import grade_trigger
+
+    t, levels, ind, is_first = _grading_fixture(rvol=1.2, adv=6_000_000_000.0)  # > 5B tier: 1.15
+    check("rvol clears the > 5B ADV tier", grade_trigger(t, levels, ind, is_first), 2)
+
+    t, levels, ind, is_first = _grading_fixture(rvol=1.2, adv=600_000_000.0)  # > 500M tier: 1.3
+    check("same rvol misses the > 500M ADV tier", grade_trigger(t, levels, ind, is_first), 1)
+
+    t, levels, ind, is_first = _grading_fixture(rvol=1.2, adv=100_000_000.0)  # default tier: 1.5
+    check("same rvol misses the default tier", grade_trigger(t, levels, ind, is_first), 1)
+
+
+def test_grade_trigger_clamped_to_range() -> None:
+    from astor.core.grading import grade_trigger
+
+    # Every add-1 factor at once -> would be 5, clamped to 4.
+    t, levels, ind, is_first = _grading_fixture(
+        price=104.5, session_open=102.0, rvol=1.6, minute=10
+    )
+    check("clamped to 4", grade_trigger(t, levels, ind, is_first), 4)
+
+    # Both subtract-1 factors at once with nothing added -> would be -1, clamped to 1.
+    t, levels, ind, is_first = _grading_fixture(is_first=False, minute=330)
+    check("clamped to 1", grade_trigger(t, levels, ind, is_first), 1)
+
+
+def test_grade_trigger_mirrors_for_short_setups() -> None:
+    """O&F needs price *below* open/PDC to add, the opposite of U&R."""
+    from astor.core.grading import grade_trigger
+
+    t, levels, ind, is_first = _grading_fixture(
+        direction="short", price=101.0, session_open=102.0, prev_close=104.0
+    )
+    check("short: price below open and PDC -> both add", grade_trigger(t, levels, ind, is_first), 3)
+
+    t, levels, ind, is_first = _grading_fixture(
+        direction="short", price=103.0, session_open=102.0, prev_close=90.0
+    )
+    check("short: price above both open and PDC -> neither adds", grade_trigger(t, levels, ind, is_first), 1)
+
+
+def test_scanner_attaches_auto_grade_and_tracks_first_trigger_per_symbol() -> None:
+    """Scanner, not Setup, computes auto_grade -- only Scanner knows whether
+    this is the first trigger of the session for this symbol, across every
+    setup. A raw Setup.on_bar call (every other test in this file) never
+    sees auto_grade at all."""
+    scanner = Scanner({"TEST": LEVELS}, [UndercutRally])
+
+    b0 = bar(0, 101, 101, 99, 99.5)  # arm
+    scanner.on_bar(b0)
+    b1 = bar(1, 99.5, 101, 99.5, 100.5)  # reclaim -> fire, first for TEST
+    fired = scanner.on_bar(b1)
+    assert len(fired) == 1
+    check("auto_grade present on a Scanner-fired trigger", "auto_grade" in fired[0].extras, True)
+
+    b2 = bar(2, 100.5, 100.5, 98.5, 98.8)  # re-arm
+    scanner.on_bar(b2)
+    b3 = bar(3, 98.8, 101, 98.8, 100.9)  # reclaim -> fire again, NOT first for TEST
+    fired2 = scanner.on_bar(b3)
+    assert len(fired2) == 1
+    check(
+        "second trigger for the same symbol grades at least 1 lower than the first would, "
+        "all else equal, due to the not-first-trigger penalty",
+        fired2[0].extras["auto_grade"] <= fired[0].extras["auto_grade"],
+        True,
+    )
+
+
 def test_format_trigger_line() -> None:
     from astor.core.types import Trigger
     from astor.drivers.live import _format_trigger_line
@@ -621,6 +805,7 @@ def test_format_trigger_line() -> None:
         level_name="PDH",
         level_value=2.50,
         extras={
+            "auto_grade": 3,
             "avwap_pct": -3.1,
             "adr_pct": 8.2,
             "rvol": 1.5,
@@ -636,6 +821,7 @@ def test_format_trigger_line() -> None:
     )
     line = _format_trigger_line(t)
     check("headline present", "TRIGGER ABAT" in line, True)
+    check("grade shown", "grade 3/4" in line, True)
     check("avwap shown signed", "avwap -3.10%" in line, True)
     check("level line reads as a magnitude + word, short -> below", "PDH 0.85% below" in line, True)
     check("level position size shown", "417 sh ($1,001)" in line, True)

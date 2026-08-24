@@ -19,6 +19,7 @@ from pathlib import Path
 
 from ib_async import IB
 
+from astor.core.grading import NOTIFY_GRADE_THRESHOLD
 from astor.core.scanner import Scanner
 from astor.core.store import TriggerStore
 from astor.core.types import BarEvent, Trigger
@@ -52,6 +53,7 @@ def _format_trigger_line(t: Trigger) -> str:
     right next to the tighter, level-only view.
     """
     e = t.extras
+    auto_grade = e.get("auto_grade")
     avwap_pct, adr_pct, rvol = e.get("avwap_pct"), e.get("adr_pct"), e.get("rvol")
     level_pct = e.get("reclaim_pct")  # already a clean "how far the good way" magnitude
     level_shares, level_dollars = e.get("level_stop_shares"), e.get("level_stop_dollars")
@@ -75,7 +77,8 @@ def _format_trigger_line(t: Trigger) -> str:
 
     lines = [
         f"[{t.bar_start:%H:%M:%S} ET] TRIGGER {t.symbol:<6} {t.setup:<4} {t.direction:<5} "
-        f"@ {t.trigger_price:.2f}   avwap {signed(avwap_pct)}   adr {magnitude(adr_pct)}"
+        f"grade {auto_grade if auto_grade is not None else 'n/a'}/4"
+        f"   @ {t.trigger_price:.2f}   avwap {signed(avwap_pct)}   adr {magnitude(adr_pct)}"
         f"   rvol {rvol if rvol is not None else 'n/a'}",
         f"    {t.level_name:<3} {magnitude(level_pct)} {toward}, stop {t.level_value:.2f}"
         f"  ->  {sized(level_shares, level_dollars)}",
@@ -356,7 +359,11 @@ class LiveDriver:
                     # is exactly what makes a commit here safe to do this often
                     # without blocking a concurrent reader.
                     store.commit()
-                    _print_trigger_alert(trigger)
+                    # Every trigger is still stored regardless of grade --
+                    # only the terminal alert is gated, so a look back at
+                    # the full session never has gaps to explain.
+                    if (trigger.extras.get("auto_grade") or 0) >= NOTIFY_GRADE_THRESHOLD:
+                        _print_trigger_alert(trigger)
             except Exception:
                 # This runs inside ib_async's event dispatch, off the normal
                 # call stack -- an uncaught exception here is easy to lose

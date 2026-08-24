@@ -71,6 +71,10 @@ SELECT
     -- an existing row's review, since record() only ever inserts new rows).
     t.grade,
     t.notes,
+    -- The program's own real-time call (astor.core.grading), computed once
+    -- at trigger time and never hand-edited, same as every other diagnostic
+    -- below -- kept in extras_json rather than a real column, unlike grade.
+    json_extract(t.extras_json, '$.auto_grade')                AS auto_grade,
     -- U&R and O&F record mirrored key names; coalescing gives one column each.
     COALESCE(json_extract(t.extras_json, '$.bars_below'),
              json_extract(t.extras_json, '$.bars_above'))     AS bars_beyond,

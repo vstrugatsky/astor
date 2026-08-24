@@ -37,7 +37,9 @@ RVOL_SESSIONS = 20  # the user's own spec: "1-min bars for the last 20 days"
 # A cache entry written before ADR existed lacks these, so it must be refetched
 # rather than loaded with zeroed volatility -- which would silently disable the
 # filters instead of failing visibly.
-REQUIRED_LEVEL_KEYS = {"session", "pdh", "pdl", "adr_pct", "prev_close", "adr_sessions"}
+REQUIRED_LEVEL_KEYS = {
+    "session", "pdh", "pdl", "adr_pct", "prev_close", "adr_sessions", "adv",
+}
 
 
 def compute_adr_pct(daily_bars, sessions: int = ADR_SESSIONS) -> tuple[float, int]:
@@ -55,6 +57,23 @@ def compute_adr_pct(daily_bars, sessions: int = ADR_SESSIONS) -> tuple[float, in
     if not ratios:
         return 0.0, 0
     return round(sum(ratios) / len(ratios) * 100.0, 4), len(ratios)
+
+
+def compute_adv(daily_bars, sessions: int = ADR_SESSIONS) -> tuple[float, int]:
+    """Average Dollar Volume: mean of (close * volume) over the last N
+    sessions, in dollars. Feeds astor.core.grading's rvol tiers -- the more
+    liquid a name, the less relative volume it takes for a move to be
+    unusual. Free from the same daily-bar request ADR already uses, same
+    as ADR is free from PDH/PDL: no second data source.
+    """
+    dollars = [
+        b.close * b.volume
+        for b in daily_bars[-sessions:]
+        if b.close and b.close > 0 and b.volume and b.volume > 0
+    ]
+    if not dollars:
+        return 0.0, 0
+    return round(sum(dollars) / len(dollars), 2), len(dollars)
 
 
 def build_cum_volume_curve(
@@ -188,6 +207,7 @@ class ReplayDriver:
                     cached["adr_pct"],
                     cached["prev_close"],
                     cached["adr_sessions"],
+                    cached["adv"],
                 )
                 return
             async with self.sem:
@@ -225,6 +245,7 @@ class ReplayDriver:
                     used,
                     adr_sessions,
                 )
+            adv, _ = compute_adv(bars, adr_sessions)
 
             out[sym] = DailyLevels(
                 sym,
@@ -234,6 +255,7 @@ class ReplayDriver:
                 adr_pct,
                 float(prior.close),
                 used,
+                adv,
             )
             self.cache.save(
                 "levels",
@@ -247,6 +269,7 @@ class ReplayDriver:
                     "adr_pct": adr_pct,
                     "prev_close": prior.close,
                     "adr_sessions": used,
+                    "adv": adv,
                 },
             )
 

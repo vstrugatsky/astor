@@ -49,6 +49,7 @@ class DailyLevels:
     adr_pct: float = 0.0
     prev_close: float = 0.0
     adr_sessions: int = 0
+    adv: float = 0.0  # average dollar volume (close * volume), same N-session window
 
     @property
     def adr(self) -> float:
