@@ -724,10 +724,12 @@ def test_latest_triggers_spans_sessions_and_supersedes_reruns() -> None:
     store.close()
 
 
-def test_is_tradeable_defaults_to_n_and_notes_is_editable() -> None:
-    """is_tradeable/notes are the trader's own post-hoc review, entered by
-    editing the row directly (e.g. in DataGrip) -- record() never sets them,
-    so every new trigger must default to 'N'/NULL until reviewed."""
+def test_grade_defaults_to_null_and_notes_is_editable() -> None:
+    """grade/notes are the trader's own post-hoc review, entered by editing
+    the row directly (e.g. in DataGrip) -- record() never sets them, so
+    every new trigger must default to NULL (ungraded) until reviewed. grade
+    is a 1-4 scale (D..A); a value outside that range must be rejected."""
+    import sqlite3
     import tempfile
 
     from astor.core.store import TriggerStore
@@ -752,21 +754,23 @@ def test_is_tradeable_defaults_to_n_and_notes_is_editable() -> None:
     )
     store.commit()
 
-    row = store.conn.execute(
-        "SELECT is_tradeable, notes FROM latest_triggers"
-    ).fetchone()
-    check("is_tradeable defaults to N", row[0], "N")
+    row = store.conn.execute("SELECT grade, notes FROM latest_triggers").fetchone()
+    check("grade defaults to NULL", row[0], None)
     check("notes defaults to NULL", row[1], None)
 
     store.conn.execute(
-        "UPDATE triggers SET is_tradeable = 'Y', notes = 'clean break' WHERE run_id = 'r1'"
+        "UPDATE triggers SET grade = 4, notes = 'clean break' WHERE run_id = 'r1'"
     )
     store.commit()
-    row = store.conn.execute(
-        "SELECT is_tradeable, notes FROM latest_triggers"
-    ).fetchone()
-    check("is_tradeable is editable", row[0], "Y")
+    row = store.conn.execute("SELECT grade, notes FROM latest_triggers").fetchone()
+    check("grade is editable", row[0], 4)
     check("notes is editable", row[1], "clean break")
+
+    try:
+        store.conn.execute("UPDATE triggers SET grade = 5 WHERE run_id = 'r1'")
+        raise AssertionError("expected a CHECK constraint failure for grade=5")
+    except sqlite3.IntegrityError:
+        pass
     store.close()
 
 
@@ -802,22 +806,22 @@ def test_latest_triggers_review_columns_editable_through_the_view() -> None:
 
     row_id = store.conn.execute("SELECT id FROM triggers").fetchone()[0]
     store.conn.execute(
-        "UPDATE latest_triggers SET is_tradeable = 'Y', notes = 'via view' WHERE id = ?",
+        "UPDATE latest_triggers SET grade = 2, notes = 'via view' WHERE id = ?",
         (row_id,),
     )
     store.commit()
 
     row = store.conn.execute(
-        "SELECT is_tradeable, notes FROM triggers WHERE id = ?", (row_id,)
+        "SELECT grade, notes FROM triggers WHERE id = ?", (row_id,)
     ).fetchone()
-    check("is_tradeable written through the view", row[0], "Y")
+    check("grade written through the view", row[0], 2)
     check("notes written through the view", row[1], "via view")
     store.close()
 
 
 def test_migrate_adds_review_columns_to_a_pre_existing_db() -> None:
-    """A database created before is_tradeable/notes existed must gain them
-    on the next open -- CREATE TABLE IF NOT EXISTS alone would leave an
+    """A database created before grade/notes existed must gain them on the
+    next open -- CREATE TABLE IF NOT EXISTS alone would leave an
     already-existing triggers table without the new columns."""
     import sqlite3
     import tempfile
@@ -827,7 +831,10 @@ def test_migrate_adds_review_columns_to_a_pre_existing_db() -> None:
     path = Path(tempfile.mkdtemp()) / "old.db"
     old_schema = SCHEMA.replace(
         "    extras_json   TEXT NOT NULL,\n"
-        "    is_tradeable  TEXT NOT NULL DEFAULT 'N', -- the trader's own call, 'Y' | 'N'\n"
+        "    -- The trader's own setup-quality grade, D=1 (non-tradeable) .. A=4\n"
+        "    -- (best). NULL until reviewed -- not a default like 0/1, since ungraded\n"
+        "    -- is a real, distinct state from \"graded D\".\n"
+        "    grade         INTEGER CHECK (grade IS NULL OR grade BETWEEN 1 AND 4),\n"
         "    notes         TEXT                       -- the trader's own notes\n",
         "    extras_json   TEXT NOT NULL\n",
     )
@@ -838,8 +845,45 @@ def test_migrate_adds_review_columns_to_a_pre_existing_db() -> None:
 
     store = TriggerStore(path)
     columns = {row[1] for row in store.conn.execute("PRAGMA table_info(triggers)")}
-    check("is_tradeable added by migration", "is_tradeable" in columns, True)
+    check("grade added by migration", "grade" in columns, True)
     check("notes added by migration", "notes" in columns, True)
+    store.close()
+
+
+def test_migrate_replaces_is_tradeable_with_grade() -> None:
+    """A database from the intermediate is_tradeable/notes generation (the
+    real data/astor.db's shape as of 2026-08-22) must have is_tradeable
+    dropped and grade added -- a Y/N flag doesn't map onto a 1-4 scale, so
+    the old values are discarded rather than translated. The views/trigger
+    referencing is_tradeable must not block the DROP COLUMN, and must still
+    work afterward."""
+    import sqlite3
+    import tempfile
+
+    from astor.core.store import SCHEMA, TriggerStore
+
+    path = Path(tempfile.mkdtemp()) / "old.db"
+    old_schema = SCHEMA.replace(
+        "    -- The trader's own setup-quality grade, D=1 (non-tradeable) .. A=4\n"
+        "    -- (best). NULL until reviewed -- not a default like 0/1, since ungraded\n"
+        "    -- is a real, distinct state from \"graded D\".\n"
+        "    grade         INTEGER CHECK (grade IS NULL OR grade BETWEEN 1 AND 4),\n",
+        "    is_tradeable  TEXT NOT NULL DEFAULT 'N',\n",
+    )
+    conn = sqlite3.connect(path)
+    conn.executescript(old_schema)
+    conn.commit()
+    conn.close()
+
+    store = TriggerStore(path)
+    columns = {row[1] for row in store.conn.execute("PRAGMA table_info(triggers)")}
+    check("is_tradeable dropped by migration", "is_tradeable" in columns, False)
+    check("grade added by migration", "grade" in columns, True)
+    check(
+        "latest_triggers still queryable after the migration",
+        store.conn.execute("SELECT count(*) FROM latest_triggers").fetchone()[0],
+        0,
+    )
     store.close()
 
 

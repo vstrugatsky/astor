@@ -35,7 +35,10 @@ CREATE TABLE IF NOT EXISTS triggers (
     level_name    TEXT NOT NULL,        -- 'PDH' | 'PDL'
     level_value   REAL NOT NULL,
     extras_json   TEXT NOT NULL,
-    is_tradeable  TEXT NOT NULL DEFAULT 'N', -- the trader's own call, 'Y' | 'N'
+    -- The trader's own setup-quality grade, D=1 (non-tradeable) .. A=4
+    -- (best). NULL until reviewed -- not a default like 0/1, since ungraded
+    -- is a real, distinct state from "graded D".
+    grade         INTEGER CHECK (grade IS NULL OR grade BETWEEN 1 AND 4),
     notes         TEXT                       -- the trader's own notes
 );
 
@@ -66,7 +69,7 @@ SELECT
     -- The trader's own review, entered after the fact (DataGrip-editable real
     -- columns, not extras_json -- a rerun of the same session never touches
     -- an existing row's review, since record() only ever inserts new rows).
-    t.is_tradeable,
+    t.grade,
     t.notes,
     -- U&R and O&F record mirrored key names; coalescing gives one column each.
     COALESCE(json_extract(t.extras_json, '$.bars_below'),
@@ -143,17 +146,17 @@ WHERE run_id IN (SELECT run_id FROM latest_run_per_session)
 ORDER BY session, trigger_time;
 
 -- Every other column here is derived (from triggers/runs, or computed by a
--- run) -- only is_tradeable/notes are meant to be hand-edited, so this is
--- the one write path the trigger allows. DROP VIEW already drops any
--- trigger defined on it, but this still needs re-creating here since it is
--- itself dropped and rebuilt right along with the view every connect.
+-- run) -- only grade/notes are meant to be hand-edited, so this is the one
+-- write path the trigger allows. DROP VIEW already drops any trigger
+-- defined on it, but this still needs re-creating here since it is itself
+-- dropped and rebuilt right along with the view every connect.
 DROP TRIGGER IF EXISTS latest_triggers_review_update;
 CREATE TRIGGER latest_triggers_review_update
 INSTEAD OF UPDATE ON latest_triggers
 FOR EACH ROW
 BEGIN
     UPDATE triggers
-    SET is_tradeable = NEW.is_tradeable,
+    SET grade = NEW.grade,
         notes = NEW.notes
     WHERE id = OLD.id;
 END;
@@ -179,9 +182,19 @@ class TriggerStore:
         a column added here later needs its own ALTER TABLE to reach a
         database file created before that column existed."""
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(triggers)")}
-        if "is_tradeable" not in columns:
+        if "is_tradeable" in columns:
+            # Superseded by the numeric grade column below -- a Y/N flag
+            # doesn't map onto a 4-point A-D scale, so the old values are
+            # dropped rather than translated. DROP COLUMN fails while a view
+            # (or the trigger attached to one) still references the column,
+            # so those go first; VIEWS rebuilds both right after this runs.
+            self.conn.execute("DROP VIEW IF EXISTS latest_triggers")
+            self.conn.execute("DROP VIEW IF EXISTS trigger_detail")
+            self.conn.execute("ALTER TABLE triggers DROP COLUMN is_tradeable")
+        if "grade" not in columns:
             self.conn.execute(
-                "ALTER TABLE triggers ADD COLUMN is_tradeable TEXT NOT NULL DEFAULT 'N'"
+                "ALTER TABLE triggers ADD COLUMN grade INTEGER"
+                " CHECK (grade IS NULL OR grade BETWEEN 1 AND 4)"
             )
         if "notes" not in columns:
             self.conn.execute("ALTER TABLE triggers ADD COLUMN notes TEXT")
