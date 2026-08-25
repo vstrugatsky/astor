@@ -41,12 +41,6 @@ class Scanner:
         self.curves: dict[str, VolumeCurve] = {}
 
         self.triggers: list[Trigger] = []
-        # Which symbols have fired at least once this session, across every
-        # setup -- grade_trigger's "not the first trigger for this ticker"
-        # penalty is ticker-wide, not per-setup, since a U&R re-arm and an
-        # O&F firing later on the same name both mean the market's already
-        # spent its attention here.
-        self._fired_symbols: set[str] = set()
         self.bars_seen = 0
         self.bars_evaluated = 0
         self.skipped_zero_volume = 0
@@ -96,9 +90,7 @@ class Scanner:
                 self._state[key] = setup
             trigger = setup.on_bar(bar, levels, indicators, curve)
             if trigger is not None:
-                is_first = bar.symbol not in self._fired_symbols
-                self._fired_symbols.add(bar.symbol)
-                auto_grade = grade_trigger(trigger, levels, indicators, is_first)
+                auto_grade = grade_trigger(trigger, levels, indicators)
                 trigger = replace(
                     trigger, extras={**trigger.extras, "auto_grade": auto_grade}
                 )

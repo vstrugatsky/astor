@@ -1,9 +1,8 @@
 """Real-time setup-quality grading, 1 (weakest) - 4 (strongest).
 
-Applied by Scanner right after a Setup fires (astor.core.scanner), using data
-no Setup alone has -- whether this is the first trigger of the session for
-this symbol, across every setup -- alongside data a Setup already computed
-(rvol, in trigger.extras) or that Scanner already holds (levels, indicators).
+Applied by Scanner right after a Setup fires (astor.core.scanner), using
+data a Setup already computed (rvol, avwap, in trigger.extras) alongside
+data Scanner already holds (levels, indicators).
 
 This never filters what gets recorded: every trigger is still stored
 regardless of grade (astor.core.store). Only Live's terminal alert
@@ -24,8 +23,9 @@ RTH_OPEN = time(9, 30)
 RTH_CLOSE = time(16, 0)
 
 # Minutes since RTH_OPEN a trigger must fire within to count as "early" --
+# before minute 15 (9:45 ET) the action is often still too unstable to read;
 # past minute 90 (11:00 ET) a breakout is no longer a fresh open-driven move.
-EARLY_WINDOW_MINUTES = (5, 90)
+EARLY_WINDOW_MINUTES = (15, 90)
 
 # A trigger inside the last hour before RTH_CLOSE (15:00-16:00 ET) is treated
 # as more likely a late-day chase than a fresh setup.
@@ -43,12 +43,29 @@ _RVOL_TIERS = (
 )
 _DEFAULT_RVOL_THRESHOLD = 1.5
 
+# How far price has already run from AVWAP, in ADR units, in the setup's own
+# direction (above AVWAP for a long U&R, below it for a short O&F) -- a
+# trigger that far from AVWAP is chasing a move that's already extended,
+# with less room left to run than the setup's edge assumes. Ordered widest
+# threshold first; the first one price clears wins.
+_AVWAP_EXTENSION_TIERS = (
+    (0.5, 2),
+    (0.3, 1),
+)
+
 
 def _rvol_threshold(adv: float) -> float:
     for floor, threshold in _RVOL_TIERS:
         if adv > floor:
             return threshold
     return _DEFAULT_RVOL_THRESHOLD
+
+
+def _avwap_extension_penalty(extension_adr: float) -> int:
+    for floor, penalty in _AVWAP_EXTENSION_TIERS:
+        if extension_adr > floor:
+            return penalty
+    return 0
 
 
 def _minutes_since_open(t: time) -> int:
@@ -59,7 +76,6 @@ def grade_trigger(
     trigger: Trigger,
     levels: DailyLevels,
     indicators: SessionIndicators,
-    is_first_for_symbol: bool,
 ) -> int:
     """1-4, clamped. Starts at 1 (base); each factor below is independent,
     so nothing here disqualifies a trigger the way a Setup filter does --
@@ -74,11 +90,6 @@ def grade_trigger(
         if beyond_open:
             grade += 1
 
-    if levels.prev_close:
-        beyond_pdc = price > levels.prev_close if long else price < levels.prev_close
-        if beyond_pdc:
-            grade += 1
-
     rvol = trigger.extras.get("rvol")
     if rvol is not None and rvol > _rvol_threshold(levels.adv):
         grade += 1
@@ -87,11 +98,14 @@ def grade_trigger(
     if EARLY_WINDOW_MINUTES[0] <= minutes <= EARLY_WINDOW_MINUTES[1]:
         grade += 1
 
-    if not is_first_for_symbol:
-        grade -= 1
-
     minutes_to_close = _minutes_since_open(RTH_CLOSE) - minutes
     if minutes_to_close <= LAST_HOUR_MINUTES:
         grade -= 1
+
+    avwap = trigger.extras.get("avwap")
+    adr = levels.adr
+    if avwap is not None and adr > 0:
+        extension = (price - avwap) if long else (avwap - price)
+        grade -= _avwap_extension_penalty(extension / adr)
 
     return max(1, min(4, grade))
