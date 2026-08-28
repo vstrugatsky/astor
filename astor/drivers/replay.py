@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Iterator
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -40,6 +41,10 @@ RVOL_SESSIONS = 20  # the user's own spec: "1-min bars for the last 20 days"
 REQUIRED_LEVEL_KEYS = {
     "session", "pdh", "pdl", "adr_pct", "prev_close", "adr_sessions", "adv",
 }
+
+# Matches the YYYYMMDD embedded in every BarCache filename (see
+# BarCache._path: f"{symbol}_{session:%Y%m%d}_{bar_size}.json").
+_CACHE_FILENAME_DATE_RE = re.compile(r"_(\d{8})_")
 
 
 def compute_adr_pct(daily_bars, sessions: int = ADR_SESSIONS) -> tuple[float, int]:
@@ -165,6 +170,40 @@ class BarCache:
         p = self._path(kind, symbol, session, bar_size)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(rows))
+
+    def prune(
+        self, protected_sessions: set[str], retention_days: int, today: date
+    ) -> dict[str, int]:
+        """Delete cache entries older than retention_days, except any date
+        in protected_sessions (ISO date strings) -- a date that was ever an
+        actual replay or live session (astor.cli.cmd_warm_cache passes the
+        distinct `session` values from data/astor.db's runs table) stays
+        forever as a real trading record, no matter its age. Everything
+        else is either the RVOL curve's rolling window (still needed, so
+        younger than retention_days) or pure curve-building filler for a
+        symbol that was never actually traded -- safe to delete once it
+        ages out.
+
+        `today` is passed in rather than read from the clock here so this
+        stays a pure function of its inputs, testable without patching
+        datetime.
+        """
+        cutoff = today - timedelta(days=retention_days)
+        removed = {"levels": 0, "curve": 0, "intraday": 0}
+        for kind in removed:
+            d = self.root / kind
+            if not d.exists():
+                continue
+            for p in d.glob("*.json"):
+                m = _CACHE_FILENAME_DATE_RE.search(p.name)
+                if not m:
+                    continue
+                entry_date = datetime.strptime(m.group(1), "%Y%m%d").date()
+                if entry_date >= cutoff or entry_date.isoformat() in protected_sessions:
+                    continue
+                p.unlink()
+                removed[kind] += 1
+        return removed
 
 
 class ReplayDriver:

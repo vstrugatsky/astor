@@ -320,6 +320,48 @@ def test_next_trading_session() -> None:
     )
 
 
+def test_bar_cache_prune() -> None:
+    """Entries older than retention_days are deleted, except a date that
+    was ever an actual replay/live session (protected forever regardless
+    of age); anything within the retention window survives either way."""
+    import tempfile
+
+    from astor.drivers.replay import BarCache
+
+    cache = BarCache(Path(tempfile.mkdtemp()))
+    today = date(2026, 8, 27)
+
+    old_unprotected = date(2026, 7, 1)  # 57 days old, never a real session
+    old_protected = date(2026, 7, 2)  # equally old, but was a real session
+    recent = date(2026, 8, 20)  # 7 days old, within the retention window
+
+    for kind in ("levels", "curve", "intraday"):
+        cache.save(kind, "AAA", old_unprotected, "1 min", [1])
+        cache.save(kind, "BBB", old_protected, "1 min", [1])
+        cache.save(kind, "CCC", recent, "1 min", [1])
+
+    removed = cache.prune(
+        protected_sessions={old_protected.isoformat()}, retention_days=30, today=today
+    )
+    check("one entry removed per kind", removed, {"levels": 1, "curve": 1, "intraday": 1})
+
+    check(
+        "old + unprotected is gone",
+        cache.load("levels", "AAA", old_unprotected, "1 min"),
+        None,
+    )
+    check(
+        "old + protected survives",
+        cache.load("levels", "BBB", old_protected, "1 min"),
+        [1],
+    )
+    check(
+        "recent survives regardless of protection",
+        cache.load("levels", "CCC", recent, "1 min"),
+        [1],
+    )
+
+
 # ADR of 10% on a $100 prior close -> $10.00 of ADR.
 ADR_LEVELS = DailyLevels(
     "TEST",

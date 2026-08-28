@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sqlite3
 import uuid
 from datetime import date, datetime, time
 from pathlib import Path
@@ -267,6 +268,11 @@ async def cmd_warm_cache(args: argparse.Namespace) -> int:
     runs are far cheaper and pacing matters less -- but the conservative
     default costs only time, not correctness, so it stays conservative
     every night rather than needing a separate "first run" mode.
+
+    Finishes by pruning BarCache entries older than --retention-days,
+    unless that date was ever an actual replay/live session (checked
+    against --db's runs table) -- run nightly forever, this is what keeps
+    disk usage from growing unbounded.
     """
     symbols = parse_symbols(args)
     if not symbols:
@@ -319,6 +325,29 @@ async def cmd_warm_cache(args: argparse.Namespace) -> int:
         print(f"No levels: {', '.join(missing_levels)}")
     if missing_curves:
         print(f"No curve : {', '.join(missing_curves)}")
+
+    if not args.no_prune:
+        protected: set[str] = set()
+        db_path = Path(args.db)
+        if db_path.exists():
+            con = sqlite3.connect(db_path)
+            protected = {
+                row[0]
+                for row in con.execute(
+                    "SELECT DISTINCT json_extract(params_json, '$.session') FROM runs"
+                )
+                if row[0]
+            }
+            con.close()
+        removed = driver.cache.prune(protected, args.retention_days, date.today())
+        total_removed = sum(removed.values())
+        if total_removed:
+            print(
+                f"Pruned {total_removed} cache entries older than "
+                f"{args.retention_days}d (never an actual session): "
+                f"{removed['levels']} levels, {removed['curve']} curve, "
+                f"{removed['intraday']} intraday"
+            )
     return 0
 
 
@@ -634,6 +663,21 @@ def build_parser() -> argparse.ArgumentParser:
         "per concurrency slot, before that slot takes another (default 0.5; "
         "0 disables pacing entirely)",
     )
+    wc.add_argument(
+        "--retention-days",
+        type=int,
+        default=30,
+        help="Delete cache entries older than this many days, unless that "
+        "date was an actual replay/live session (--db's runs table) -- "
+        "covers the RVOL window (20 sessions) plus weekends/holidays with "
+        "margin (default 30)",
+    )
+    wc.add_argument(
+        "--no-prune",
+        action="store_true",
+        help="Skip pruning old cache entries entirely",
+    )
+    wc.add_argument("--db", default="data/astor.db", help="Only read, to find protected session dates")
     wc.add_argument("--cache-dir", default="data/bars")
     wc.add_argument("--host", default="127.0.0.1")
     wc.add_argument("--port", type=int, default=4001)
