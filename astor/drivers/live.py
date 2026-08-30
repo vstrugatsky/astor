@@ -22,6 +22,7 @@ from ib_async import IB
 from astor.core.grading import NOTIFY_GRADE_THRESHOLD
 from astor.core.scanner import Scanner
 from astor.core.store import TriggerStore
+from astor.core.tracking import SellRuleTracker, TrackAlert, TrackedTrade
 from astor.core.types import BarEvent, Trigger
 from astor.drivers.replay import (
     ET,
@@ -106,12 +107,81 @@ _ANSI_GREEN = "\033[92m"
 _ANSI_RED = "\033[91m"
 _ANSI_RESET = "\033[0m"
 
+# Distinct from the setup-trigger palette above, so a trade alert (this
+# trader's own open position) is visually distinguishable at a glance from a
+# fresh setup trigger (a new candidate). Bold + plain black (30) renders as
+# "bright black"/gray in most modern terminals rather than true black, so it
+# stays visible on both light- and dark-background terminals; a literal
+# black would risk vanishing on a dark background.
+_ANSI_BLACK = "\033[30m"
+_ANSI_BROWN = "\033[38;5;130m"
+
 
 def _print_trigger_alert(t: Trigger) -> None:
     """Bell + bold color, not just a plain print -- a trigger scrolling by
     silently in a wall of other output is exactly what this is for."""
     color = _ANSI_GREEN if t.direction == "long" else _ANSI_RED
     print(f"{_BELL}{_ANSI_BOLD}{color}{_format_trigger_line(t)}{_ANSI_RESET}")
+
+
+def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
+    header = f"[{alert.bar_start:%H:%M:%S} ET] TRACK {alert.symbol:<6} {trade.direction:<5}"
+    if alert.kind == "breakeven":
+        return (
+            f"{header} +1R reached @ {alert.close:.2f} (target {trade.target_1r:.2f})"
+            f"  ->  move stop to breakeven ({trade.entry:.2f})"
+        )
+    assert trade.peak is not None
+    return (
+        f"{header} SELL -- gave back 0.5R from peak {trade.peak:.2f} to {alert.close:.2f}"
+        f"  (entry {trade.entry:.2f}, stop {trade.stop:.2f}, R {trade.r:.2f})"
+    )
+
+
+def _print_track_alert(alert: TrackAlert, trade: TrackedTrade) -> None:
+    color = _ANSI_BLACK if alert.kind == "breakeven" else _ANSI_BROWN
+    print(f"{_BELL}{_ANSI_BOLD}{color}{_format_track_alert(alert, trade)}{_ANSI_RESET}")
+
+
+async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | None:
+    """Look up entry price and protective stop for an open position in
+    `symbol`, across every account this IBKR login can see. Returns
+    (entry, stop, account), or None if it can't be resolved unambiguously --
+    no position, more than one position, no single matching working stop
+    order, or a stop that sits on the wrong side of entry for the position's
+    direction (stale/unrelated order rather than this trade's actual stop).
+
+    Entry comes from `ib.positions()` (kept live-synced by ib_async once
+    connected, no extra request needed). The stop comes from a fresh
+    `reqAllOpenOrders` -- unlike `ib.openOrders()`, which only sees orders
+    placed via this API client, `reqAllOpenOrders` also sees orders entered
+    by hand in TWS/Gateway, which is how this trader's stops are placed.
+    """
+    positions = [
+        p for p in ib.positions() if p.contract.symbol == symbol and p.position != 0
+    ]
+    if len(positions) != 1:
+        return None
+    pos = positions[0]
+    entry = pos.avgCost
+    long = pos.position > 0
+    exit_side = "SELL" if long else "BUY"
+
+    open_trades = await ib.reqAllOpenOrdersAsync()
+    stops = [
+        t.order
+        for t in open_trades
+        if t.contract.symbol == symbol
+        and t.order.account == pos.account
+        and t.order.orderType == "STP"
+        and t.order.action == exit_side
+    ]
+    if len(stops) != 1:
+        return None
+    stop = stops[0].auxPrice
+    if (stop < entry) != long:
+        return None
+    return entry, stop, pos.account
 
 
 class LiveDriver:
@@ -128,6 +198,7 @@ class LiveDriver:
         self._pending: set[str] = set()  # reference data fetched, not yet live
         self._subs: dict[str, object] = {}  # symbol -> BarDataList
         self._last_bar_start: dict[str, datetime] = {}
+        self.tracker = SellRuleTracker()
 
     def symbol_count(self) -> int:
         return len(self._pending) + len(self._subs)
@@ -210,6 +281,48 @@ class LiveDriver:
             else:
                 results[sym] = "not found"
         return results
+
+    # -- sell-rule tracking -------------------------------------------------
+
+    async def track(
+        self,
+        scanner: Scanner,
+        symbol: str,
+        entry: float | None,
+        stop: float | None,
+        run_id: str,
+        store: TriggerStore,
+    ) -> str:
+        """Start sell-rule tracking for a position in `symbol`. `entry` and
+        `stop` are either both given (trusted as-is, no IBKR lookup -- the
+        only path that works for an account this login can't see) or both
+        None, in which case both are resolved from IBKR.
+
+        Ensures `symbol` has a live bar subscription, same as `add_symbols`
+        -- tracking needs the same 1-min closes a scanned symbol gets.
+        """
+        account = None
+        if entry is None and stop is None:
+            resolved = await resolve_open_trade(self.ib, symbol)
+            if resolved is None:
+                return (
+                    f"Could not resolve a single open position + matching stop "
+                    f"order for {symbol} from IBKR. Give both explicitly: "
+                    f"'track {symbol} ENTRY STOP'."
+                )
+            entry, stop, account = resolved
+
+        if symbol not in self._subs and symbol not in self._pending:
+            results = await self.add_symbols(scanner, [symbol], run_id, store)
+            if results.get(symbol) == "failed":
+                return f"Could not subscribe {symbol} for bars; tracking not started."
+
+        trade = self.tracker.track(symbol, entry, stop, account)
+        where = f" [{account}]" if account else ""
+        return (
+            f"Tracking {symbol} {trade.direction}: entry {entry:.2f} stop {stop:.2f} "
+            f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}){where}"
+        )
 
     # -- open transition --------------------------------------------------
 
@@ -352,6 +465,10 @@ class LiveDriver:
                     # the full session never has gaps to explain.
                     if (trigger.extras.get("auto_grade") or 0) >= NOTIFY_GRADE_THRESHOLD:
                         _print_trigger_alert(trigger)
+
+                track_alert = self.tracker.on_close(symbol, bar_event.close, bar_event.start)
+                if track_alert is not None:
+                    _print_track_alert(track_alert, self.tracker.trades[symbol])
             except Exception:
                 # This runs inside ib_async's event dispatch, off the normal
                 # call stack -- an uncaught exception here is easy to lose
