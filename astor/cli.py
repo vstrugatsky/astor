@@ -14,6 +14,9 @@
     uv run python -m astor.cli purge-db
         (wipes the ENTIRE store, every session -- only after a schema change;
         a same-day rerun of replay/live never needs this)
+
+    uv run python -m astor.cli explain --date 2026-08-28 --ticker NTNX --setup REV-S
+        (bar-by-bar reasons why that setup did or did not fire)
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from pathlib import Path
 
 from ib_async import IB
 
+from astor.core.grading import rvol_threshold
 from astor.core.scanner import Scanner
 from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME
 from astor.core.store import TriggerStore
@@ -79,12 +83,7 @@ def parse_symbols(args: argparse.Namespace) -> list[str]:
     return split_symbols(raw)
 
 
-def _setups_and_kwargs(args: argparse.Namespace):
-    setups = (
-        [SETUPS_BY_NAME[n] for n in args.setups.split(",")]
-        if args.setups
-        else ALL_SETUPS
-    )
+def _setup_kwargs(args: argparse.Namespace) -> dict:
     reversal_kwargs = {
         "min_leg_adr": args.min_leg_adr,
         "min_retrace_pct": args.min_retrace_pct,
@@ -92,7 +91,7 @@ def _setups_and_kwargs(args: argparse.Namespace):
         "min_confirm_minutes": args.min_confirm_minutes,
         "max_loss_dollars": args.max_loss,
     }
-    kwargs = {
+    return {
         "U&R": {
             "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
             "min_excursion_pct": args.min_excursion_pct,
@@ -110,7 +109,15 @@ def _setups_and_kwargs(args: argparse.Namespace):
         "REV-L": reversal_kwargs,
         "REV-S": reversal_kwargs,
     }
-    return setups, kwargs
+
+
+def _setups_and_kwargs(args: argparse.Namespace):
+    setups = (
+        [SETUPS_BY_NAME[n] for n in args.setups.split(",")]
+        if args.setups
+        else ALL_SETUPS
+    )
+    return setups, _setup_kwargs(args)
 
 
 def parse_hhmm(value: str | None) -> time | None:
@@ -207,9 +214,14 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
             f"{min(adrs):.2f}% - {max(adrs):.2f}% across symbols"
         )
     print(
-        f"Filters             : excursion >= {args.min_excursion_pct}% of level, "
+        f"Filters (U&R/O&F)   : excursion >= {args.min_excursion_pct}% of level, "
         f"reclaim >= {args.min_reclaim_pct}% of level, "
         f"excursion+reclaim >= {args.min_combined_pct}%"
+    )
+    print(
+        f"Filters (REV-L/S)   : leg >= {args.min_leg_adr}x ADR, "
+        f"retrace {args.min_retrace_pct}%-{args.max_retrace_pct}% of leg, "
+        f"held >= {args.min_confirm_minutes}min since the extreme"
     )
     print(f"Bars fed to scanner : {fed}")
     print(f"Bars evaluated      : {scanner.bars_evaluated}")
@@ -262,6 +274,90 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
         print("\nMost active: " + ", ".join(f"{s} ({n})" for s, n in busiest))
 
     print(f"\nStored in {args.db}  (run_id={run_id})")
+
+
+async def cmd_explain(args: argparse.Namespace) -> int:
+    """Why did (or didn't) one setup fire for one symbol on one day.
+
+    Runs the exact same Setup.on_bar/Scanner.on_bar code every replay/live
+    run uses, just for a single symbol and a single setup, with the `trace`
+    hook (astor.core.setups) turned on -- so this is not a second
+    implementation of the filter logic that could quietly drift out of sync
+    with the real one; it is the real one, just narrated.
+    """
+    symbol = args.ticker.upper().replace(".", " ")
+    setup_cls = SETUPS_BY_NAME.get(args.setup)
+    if setup_cls is None:
+        logger.error("Unknown setup %r. Choices: %s", args.setup, ", ".join(SETUPS_BY_NAME))
+        return 2
+
+    session = date.fromisoformat(args.date)
+    kwargs = _setup_kwargs(args)[setup_cls.name]
+
+    ib = IB()
+    logger.info("Connecting to %s:%d...", args.host, args.port)
+    await ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=15)
+    try:
+        driver = ReplayDriver(ib, session, "1 min", Path(args.cache_dir))
+        levels = await driver.fetch_levels([symbol], args.adr_sessions)
+        bars_by_symbol = await driver.fetch_bars([symbol])
+        curves = await driver.fetch_volume_curve([symbol])
+    finally:
+        ib.disconnect()
+
+    lv = levels.get(symbol)
+    if lv is None:
+        logger.error("No reference levels for %s on %s -- nothing to explain.", symbol, session)
+        return 1
+
+    scanner = Scanner({symbol: lv}, [setup_cls], {setup_cls.name: kwargs})
+    if symbol in curves:
+        scanner.curves[symbol] = curves[symbol]
+
+    trace: dict[str, list[dict]] = {}
+    fired = []
+    for b in bars_by_symbol.get(symbol, []):
+        fired.extend(scanner.on_bar(b, trace=trace))
+
+    print("\n" + "=" * 78)
+    print(f"EXPLAIN {args.setup} {symbol} {session}")
+    print("=" * 78)
+    print(
+        f"PDH {lv.pdh:.2f}  PDL {lv.pdl:.2f}  ADR({args.adr_sessions}) {lv.adr_pct:.2f}% "
+        f"(${lv.adr:.2f})  ADV ${lv.adv:,.0f}  RVOL floor {rvol_threshold(lv.adv)}"
+    )
+    ind = scanner.indicators.get(symbol)
+    if ind is not None and ind.session_open is not None:
+        print(
+            f"Session open {ind.session_open:.2f}  high {ind.session_high:.2f}  "
+            f"low {ind.session_low:.2f}"
+        )
+    print(
+        f"Bars evaluated: {scanner.bars_evaluated}  "
+        f"(dropped zero-volume: {scanner.skipped_zero_volume})"
+    )
+
+    lines = trace.get(setup_cls.name, [])
+    if not lines:
+        print(
+            f"\nNo decision points at all -- {args.setup} never even armed or "
+            f"tracked a leg for {symbol} on {session}."
+        )
+    else:
+        print(f"\n{len(lines)} decision point(s):")
+        for entry in lines:
+            print(f"  {entry['time']:%H:%M}  {entry['text']}")
+
+    if fired:
+        print(f"\n{len(fired)} trigger(s) fired:")
+        for t in fired:
+            print(
+                f"  {t.bar_start:%H:%M:%S}  {t.symbol} {t.setup} {t.direction} "
+                f"@ {t.trigger_price:.2f}"
+            )
+    else:
+        print("\nNo trigger fired.")
+    return 0
 
 
 async def cmd_warm_cache(args: argparse.Namespace) -> int:
@@ -776,6 +872,36 @@ def build_parser() -> argparse.ArgumentParser:
     # can point at the same IB Gateway/TWS at once without a clientId clash.
     lv.add_argument("--client-id", type=int, default=22)
 
+    ex = sub.add_parser(
+        "explain",
+        help="Show, bar by bar, why one setup did or did not fire for one "
+        "symbol on one day -- the real detection code, narrated",
+    )
+    ex.add_argument("--date", required=True, help="Market day, YYYY-MM-DD")
+    ex.add_argument("--ticker", required=True, help="Single symbol")
+    ex.add_argument(
+        "--setup", required=True, help=f"One of: {', '.join(SETUPS_BY_NAME)}"
+    )
+    ex.add_argument(
+        "--allow-same-bar-reclaim",
+        action="store_true",
+        help="U&R/O&F only: let a single bar both breach and reclaim the level",
+    )
+    ex.add_argument("--min-excursion-pct", type=float, default=0.6, help="U&R/O&F only.")
+    ex.add_argument("--min-reclaim-pct", type=float, default=0.6, help="U&R/O&F only.")
+    ex.add_argument("--min-combined-pct", type=float, default=1.5, help="U&R/O&F only.")
+    ex.add_argument("--adr-sessions", type=int, default=14)
+    ex.add_argument("--min-leg-adr", type=float, default=0.5, help="REV-L/REV-S only.")
+    ex.add_argument("--min-retrace-pct", type=float, default=25.0, help="REV-L/REV-S only.")
+    ex.add_argument("--max-retrace-pct", type=float, default=50.0, help="REV-L/REV-S only.")
+    ex.add_argument("--min-confirm-minutes", type=float, default=6.0, help="REV-L/REV-S only.")
+    ex.add_argument("--max-loss", type=float, default=100.0)
+    ex.add_argument("--cache-dir", default="data/bars")
+    ex.add_argument("--host", default="127.0.0.1")
+    ex.add_argument("--port", type=int, default=4001)
+    # Distinct from replay/live/warm-cache/purge-db's client IDs.
+    ex.add_argument("--client-id", type=int, default=25)
+
     wc = sub.add_parser(
         "warm-cache",
         help="Pre-fetch PDH/PDL/ADR/ADV and RVOL curves for a watchlist into "
@@ -871,6 +997,7 @@ def main() -> None:
         "live": cmd_live,
         "warm-cache": cmd_warm_cache,
         "purge-db": cmd_purge_db,
+        "explain": cmd_explain,
     }[args.command]
     raise SystemExit(asyncio.run(cmd(args)))
 

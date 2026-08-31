@@ -70,8 +70,16 @@ class Scanner:
             return None
         return levels
 
-    def on_bar(self, bar: BarEvent) -> list[Trigger]:
-        """Feed one completed bar. Returns any triggers it produced."""
+    def on_bar(
+        self, bar: BarEvent, trace: dict[str, list[dict]] | None = None
+    ) -> list[Trigger]:
+        """Feed one completed bar. Returns any triggers it produced.
+
+        `trace`, if given, collects a human-readable diagnostic line per
+        setup per decision point (astor.cli's `explain` command) -- keyed by
+        setup name, since more than one setup can be active for a symbol.
+        None (the default, what Replay/Live pass) costs nothing extra.
+        """
         levels = self._gate(bar)
         if levels is None:
             return []
@@ -88,7 +96,8 @@ class Scanner:
             if setup is None:
                 setup = cls(**self.setup_kwargs.get(cls.name, {}))
                 self._state[key] = setup
-            trigger = setup.on_bar(bar, levels, indicators, curve)
+            setup_trace = trace.setdefault(cls.name, []) if trace is not None else None
+            trigger = setup.on_bar(bar, levels, indicators, curve, trace=setup_trace)
             if trigger is not None:
                 auto_grade = grade_trigger(trigger, levels, indicators)
                 trigger = replace(

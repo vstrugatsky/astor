@@ -105,6 +105,20 @@ def _min_pct_passes(
     return passes, pct
 
 
+def _pctstr(x: float | None) -> str:
+    return f"{x:.2f}%" if x is not None else "n/a"
+
+
+def _trace(trace: list[dict] | None, bar: BarEvent, text: str) -> None:
+    """Append one human-readable diagnostic line, if a trace list was passed
+    in (astor.cli's `explain` command). A no-op otherwise -- every setup's
+    real detection path calls this unconditionally at each decision point,
+    so the diagnostic can never drift out of sync with what actually
+    decided a trigger (or didn't)."""
+    if trace is not None:
+        trace.append({"time": bar.start, "text": text})
+
+
 def _position_size(
     entry: float, stop: float, max_loss: float
 ) -> tuple[int | None, float | None]:
@@ -135,6 +149,7 @@ class Setup:
         levels: DailyLevels,
         indicators: SessionIndicators | None = None,
         curve: VolumeCurve | None = None,
+        trace: list[dict] | None = None,
     ) -> Trigger | None:
         raise NotImplementedError
 
@@ -172,6 +187,7 @@ class UndercutRally(Setup):
         levels: DailyLevels,
         indicators: SessionIndicators | None = None,
         curve: VolumeCurve | None = None,
+        trace: list[dict] | None = None,
     ) -> Trigger | None:
         pdl = levels.pdl
 
@@ -182,6 +198,7 @@ class UndercutRally(Setup):
             self._undercut_start = bar.start
             self._bars_below = 1
             self._bars_armed = 1
+            _trace(trace, bar, f"breach: low {bar.low:.2f} < PDL {pdl:.2f} -- armed")
             if not (self.allow_same_bar_reclaim and bar.close > pdl):
                 return None
         else:
@@ -203,9 +220,19 @@ class UndercutRally(Setup):
             excursion, pdl, self.min_excursion_pct
         )
         if not excursion_ok:
+            _trace(
+                trace, bar,
+                f"reclaim candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
+                f"< min {self.min_excursion_pct}% -- too shallow, stay armed",
+            )
             return None  # stay armed: too shallow
         reclaim_ok, reclaim_pct = _min_pct_passes(reclaim, pdl, self.min_reclaim_pct)
         if not reclaim_ok:
+            _trace(
+                trace, bar,
+                f"reclaim candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} OK, "
+                f"reclaim {_pctstr(reclaim_pct)} < min {self.min_reclaim_pct}% -- too limp, stay armed",
+            )
             return None  # stay armed: wait for a more convincing reclaim
         combined_pct = (
             round(excursion_pct + reclaim_pct, 4)
@@ -215,7 +242,19 @@ class UndercutRally(Setup):
         if self.min_combined_pct > 0 and (
             combined_pct is None or combined_pct < self.min_combined_pct
         ):
+            _trace(
+                trace, bar,
+                f"reclaim candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
+                f"reclaim {_pctstr(reclaim_pct)} combined {_pctstr(combined_pct)} "
+                f"< min {self.min_combined_pct}% -- stay armed",
+            )
             return None  # stay armed: each half is fine, the whole move isn't
+
+        _trace(
+            trace, bar,
+            f"FIRE @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
+            f"reclaim {_pctstr(reclaim_pct)} combined {_pctstr(combined_pct)}",
+        )
 
         avwap = indicators.avwap if indicators else None
         avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
@@ -311,6 +350,7 @@ class OvershootFail(Setup):
         levels: DailyLevels,
         indicators: SessionIndicators | None = None,
         curve: VolumeCurve | None = None,
+        trace: list[dict] | None = None,
     ) -> Trigger | None:
         pdh = levels.pdh
 
@@ -321,6 +361,7 @@ class OvershootFail(Setup):
             self._overshoot_start = bar.start
             self._bars_above = 1
             self._bars_armed = 1
+            _trace(trace, bar, f"breach: high {bar.high:.2f} > PDH {pdh:.2f} -- armed")
             if not (self.allow_same_bar_fail and bar.close < pdh):
                 return None
         else:
@@ -339,9 +380,19 @@ class OvershootFail(Setup):
             excursion, pdh, self.min_excursion_pct
         )
         if not excursion_ok:
+            _trace(
+                trace, bar,
+                f"fail candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
+                f"< min {self.min_excursion_pct}% -- too shallow, stay armed",
+            )
             return None  # stay armed: too shallow
         reclaim_ok, reclaim_pct = _min_pct_passes(reclaim, pdh, self.min_reclaim_pct)
         if not reclaim_ok:
+            _trace(
+                trace, bar,
+                f"fail candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} OK, "
+                f"reclaim {_pctstr(reclaim_pct)} < min {self.min_reclaim_pct}% -- too limp, stay armed",
+            )
             return None  # stay armed: wait for a more convincing fail
         combined_pct = (
             round(excursion_pct + reclaim_pct, 4)
@@ -351,7 +402,19 @@ class OvershootFail(Setup):
         if self.min_combined_pct > 0 and (
             combined_pct is None or combined_pct < self.min_combined_pct
         ):
+            _trace(
+                trace, bar,
+                f"fail candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
+                f"reclaim {_pctstr(reclaim_pct)} combined {_pctstr(combined_pct)} "
+                f"< min {self.min_combined_pct}% -- stay armed",
+            )
             return None  # stay armed: each half is fine, the whole move isn't
+
+        _trace(
+            trace, bar,
+            f"FIRE @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
+            f"reclaim {_pctstr(reclaim_pct)} combined {_pctstr(combined_pct)}",
+        )
 
         avwap = indicators.avwap if indicators else None
         avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
@@ -502,6 +565,7 @@ class _ReversalBase(Setup):
         levels: DailyLevels,
         indicators: SessionIndicators | None = None,
         curve: VolumeCurve | None = None,
+        trace: list[dict] | None = None,
     ) -> Trigger | None:
         if indicators is None or indicators.session_open is None:
             return None
@@ -519,6 +583,11 @@ class _ReversalBase(Setup):
             self._extreme_bar = bar
             self._extreme_cum_volume = indicators.cum_volume
             self._retrace_dead = False
+            _trace(
+                trace, bar,
+                f"new extreme {self._extreme:.2f} "
+                f"(leg vs anchor {self._anchor:.2f} = {abs(self._anchor - self._extreme):.2f})",
+            )
             return None
 
         if self._retrace_dead or self._extreme == self._fired_extreme:
@@ -533,6 +602,11 @@ class _ReversalBase(Setup):
 
         if retrace_pct > self.max_retrace_pct:
             self._retrace_dead = True
+            _trace(
+                trace, bar,
+                f"retrace {retrace_pct:.1f}% > max {self.max_retrace_pct}% -- "
+                f"leg dead until a new, deeper extreme",
+            )
             return None
         if retrace_pct < self.min_retrace_pct:
             return None
@@ -540,10 +614,22 @@ class _ReversalBase(Setup):
         assert self._extreme_bar is not None
         elapsed_minutes = (bar.start - self._extreme_bar.start).total_seconds() / 60.0
         if elapsed_minutes < self.min_confirm_minutes:
+            _trace(
+                trace, bar,
+                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% in band, "
+                f"elapsed {elapsed_minutes:.0f}m < min {self.min_confirm_minutes}m -- too early",
+            )
             return None
 
         adr = levels.adr
         if adr <= 0 or leg_size < self.min_leg_adr * adr:
+            _trace(
+                trace, bar,
+                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
+                f"{elapsed_minutes:.0f}m OK, but leg {leg_size:.2f} < required "
+                f"{self.min_leg_adr * adr if adr > 0 else float('nan'):.2f} "
+                f"({self.min_leg_adr}x ADR ${adr:.2f}) -- leg too small",
+            )
             return None  # too small a move to be "sharp"
 
         move_rvol = (
@@ -552,7 +638,19 @@ class _ReversalBase(Setup):
             else None
         )
         if move_rvol is None or move_rvol < rvol_threshold(levels.adv):
+            _trace(
+                trace, bar,
+                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
+                f"{elapsed_minutes:.0f}m leg {leg_size:.2f} OK, but move_rvol "
+                f"{move_rvol} < required {rvol_threshold(levels.adv)} -- too thin",
+            )
             return None  # not enough volume behind the move
+
+        _trace(
+            trace, bar,
+            f"FIRE @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
+            f"{elapsed_minutes:.0f}m leg {leg_size:.2f} move_rvol {move_rvol}",
+        )
 
         avwap = indicators.avwap
         avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
