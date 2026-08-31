@@ -105,6 +105,18 @@ SELECT
     json_extract(t.extras_json, '$.session_extreme_pct')      AS session_extreme_pct,
     json_extract(t.extras_json, '$.session_stop_shares')      AS session_stop_shares,
     json_extract(t.extras_json, '$.session_stop_dollars')     AS session_stop_dollars,
+    -- Reversal (REV-L/REV-S) only: the leg it fired on. anchor/leg_extreme
+    -- are dollars, leg_size_adr/leg_size_pct describe the same leg in ADR
+    -- and percent-of-anchor terms, and retrace_pct/retrace_minutes/move_rvol
+    -- are the three filters that actually gated the fire (25-50% retracement,
+    -- >=6 minutes since the extreme, RVOL frozen at the extreme bar).
+    json_extract(t.extras_json, '$.anchor')                   AS anchor,
+    json_extract(t.extras_json, '$.leg_extreme')               AS leg_extreme,
+    json_extract(t.extras_json, '$.leg_size_adr')              AS leg_size_adr,
+    json_extract(t.extras_json, '$.leg_size_pct')              AS leg_size_pct,
+    json_extract(t.extras_json, '$.retrace_pct')               AS retrace_pct,
+    json_extract(t.extras_json, '$.retrace_minutes')           AS retrace_minutes,
+    json_extract(t.extras_json, '$.move_rvol')                 AS move_rvol,
     -- detection_ts equals bar_end exactly in Replay, so showing both is noise.
     -- The difference is the only part that carries information, and it is what
     -- Live will populate: how long after the bar closed the trigger was seen.

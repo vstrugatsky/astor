@@ -10,6 +10,10 @@
 
     uv run python -m astor.cli warm-cache --tickers-file broad_watchlist.txt
         (run overnight via cron so a mid-session Live 'add' hits disk, not IBKR)
+
+    uv run python -m astor.cli purge-db
+        (wipes the ENTIRE store, every session -- only after a schema change;
+        a same-day rerun of replay/live never needs this)
 """
 
 from __future__ import annotations
@@ -81,6 +85,13 @@ def _setups_and_kwargs(args: argparse.Namespace):
         if args.setups
         else ALL_SETUPS
     )
+    reversal_kwargs = {
+        "min_leg_adr": args.min_leg_adr,
+        "min_retrace_pct": args.min_retrace_pct,
+        "max_retrace_pct": args.max_retrace_pct,
+        "min_confirm_minutes": args.min_confirm_minutes,
+        "max_loss_dollars": args.max_loss,
+    }
     kwargs = {
         "U&R": {
             "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
@@ -96,6 +107,8 @@ def _setups_and_kwargs(args: argparse.Namespace):
             "min_combined_pct": args.min_combined_pct,
             "max_loss_dollars": args.max_loss,
         },
+        "REV-L": reversal_kwargs,
+        "REV-S": reversal_kwargs,
     }
     return setups, kwargs
 
@@ -129,6 +142,10 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         "min_reclaim_pct": args.min_reclaim_pct,
         "min_combined_pct": args.min_combined_pct,
         "adr_sessions": args.adr_sessions,
+        "min_leg_adr": args.min_leg_adr,
+        "min_retrace_pct": args.min_retrace_pct,
+        "max_retrace_pct": args.max_retrace_pct,
+        "min_confirm_minutes": args.min_confirm_minutes,
         "max_loss": args.max_loss,
     }
 
@@ -160,12 +177,6 @@ async def cmd_replay(args: argparse.Namespace) -> int:
     scanner.curves = curves
 
     store = TriggerStore(Path(args.db))
-    if args.purge:
-        # Rows, not the file: replacing the file would strand any open DataGrip
-        # connection on the old inode, where it would read stale rows forever.
-        removed = store.purge_runs()
-        if removed:
-            logger.info("Purged %d earlier run(s) from %s", removed, args.db)
     store.start_run(run_id, "replay", params)
 
     def on_trigger(t):
@@ -217,7 +228,10 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
         print("-" * 92)
         for t in triggers:
             e = t.extras
+            # bars_below/bars_above/bars_armed are U&R/O&F-specific -- absent
+            # (None) for REV-L/REV-S, which has no analogous bar count.
             nbars = e.get("bars_below", e.get("bars_above"))
+            bars_armed = e.get("bars_armed")
             exc_pct, rec_pct, sum_pct = (
                 e.get("excursion_pct"),
                 e.get("reclaim_pct"),
@@ -231,12 +245,14 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
             sum_pct_s = f"{sum_pct:.2f}%" if sum_pct is not None else "-"
             avwap_s = f"{avwap:.2f}" if avwap is not None else "-"
             rvol_s = f"{rvol:.2f}" if rvol is not None else "-"
+            nbars_s = str(nbars) if nbars is not None else "-"
+            armed_s = str(bars_armed) if bars_armed is not None else "-"
             print(
                 f"{t.bar_start:%H:%M:%S}  {t.symbol:<7} {t.setup:<5} {grade_s:>3} "
                 f"{t.trigger_price:>9.2f} {t.level_value:>9.2f} "
                 f"{exc_pct_s:>7} {rec_pct_s:>7} {sum_pct_s:>7}"
                 f" {avwap_s:>9} {rvol_s:>6}"
-                f" {nbars:>7} {e.get('bars_armed', 0):>6}"
+                f" {nbars_s:>7} {armed_s:>6}"
             )
 
         by_symbol: dict[str, int] = {}
@@ -352,6 +368,49 @@ async def cmd_warm_cache(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_purge_db(args: argparse.Namespace) -> int:
+    """Wipe every run and trigger from the store. No IB connection needed --
+    this only touches the sqlite file.
+
+    Rows are cleared in place (DELETE, not file replacement): replacing the
+    file would strand any open DataGrip connection on the old inode, which
+    the OS keeps serving stale rows from indefinitely with no error. See
+    TriggerStore.purge_runs.
+
+    Separate from `replay`/`live` (which used to carry a `--purge` flag) on
+    purpose -- a routine rerun of a session never needs this (latest_triggers
+    already supersedes an earlier run of the same session on its own), and a
+    flag sitting on every routine invocation is exactly the shape of mistake
+    that deletes months of trigger history because it seemed convenient in
+    the moment. This command exists, but has to be reached for deliberately.
+    """
+    db_path = Path(args.db)
+    store = TriggerStore(db_path)
+    n_runs = store.conn.execute("SELECT count(*) FROM runs").fetchone()[0]
+    n_triggers = store.conn.execute("SELECT count(*) FROM triggers").fetchone()[0]
+    if n_runs == 0:
+        print(f"{db_path} has no runs to purge.")
+        store.close()
+        return 0
+
+    print(
+        f"This will PERMANENTLY delete {n_runs} run(s) and {n_triggers} "
+        f"trigger(s) from {db_path} -- every session ever recorded, not "
+        f"just one day. Any grades/notes on those triggers are lost too."
+    )
+    if not args.yes:
+        reply = input("Type 'yes' to confirm: ").strip().lower()
+        if reply != "yes":
+            print("Aborted -- nothing deleted.")
+            store.close()
+            return 1
+
+    removed = store.purge_runs()
+    store.close()
+    print(f"Purged {removed} run(s) from {db_path}.")
+    return 0
+
+
 async def cmd_live(args: argparse.Namespace) -> int:
     symbols = parse_symbols(args)
     setups, kwargs = _setups_and_kwargs(args)
@@ -367,10 +426,6 @@ async def cmd_live(args: argparse.Namespace) -> int:
         logger.info("Live session target: %s (run_id=%s)", driver.session, run_id)
 
         store = TriggerStore(Path(args.db))
-        if args.purge:
-            removed = store.purge_runs()
-            if removed:
-                logger.info("Purged %d earlier run(s) from %s", removed, args.db)
         store.start_run(
             run_id,
             "live",
@@ -382,6 +437,10 @@ async def cmd_live(args: argparse.Namespace) -> int:
                 "min_excursion_pct": args.min_excursion_pct,
                 "min_reclaim_pct": args.min_reclaim_pct,
                 "min_combined_pct": args.min_combined_pct,
+                "min_leg_adr": args.min_leg_adr,
+                "min_retrace_pct": args.min_retrace_pct,
+                "max_retrace_pct": args.max_retrace_pct,
+                "min_confirm_minutes": args.min_confirm_minutes,
                 "max_loss": args.max_loss,
             },
         )
@@ -584,17 +643,42 @@ def build_parser() -> argparse.ArgumentParser:
         "trigger.",
     )
     r.add_argument(
+        "--min-leg-adr",
+        type=float,
+        default=0.5,
+        help="REV-L/REV-S only: minimum directional-leg size, in ADR units "
+        "(0.5 = the leg must be at least half the symbol's ADR).",
+    )
+    r.add_argument(
+        "--min-retrace-pct",
+        type=float,
+        default=25.0,
+        help="REV-L/REV-S only: minimum retracement of the leg, as %% of "
+        "the leg's size, to count as a real reversal (not too early).",
+    )
+    r.add_argument(
+        "--max-retrace-pct",
+        type=float,
+        default=50.0,
+        help="REV-L/REV-S only: maximum retracement of the leg, as %% of "
+        "the leg's size -- past this the move has round-tripped (too late), "
+        "and the leg is dead until a new, deeper extreme forms.",
+    )
+    r.add_argument(
+        "--min-confirm-minutes",
+        type=float,
+        default=6.0,
+        help="REV-L/REV-S only: minutes that must elapse since the leg's "
+        "extreme before a retracement in the target band is trusted, so a "
+        "same-bar or two-bar bounce doesn't count as confirmed.",
+    )
+    r.add_argument(
         "--max-loss",
         type=float,
         default=100.0,
         help="Max loss in dollars a stop-out is assumed to cost, for the "
         "position-size diagnostics recorded on each trigger (both a stop at "
         "PDH/PDL and a stop at the session's actual high/low are sized).",
-    )
-    r.add_argument(
-        "--purge",
-        action="store_true",
-        help="Clear earlier runs first, in place (keeps open DB connections valid)",
     )
     r.add_argument("--db", default="data/astor.db")
     r.add_argument("--cache-dir", default="data/bars")
@@ -644,6 +728,33 @@ def build_parser() -> argparse.ArgumentParser:
         "price (0 = off).",
     )
     lv.add_argument(
+        "--min-leg-adr",
+        type=float,
+        default=0.5,
+        help="REV-L/REV-S only: minimum directional-leg size, in ADR units.",
+    )
+    lv.add_argument(
+        "--min-retrace-pct",
+        type=float,
+        default=25.0,
+        help="REV-L/REV-S only: minimum retracement of the leg, as %% of "
+        "the leg's size, to count as a real reversal.",
+    )
+    lv.add_argument(
+        "--max-retrace-pct",
+        type=float,
+        default=50.0,
+        help="REV-L/REV-S only: maximum retracement of the leg, as %% of "
+        "the leg's size, before the leg is dead until a new extreme forms.",
+    )
+    lv.add_argument(
+        "--min-confirm-minutes",
+        type=float,
+        default=6.0,
+        help="REV-L/REV-S only: minutes since the leg's extreme before a "
+        "retracement in the target band is trusted.",
+    )
+    lv.add_argument(
         "--max-loss",
         type=float,
         default=100.0,
@@ -656,11 +767,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="Cap enforced by the add/remove console (0 = no cap)",
-    )
-    lv.add_argument(
-        "--purge",
-        action="store_true",
-        help="Clear earlier runs first, in place (keeps open DB connections valid)",
     )
     lv.add_argument("--db", default="data/astor.db")
     lv.add_argument("--cache-dir", default="data/bars")
@@ -730,6 +836,21 @@ def build_parser() -> argparse.ArgumentParser:
     # warm-cache run never clashes with an interactive session left open.
     wc.add_argument("--client-id", type=int, default=23)
 
+    pd = sub.add_parser(
+        "purge-db",
+        help="Permanently delete every run and trigger from the store -- "
+        "the whole database, not just one session. Only needed after a "
+        "schema change (new/renamed extras fields); a same-day rerun never "
+        "needs this, since latest_triggers already supersedes old runs of "
+        "the same session on its own.",
+    )
+    pd.add_argument("--db", default="data/astor.db")
+    pd.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation prompt (for scripted use)",
+    )
+
     return p
 
 
@@ -749,6 +870,7 @@ def main() -> None:
         "replay": cmd_replay,
         "live": cmd_live,
         "warm-cache": cmd_warm_cache,
+        "purge-db": cmd_purge_db,
     }[args.command]
     raise SystemExit(asyncio.run(cmd(args)))
 

@@ -72,6 +72,7 @@ from __future__ import annotations
 
 from typing import ClassVar
 
+from astor.core.grading import rvol_threshold
 from astor.core.indicators import SessionIndicators, compute_rvol
 from astor.core.types import BarEvent, DailyLevels, Trigger, VolumeCurve
 
@@ -413,5 +414,233 @@ class OvershootFail(Setup):
         return trigger
 
 
-ALL_SETUPS: list[type[Setup]] = [UndercutRally, OvershootFail]
+class _ReversalBase(Setup):
+    """Shared shape for ReversalLong/ReversalShort ("right side of V"): a
+    sharp directional move on real volume, followed by a retracement that
+    lands in a middle band -- not so shallow it never really reversed, not
+    so deep the whole move already round-tripped -- held long enough to
+    look like more than a dead-cat bounce.
+
+    Unlike U&R/O&F, this is not anchored to a static level (PDL/PDH). The
+    "leg" is the session's own developing extreme -- SessionIndicators'
+    session_low/session_high, continuously updated by Scanner before this
+    ever sees the bar. Whenever a new, deeper extreme forms, the leg resets
+    completely: a fresh anchor check, a fresh clock, and (per the trader's
+    call) any prior retracement progress is void -- the V's bottom just
+    moved, so a partial bounce that hadn't fired yet means nothing anymore.
+
+    The leg's anchor is always `session_open` -- the overnight gap and
+    `prev_close` play no part here, by the trader's own call. A gap-inclusive
+    version of this idea is a distinct setup (Gap Reversal, not yet built),
+    not a variant of this one.
+
+    RVOL is evaluated frozen at the extreme bar, not at fire time: by fire
+    time more volume has accumulated during the retracement itself, which
+    would understate or overstate how unusual the *original move* actually
+    was depending on how that later volume behaved. `move_rvol` is that
+    frozen figure; `rvol` (the same diagnostic name U&R/O&F use, and what
+    Scanner's real-time grading reads) is the ordinary current-bar value.
+
+    A leg fires at most once: after firing, only a new, deeper extreme
+    (never the one just fired on) can arm it again. And per the trader's
+    call, a leg that already gave back more than max_retrace_pct is dead
+    for good -- the right side of the V is gone -- until a new extreme
+    starts a new leg from scratch.
+
+    "EXT" is used as level_name (there's no PDH/PDL here, so no 3-letter
+    level code makes sense beyond "the extreme"); level_value is the leg's
+    own extreme, playing the same stop-anchor role PDL/PDH plays for U&R/O&F.
+    session_extreme/session_extreme_pct/session_stop_* are left unset
+    (unlike U&R/O&F): there is no second, distinct "technical vs. actual"
+    stop to show here since the level *is* the session extreme already --
+    a redundant second line would misleadingly imply otherwise.
+    """
+
+    name: ClassVar[str]
+    direction: ClassVar[str]
+    level_name: ClassVar[str] = "EXT"
+
+    def __init__(
+        self,
+        min_leg_adr: float = 0.5,
+        min_retrace_pct: float = 25.0,
+        max_retrace_pct: float = 50.0,
+        min_confirm_minutes: float = 6.0,
+        max_loss_dollars: float = 100.0,
+    ):
+        self.min_leg_adr = min_leg_adr
+        self.min_retrace_pct = min_retrace_pct
+        self.max_retrace_pct = max_retrace_pct
+        self.min_confirm_minutes = min_confirm_minutes
+        self.max_loss_dollars = max_loss_dollars
+        self._anchor: float | None = None
+        self._extreme: float | None = None
+        self._extreme_bar: BarEvent | None = None
+        self._extreme_cum_volume: float = 0.0
+        self._retrace_dead = False
+        self._fired_extreme: float | None = None
+
+    # -- direction-specific hooks, overridden by Long/Short below -----------
+
+    def _session_extreme(self, indicators: SessionIndicators) -> float:
+        raise NotImplementedError
+
+    def _more_extreme(self, a: float, b: float) -> float:
+        """The more extreme (further from anchor) of two candidates."""
+        raise NotImplementedError
+
+    def _retrace_from(self, close: float, extreme: float) -> float:
+        """Distance price has moved back toward (or past) the anchor,
+        starting from the extreme -- positive once retracement begins."""
+        raise NotImplementedError
+
+    # -- shared state machine ------------------------------------------------
+
+    def on_bar(
+        self,
+        bar: BarEvent,
+        levels: DailyLevels,
+        indicators: SessionIndicators | None = None,
+        curve: VolumeCurve | None = None,
+    ) -> Trigger | None:
+        if indicators is None or indicators.session_open is None:
+            return None
+
+        if self._anchor is None:
+            self._anchor = indicators.session_open
+
+        session_extreme = self._session_extreme(indicators)
+        if self._extreme is None or self._more_extreme(
+            session_extreme, self._extreme
+        ) != self._extreme:
+            # A new, deeper extreme just formed (or this is the first bar) --
+            # the leg resets clean, and there is nothing to check this bar.
+            self._extreme = session_extreme
+            self._extreme_bar = bar
+            self._extreme_cum_volume = indicators.cum_volume
+            self._retrace_dead = False
+            return None
+
+        if self._retrace_dead or self._extreme == self._fired_extreme:
+            return None
+
+        leg_size = abs(self._anchor - self._extreme)
+        if leg_size <= 0:
+            return None
+
+        retrace = self._retrace_from(bar.close, self._extreme)
+        retrace_pct = retrace / leg_size * 100.0
+
+        if retrace_pct > self.max_retrace_pct:
+            self._retrace_dead = True
+            return None
+        if retrace_pct < self.min_retrace_pct:
+            return None
+
+        assert self._extreme_bar is not None
+        elapsed_minutes = (bar.start - self._extreme_bar.start).total_seconds() / 60.0
+        if elapsed_minutes < self.min_confirm_minutes:
+            return None
+
+        adr = levels.adr
+        if adr <= 0 or leg_size < self.min_leg_adr * adr:
+            return None  # too small a move to be "sharp"
+
+        move_rvol = (
+            compute_rvol(self._extreme_cum_volume, self._extreme_bar, curve)
+            if curve
+            else None
+        )
+        if move_rvol is None or move_rvol < rvol_threshold(levels.adv):
+            return None  # not enough volume behind the move
+
+        avwap = indicators.avwap
+        avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
+        level_stop_pct = _abs_pct_of_level(bar.close - self._extreme, self._extreme)
+        level_shares, level_dollars = _position_size(
+            bar.close, self._extreme, self.max_loss_dollars
+        )
+        rvol = (
+            compute_rvol(indicators.cum_volume, bar, curve)
+            if curve
+            else None
+        )
+
+        trigger = Trigger(
+            symbol=bar.symbol,
+            setup=self.name,
+            direction=self.direction,
+            trigger_price=bar.close,
+            bar_start=bar.start,
+            bar_end=bar.end,
+            level_name=self.level_name,
+            level_value=self._extreme,
+            extras={
+                "anchor": self._anchor,
+                "leg_extreme": self._extreme,
+                "leg_extreme_start": self._extreme_bar.start.isoformat(),
+                "leg_size_adr": round(leg_size / adr, 4) if adr > 0 else None,
+                "leg_size_pct": _pct_of_level(leg_size, self._anchor),
+                "retrace_pct": round(retrace_pct, 4),
+                "retrace_minutes": round(elapsed_minutes, 1),
+                "move_rvol": move_rvol,
+                "adr_pct": levels.adr_pct,
+                "avwap": avwap,
+                "avwap_pct": avwap_pct,
+                "rvol": rvol,
+                # Aliased under U&R/O&F's own diagnostic name too, so the
+                # live console alert (astor.drivers.live, setup-agnostic)
+                # renders a stop line without any Reversal-specific code.
+                "reclaim_pct": level_stop_pct,
+                "max_loss_dollars": self.max_loss_dollars,
+                "level_stop_pct": level_stop_pct,
+                "level_stop_shares": level_shares,
+                "level_stop_dollars": level_dollars,
+                "session_open": indicators.session_open,
+                "session_high": indicators.session_high,
+                "session_low": indicators.session_low,
+            },
+        )
+        self._fired_extreme = self._extreme
+        return trigger
+
+
+class ReversalLong(_ReversalBase):
+    """Long. A sharp move down, on volume, then a 25-50% retracement back up
+    held for at least min_confirm_minutes -- the right side of a V."""
+
+    name = "REV-L"
+    direction = "long"
+
+    def _session_extreme(self, indicators: SessionIndicators) -> float:
+        assert indicators.session_low is not None
+        return indicators.session_low
+
+    def _more_extreme(self, a: float, b: float) -> float:
+        return min(a, b)
+
+    def _retrace_from(self, close: float, extreme: float) -> float:
+        return close - extreme
+
+
+class ReversalShort(_ReversalBase):
+    """Short. A sharp move up, on volume, then a 25-50% retracement back
+    down held for at least min_confirm_minutes -- the right side of a
+    mirrored (^-shaped) V."""
+
+    name = "REV-S"
+    direction = "short"
+
+    def _session_extreme(self, indicators: SessionIndicators) -> float:
+        assert indicators.session_high is not None
+        return indicators.session_high
+
+    def _more_extreme(self, a: float, b: float) -> float:
+        return max(a, b)
+
+    def _retrace_from(self, close: float, extreme: float) -> float:
+        return extreme - close
+
+
+ALL_SETUPS: list[type[Setup]] = [UndercutRally, OvershootFail, ReversalLong, ReversalShort]
 SETUPS_BY_NAME = {s.name: s for s in ALL_SETUPS}

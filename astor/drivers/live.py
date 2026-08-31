@@ -52,6 +52,13 @@ ACTIVATION_PACE_SECONDS = 0.75
 # most of a second per symbol out of an already-paced activation batch.
 BACKFILL_TIMEOUT = 15.0
 
+# Suspended while validating REV-L/REV-S live: the trader expects Reversal
+# to generate enough alerts on its own, and stacking U&R/O&F's on top risks
+# bell-fatigue during the session. This only silences the terminal alert --
+# every U&R/O&F trigger is still detected and stored, so a later replay/SQL
+# review sees exactly what it would have otherwise.
+SUSPENDED_NOTIFY_SETUPS = {"U&R", "O&F"}
+
 
 def _format_trigger_line(t: Trigger) -> str:
     """Everything Notify shows for a fired trigger: the headline, then the
@@ -460,10 +467,13 @@ class LiveDriver:
                     # is exactly what makes a commit here safe to do this often
                     # without blocking a concurrent reader.
                     store.commit()
-                    # Every trigger is still stored regardless of grade --
-                    # only the terminal alert is gated, so a look back at
-                    # the full session never has gaps to explain.
-                    if (trigger.extras.get("auto_grade") or 0) >= NOTIFY_GRADE_THRESHOLD:
+                    # Every trigger is still stored regardless of grade or
+                    # setup -- only the terminal alert is gated, so a look
+                    # back at the full session never has gaps to explain.
+                    if (
+                        trigger.setup not in SUSPENDED_NOTIFY_SETUPS
+                        and (trigger.extras.get("auto_grade") or 0) >= NOTIFY_GRADE_THRESHOLD
+                    ):
                         _print_trigger_alert(trigger)
 
                 track_alert = self.tracker.on_close(symbol, bar_event.close, bar_event.start)

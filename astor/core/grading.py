@@ -54,7 +54,12 @@ _AVWAP_EXTENSION_TIERS = (
 )
 
 
-def _rvol_threshold(adv: float) -> float:
+def rvol_threshold(adv: float) -> float:
+    """The RVOL floor for a name of this ADV, highest-liquidity tier first.
+    Shared with astor.core.setups (Reversal), not just this module's own
+    grading -- a $5B/day name needing less relative volume to look unusual
+    is a property of the name, not of any one setup.
+    """
     for floor, threshold in _RVOL_TIERS:
         if adv > floor:
             return threshold
@@ -91,7 +96,7 @@ def grade_trigger(
             grade += 1
 
     rvol = trigger.extras.get("rvol")
-    if rvol is not None and rvol > _rvol_threshold(levels.adv):
+    if rvol is not None and rvol > rvol_threshold(levels.adv):
         grade += 1
 
     minutes = _minutes_since_open(trigger.bar_start.time())

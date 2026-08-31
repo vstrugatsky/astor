@@ -10,8 +10,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from astor.core.scanner import Scanner
-from astor.core.setups import OvershootFail, UndercutRally
-from astor.core.types import BarEvent, DailyLevels
+from astor.core.setups import OvershootFail, ReversalLong, ReversalShort, UndercutRally
+from astor.core.types import BarEvent, DailyLevels, VolumeCurve
 from astor.drivers.replay import ReplayDriver, run_replay
 
 ET = ZoneInfo("America/New_York")
@@ -1335,6 +1335,169 @@ def test_store_view_coalesces_short_setup() -> None:
     ).fetchone()
     check("short-side coalesce", row, (2, 3, 0.15))
     store.close()
+
+
+def _minute(i: int):
+    return (OPEN + timedelta(minutes=i)).time()
+
+
+def _generous_curve(symbol: str, n: int = 40) -> VolumeCurve:
+    """A curve whose average is tiny at every minute, so any real bar volume
+    trivially clears the RVOL floor -- for tests where RVOL isn't the point."""
+    return VolumeCurve(symbol, sessions=10, cum_volume_by_minute={_minute(i): 1.0 for i in range(n)})
+
+
+def _rev_scanner(
+    setup_cls, prev_close: float = 100.0, adr_pct: float = 4.0, curve: VolumeCurve | None = None
+) -> Scanner:
+    levels = DailyLevels(
+        "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=adr_pct, prev_close=prev_close, adv=100_000_000.0
+    )
+    scanner = Scanner({"REV": levels}, [setup_cls])
+    scanner.curves["REV"] = curve or _generous_curve("REV")
+    return scanner
+
+
+def _feed(scanner: Scanner, bars: list[BarEvent]) -> list:
+    triggers = []
+    for b in bars:
+        triggers.extend(scanner.on_bar(b))
+    return triggers
+
+
+def _leg3_bars(final_close: float = 96.0) -> list[BarEvent]:
+    """A REV-L scenario with anchor=session_open=98.0 (prev_close plays no
+    part -- gap is out of scope) and leg extreme 95.0, so leg_size=3.0.
+    Bars 3-8 ramp gently up to `final_close` at elapsed=6 (bar index 8),
+    never dipping below the 95.0 extreme and never exceeding the 50% line
+    (96.5) along the way.
+    """
+    return [
+        bar(0, 98.0, 98.2, 97.5, 97.8, 50_000, symbol="REV"),  # session open 98.0
+        bar(1, 97.8, 98.0, 96.0, 96.2, 60_000, symbol="REV"),  # new low
+        bar(2, 96.2, 96.5, 95.0, 95.3, 70_000, symbol="REV"),  # new low -- becomes the leg extreme
+        bar(3, 95.3, 95.6, 95.2, 95.4, 10_000, symbol="REV"),  # retrace 13%, elapsed 1
+        bar(4, 95.4, 95.8, 95.3, 95.6, 10_000, symbol="REV"),  # retrace 20%, elapsed 2
+        bar(5, 95.6, 95.9, 95.4, 95.7, 10_000, symbol="REV"),  # retrace 23%, elapsed 3
+        bar(6, 95.7, 96.0, 95.5, 95.8, 10_000, symbol="REV"),  # retrace 27%, elapsed 4 -- in band, too early
+        bar(7, 95.8, 96.1, 95.6, 95.9, 10_000, symbol="REV"),  # retrace 30%, elapsed 5
+        bar(8, 95.9, 96.2, 95.7, final_close, 10_000, symbol="REV"),  # elapsed 6
+    ]
+
+
+def test_reversal_long_basic() -> None:
+    curve = VolumeCurve("REV", 10, {time(9, 32): 100_000.0})
+    scanner = _rev_scanner(ReversalLong, curve=curve)
+    triggers = _feed(scanner, _leg3_bars())
+    check("exactly one trigger", len(triggers), 1)
+    t = triggers[0]
+    check("setup", t.setup, "REV-L")
+    check("direction", t.direction, "long")
+    check("level_name", t.level_name, "EXT")
+    check("level_value is the leg extreme", t.level_value, 95.0)
+    check("trigger_price", t.trigger_price, 96.0)
+    check("anchor is session_open (prev_close/gap out of scope)", t.extras["anchor"], 98.0)
+    check("retrace_pct", round(t.extras["retrace_pct"], 1), 33.3)
+    check("retrace_minutes", t.extras["retrace_minutes"], 6.0)
+    check("move_rvol", t.extras["move_rvol"], 1.8)
+    check("reclaim_pct aliases level_stop_pct", t.extras["reclaim_pct"], t.extras["level_stop_pct"])
+
+
+def test_reversal_long_too_early_does_not_fire() -> None:
+    curve = VolumeCurve("REV", 10, {time(9, 32): 100_000.0})
+    scanner = _rev_scanner(ReversalLong, curve=curve)
+    bars = _leg3_bars()[:8]  # stop at elapsed 5 (in-band, but too early)
+    check("no trigger before 6 minutes elapsed", _feed(scanner, bars), [])
+
+
+def test_reversal_retrace_past_50pct_kills_leg_until_new_extreme() -> None:
+    scanner = _rev_scanner(ReversalLong)
+    bars = [
+        bar(0, 98.0, 98.2, 97.5, 97.8, 1000, symbol="REV"),
+        bar(1, 97.8, 98.0, 96.0, 96.2, 1000, symbol="REV"),
+        bar(2, 96.2, 96.5, 95.0, 95.3, 1000, symbol="REV"),  # leg1 extreme 95.0 (anchor 98, size 3.0)
+        bar(3, 95.3, 98.2, 95.5, 98.0, 1000, symbol="REV"),  # retrace 100% -- kills leg1
+        bar(4, 98.0, 98.2, 96.0, 96.5, 1000, symbol="REV"),  # back in-band, but dead
+        bar(5, 96.5, 96.8, 96.0, 96.6, 1000, symbol="REV"),
+        bar(6, 96.6, 96.9, 96.0, 96.7, 1000, symbol="REV"),
+        bar(7, 96.7, 97.0, 96.0, 96.8, 1000, symbol="REV"),
+        bar(8, 96.8, 97.1, 96.0, 96.9, 1000, symbol="REV"),  # elapsed 6 since leg1 extreme, still dead
+    ]
+    check("dead leg never fires even in-band past 6 minutes", _feed(scanner, bars), [])
+
+    # A new, deeper low re-arms a fresh leg (own anchor reused, own clock, own extreme).
+    more_bars = [
+        bar(9, 96.9, 97.0, 94.0, 94.3, 1000, symbol="REV"),  # new leg2 extreme 94.0 (anchor 98, size 4.0)
+        bar(10, 94.3, 94.7, 94.2, 94.6, 1000, symbol="REV"),
+        bar(11, 94.6, 95.1, 94.5, 95.0, 1000, symbol="REV"),
+        bar(12, 95.0, 95.4, 94.8, 95.3, 1000, symbol="REV"),
+        bar(13, 95.3, 95.7, 95.0, 95.6, 1000, symbol="REV"),
+        bar(14, 95.6, 96.0, 95.2, 95.9, 1000, symbol="REV"),
+        bar(15, 95.9, 96.1, 95.4, 96.0, 1000, symbol="REV"),  # retrace 50%, elapsed 6 -- fires
+    ]
+    triggers = _feed(scanner, more_bars)
+    check("exactly one trigger for leg2", len(triggers), 1)
+    t = triggers[0]
+    check("fires on the new, deeper extreme", t.level_value, 94.0)
+    check("anchor unchanged (not recomputed, still session_open)", t.extras["anchor"], 98.0)
+    check("trigger price", t.trigger_price, 96.0)
+
+
+def test_reversal_anchor_ignores_prev_close() -> None:
+    # prev_close set far from session_open, on both sides -- anchor must
+    # equal session_open (98.0) regardless, since gap/prev_close play no
+    # part in this setup anymore.
+    for prev_close in (90.0, 110.0):
+        curve = VolumeCurve("REV", 10, {time(9, 32): 100_000.0})
+        scanner = _rev_scanner(ReversalLong, prev_close=prev_close, curve=curve)
+        triggers = _feed(scanner, _leg3_bars())
+        check(f"exactly one trigger (prev_close={prev_close})", len(triggers), 1)
+        check(
+            f"anchor is session_open regardless of prev_close={prev_close}",
+            triggers[0].extras["anchor"],
+            98.0,
+        )
+
+
+def test_reversal_requires_min_leg_adr() -> None:
+    # adr_pct=20 -> ADR=20.0, so the required 0.5*ADR=10.0 floor exceeds the
+    # 3.0 leg this scenario forms -- should never fire, same bars as the
+    # otherwise-passing basic case (isolating the ADR floor specifically).
+    curve = VolumeCurve("REV", 10, {time(9, 32): 100_000.0})
+    scanner = _rev_scanner(ReversalLong, adr_pct=20.0, curve=curve)
+    check("leg too small relative to ADR never fires", _feed(scanner, _leg3_bars()), [])
+
+
+def test_reversal_requires_rvol_floor() -> None:
+    # Average volume at the extreme minute set absurdly high, so the frozen
+    # move_rvol comes in far below the 1.5x default floor -- same bars as
+    # the otherwise-passing basic case, isolating the RVOL floor.
+    curve = VolumeCurve("REV", 10, {time(9, 32): 10_000_000.0})
+    scanner = _rev_scanner(ReversalLong, curve=curve)
+    check("thin RVOL relative to average never fires", _feed(scanner, _leg3_bars()), [])
+
+
+def test_reversal_short_mirrors_long() -> None:
+    scanner = _rev_scanner(ReversalShort)
+    bars = [
+        bar(0, 102.0, 102.5, 101.8, 102.2, 1000, symbol="REV"),  # session open 102.0
+        bar(1, 102.2, 104.0, 102.0, 103.8, 1000, symbol="REV"),  # new high
+        bar(2, 103.8, 105.0, 103.5, 104.7, 1000, symbol="REV"),  # new high -- leg extreme 105.0
+        bar(3, 104.7, 104.8, 104.4, 104.6, 1000, symbol="REV"),  # retrace 13%, elapsed 1
+        bar(4, 104.6, 104.6, 104.2, 104.4, 1000, symbol="REV"),  # retrace 20%, elapsed 2
+        bar(5, 104.4, 104.5, 104.1, 104.3, 1000, symbol="REV"),  # retrace 23%, elapsed 3
+        bar(6, 104.3, 104.4, 104.0, 104.2, 1000, symbol="REV"),  # retrace 27%, elapsed 4
+        bar(7, 104.2, 104.3, 103.9, 104.1, 1000, symbol="REV"),  # retrace 30%, elapsed 5
+        bar(8, 104.1, 104.2, 103.8, 104.0, 1000, symbol="REV"),  # retrace 33%, elapsed 6 -- fires
+    ]
+    triggers = _feed(scanner, bars)
+    check("exactly one trigger", len(triggers), 1)
+    t = triggers[0]
+    check("setup", t.setup, "REV-S")
+    check("direction", t.direction, "short")
+    check("level_value is the leg extreme (session high)", t.level_value, 105.0)
+    check("anchor is session_open (prev_close/gap out of scope)", t.extras["anchor"], 102.0)
+    check("retrace_pct", round(t.extras["retrace_pct"], 1), 33.3)
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
