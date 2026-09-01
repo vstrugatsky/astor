@@ -1366,14 +1366,15 @@ def _feed(scanner: Scanner, bars: list[BarEvent]) -> list:
 
 
 def _leg3_bars(final_close: float = 96.0) -> list[BarEvent]:
-    """A REV-L scenario with anchor=session_open=98.0 (prev_close plays no
-    part -- gap is out of scope) and leg extreme 95.0, so leg_size=3.0.
-    Bars 3-8 ramp gently up to `final_close` at elapsed=6 (bar index 8),
-    never dipping below the 95.0 extreme and never exceeding the 50% line
-    (96.5) along the way.
+    """A REV-L scenario where anchor (the running session high) never moves
+    past bar 0's high, so it stays pinned at session_open=98.0 -- extreme
+    (session low) settles at 95.0, so leg_size=3.0. Bars 3-8 ramp gently up
+    to `final_close` at elapsed=6 (bar index 8), never dipping below the
+    95.0 extreme, never exceeding 98.0 (which would move the anchor), and
+    never exceeding the 50% retrace line (96.5) along the way.
     """
     return [
-        bar(0, 98.0, 98.2, 97.5, 97.8, 50_000, symbol="REV"),  # session open 98.0
+        bar(0, 98.0, 98.0, 97.5, 97.8, 50_000, symbol="REV"),  # session open 98.0, high pinned at 98.0
         bar(1, 97.8, 98.0, 96.0, 96.2, 60_000, symbol="REV"),  # new low
         bar(2, 96.2, 96.5, 95.0, 95.3, 70_000, symbol="REV"),  # new low -- becomes the leg extreme
         bar(3, 95.3, 95.6, 95.2, 95.4, 10_000, symbol="REV"),  # retrace 13%, elapsed 1
@@ -1401,6 +1402,8 @@ def test_reversal_long_basic() -> None:
     check("retrace_minutes", t.extras["retrace_minutes"], 6.0)
     check("move_rvol", t.extras["move_rvol"], 1.8)
     check("reclaim_pct aliases level_stop_pct", t.extras["reclaim_pct"], t.extras["level_stop_pct"])
+    # anchor set at bar 0 (9:30), extreme (95.0) last set at bar 2 (9:32).
+    check("leg_duration_minutes", t.extras["leg_duration_minutes"], 2.0)
 
 
 def test_reversal_long_too_early_does_not_fire() -> None:
@@ -1411,13 +1414,17 @@ def test_reversal_long_too_early_does_not_fire() -> None:
 
 
 def test_reversal_retrace_past_50pct_kills_leg_until_new_extreme() -> None:
+    # Every bar's high is capped at 98.0 throughout (never exceeding bar 0's
+    # high) so the anchor never itself moves during this test -- isolating
+    # the extreme/retrace/dead-leg behavior from the anchor-movement one,
+    # which gets its own test below.
     scanner = _rev_scanner(ReversalLong)
     bars = [
-        bar(0, 98.0, 98.2, 97.5, 97.8, 1000, symbol="REV"),
+        bar(0, 98.0, 98.0, 97.5, 97.8, 1000, symbol="REV"),
         bar(1, 97.8, 98.0, 96.0, 96.2, 1000, symbol="REV"),
         bar(2, 96.2, 96.5, 95.0, 95.3, 1000, symbol="REV"),  # leg1 extreme 95.0 (anchor 98, size 3.0)
-        bar(3, 95.3, 98.2, 95.5, 98.0, 1000, symbol="REV"),  # retrace 100% -- kills leg1
-        bar(4, 98.0, 98.2, 96.0, 96.5, 1000, symbol="REV"),  # back in-band, but dead
+        bar(3, 95.3, 98.0, 95.5, 98.0, 1000, symbol="REV"),  # retrace 100% -- kills leg1
+        bar(4, 98.0, 98.0, 96.0, 96.5, 1000, symbol="REV"),  # back in-band, but dead
         bar(5, 96.5, 96.8, 96.0, 96.6, 1000, symbol="REV"),
         bar(6, 96.6, 96.9, 96.0, 96.7, 1000, symbol="REV"),
         bar(7, 96.7, 97.0, 96.0, 96.8, 1000, symbol="REV"),
@@ -1444,19 +1451,80 @@ def test_reversal_retrace_past_50pct_kills_leg_until_new_extreme() -> None:
 
 
 def test_reversal_anchor_ignores_prev_close() -> None:
-    # prev_close set far from session_open, on both sides -- anchor must
-    # equal session_open (98.0) regardless, since gap/prev_close play no
-    # part in this setup anymore.
+    # prev_close set far from session_open, on both sides -- anchor (98.0,
+    # the running session high, which happens to stay pinned at the open in
+    # this bar shape) must be unaffected regardless, since prev_close/gap
+    # play no part in this setup's anchor at all anymore.
     for prev_close in (90.0, 110.0):
         curve = VolumeCurve("REV", 10, {time(9, 32): 100_000.0})
         scanner = _rev_scanner(ReversalLong, prev_close=prev_close, curve=curve)
         triggers = _feed(scanner, _leg3_bars())
         check(f"exactly one trigger (prev_close={prev_close})", len(triggers), 1)
         check(
-            f"anchor is session_open regardless of prev_close={prev_close}",
+            f"anchor unaffected by prev_close={prev_close}",
             triggers[0].extras["anchor"],
             98.0,
         )
+
+
+def test_reversal_short_anchor_shifts_to_pre_leg_low() -> None:
+    # The CDNA case that motivated this: price dips right after the open,
+    # *before* the real up-leg (the one REV-S actually tracks) begins. The
+    # anchor must be that pre-leg low (96.0), not session_open (100.0).
+    scanner = _rev_scanner(ReversalShort)
+    bars = [
+        bar(0, 100.0, 100.0, 99.0, 99.5, 1000, symbol="REV"),  # session open 100.0
+        bar(1, 99.5, 99.5, 97.0, 97.5, 1000, symbol="REV"),  # anchor moves to 97.0
+        bar(2, 97.5, 97.5, 96.0, 96.3, 1000, symbol="REV"),  # anchor moves to 96.0 -- pre-leg low
+        bar(3, 96.3, 100.5, 96.1, 100.2, 1000, symbol="REV"),  # reversal candle -- new extreme 100.5
+        bar(4, 100.2, 102.0, 100.0, 101.8, 1000, symbol="REV"),  # new extreme 102.0
+        bar(5, 101.8, 104.0, 101.5, 103.8, 1000, symbol="REV"),  # new extreme 104.0
+        bar(6, 103.8, 106.0, 103.5, 105.7, 1000, symbol="REV"),  # new extreme 106.0 -- the leg's peak
+        bar(7, 105.7, 105.5, 104.0, 104.5, 1000, symbol="REV"),  # retrace 15%, elapsed 1
+        bar(8, 104.5, 105.0, 103.5, 104.0, 1000, symbol="REV"),  # retrace 20%, elapsed 2
+        bar(9, 104.0, 104.5, 103.0, 103.6, 1000, symbol="REV"),  # retrace 24%, elapsed 3
+        bar(10, 103.6, 104.0, 102.8, 103.3, 1000, symbol="REV"),  # retrace 27%, elapsed 4
+        bar(11, 103.3, 103.8, 102.5, 103.0, 1000, symbol="REV"),  # retrace 30%, elapsed 5
+        bar(12, 103.0, 103.5, 102.2, 102.8, 1000, symbol="REV"),  # retrace 32%, elapsed 6 -- fires
+    ]
+    triggers = _feed(scanner, bars)
+    check("exactly one trigger", len(triggers), 1)
+    t = triggers[0]
+    check("level_value is the leg extreme (session high)", t.level_value, 106.0)
+    check("anchor is the pre-leg low, not session_open", t.extras["anchor"], 96.0)
+    check("retrace_pct off the pre-leg-low leg (10.0 wide)", round(t.extras["retrace_pct"], 1), 32.0)
+    # anchor last set at bar 2 (9:32), extreme (106.0) last set at bar 6 (9:36).
+    check("leg_duration_minutes", t.extras["leg_duration_minutes"], 4.0)
+
+
+def test_reversal_long_anchor_shifts_to_pre_leg_high() -> None:
+    # Mirror of the above: price ticks up right after the open, before the
+    # real down-leg begins. The anchor must be that pre-leg high (104.0),
+    # not session_open (100.0).
+    scanner = _rev_scanner(ReversalLong)
+    bars = [
+        bar(0, 100.0, 101.0, 100.0, 100.5, 1000, symbol="REV"),  # session open 100.0
+        bar(1, 100.5, 103.0, 100.2, 102.8, 1000, symbol="REV"),  # anchor moves to 103.0
+        bar(2, 102.8, 104.0, 102.5, 103.8, 1000, symbol="REV"),  # anchor moves to 104.0 -- pre-leg high
+        bar(3, 103.8, 104.0, 99.5, 100.0, 1000, symbol="REV"),  # reversal candle -- new extreme 99.5
+        bar(4, 100.0, 100.2, 98.0, 98.3, 1000, symbol="REV"),  # new extreme 98.0
+        bar(5, 98.3, 98.5, 96.0, 96.3, 1000, symbol="REV"),  # new extreme 96.0
+        bar(6, 96.3, 96.5, 94.0, 94.3, 1000, symbol="REV"),  # new extreme 94.0 -- the leg's trough
+        bar(7, 94.3, 95.5, 94.2, 95.2, 1000, symbol="REV"),  # retrace 12%, elapsed 1
+        bar(8, 95.2, 96.0, 94.5, 95.8, 1000, symbol="REV"),  # retrace 18%, elapsed 2
+        bar(9, 95.8, 96.3, 94.8, 96.0, 1000, symbol="REV"),  # retrace 20%, elapsed 3
+        bar(10, 96.0, 96.6, 95.0, 96.3, 1000, symbol="REV"),  # retrace 23%, elapsed 4
+        bar(11, 96.3, 97.0, 95.2, 96.8, 1000, symbol="REV"),  # retrace 28%, elapsed 5
+        bar(12, 96.8, 97.3, 95.5, 97.0, 1000, symbol="REV"),  # retrace 30%, elapsed 6 -- fires
+    ]
+    triggers = _feed(scanner, bars)
+    check("exactly one trigger", len(triggers), 1)
+    t = triggers[0]
+    check("level_value is the leg extreme (session low)", t.level_value, 94.0)
+    check("anchor is the pre-leg high, not session_open", t.extras["anchor"], 104.0)
+    check("retrace_pct off the pre-leg-high leg (10.0 wide)", round(t.extras["retrace_pct"], 1), 30.0)
+    # anchor last set at bar 2 (9:32), extreme (94.0) last set at bar 6 (9:36).
+    check("leg_duration_minutes", t.extras["leg_duration_minutes"], 4.0)
 
 
 def test_reversal_requires_min_leg_adr() -> None:
@@ -1478,9 +1546,11 @@ def test_reversal_requires_rvol_floor() -> None:
 
 
 def test_reversal_short_mirrors_long() -> None:
+    # Bar 0's low is pinned at the open (102.0, never below it) so the
+    # anchor (running session low, for REV-S) never itself moves.
     scanner = _rev_scanner(ReversalShort)
     bars = [
-        bar(0, 102.0, 102.5, 101.8, 102.2, 1000, symbol="REV"),  # session open 102.0
+        bar(0, 102.0, 102.5, 102.0, 102.2, 1000, symbol="REV"),  # session open 102.0, low pinned
         bar(1, 102.2, 104.0, 102.0, 103.8, 1000, symbol="REV"),  # new high
         bar(2, 103.8, 105.0, 103.5, 104.7, 1000, symbol="REV"),  # new high -- leg extreme 105.0
         bar(3, 104.7, 104.8, 104.4, 104.6, 1000, symbol="REV"),  # retrace 13%, elapsed 1

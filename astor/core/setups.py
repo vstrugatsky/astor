@@ -484,18 +484,35 @@ class _ReversalBase(Setup):
     so deep the whole move already round-tripped -- held long enough to
     look like more than a dead-cat bounce.
 
-    Unlike U&R/O&F, this is not anchored to a static level (PDL/PDH). The
-    "leg" is the session's own developing extreme -- SessionIndicators'
-    session_low/session_high, continuously updated by Scanner before this
-    ever sees the bar. Whenever a new, deeper extreme forms, the leg resets
-    completely: a fresh anchor check, a fresh clock, and (per the trader's
-    call) any prior retracement progress is void -- the V's bottom just
-    moved, so a partial bounce that hadn't fired yet means nothing anymore.
+    Unlike U&R/O&F, this is not anchored to a static level (PDL/PDH) or even
+    a fixed session_open. Both ends of the leg are running values off
+    SessionIndicators, continuously updated by Scanner before this ever sees
+    the bar: `extreme` is the running extreme in the setup's own direction
+    (session_low for REV-L, session_high for REV-S) and `anchor` is the
+    running extreme in the *opposite* direction (session_high for REV-L,
+    session_low for REV-S). Both are seeded straight from bar 1's actual
+    high and low (via SessionIndicators.update, before this ever sees the
+    bar) -- not bar 1's open, which can differ from its high/low
+    substantially and isn't used here at all. A REV-S candidate that dips to
+    a fresh session low right after the open, before the actual up-leg
+    begins, gets that low as its anchor, since that's where the up-leg
+    actually started -- not wherever price happened to open.
 
-    The leg's anchor is always `session_open` -- the overnight gap and
-    `prev_close` play no part here, by the trader's own call. A gap-inclusive
-    version of this idea is a distinct setup (Gap Reversal, not yet built),
-    not a variant of this one.
+    Whenever *either* boundary moves, the leg resets completely: a fresh
+    clock, and (per the trader's call) any prior retracement progress is
+    void -- the leg's shape just changed, so a partial bounce measured
+    against the old shape means nothing anymore. The RVOL freeze point
+    (`_extreme_bar`) only follows `extreme`, though, not `anchor` -- that's
+    still specifically "the moment the push ended and the retracement
+    began," regardless of where the anchor sits. `_anchor_bar` follows
+    `anchor` the same way, purely to compute `leg_duration_minutes` at fire
+    time -- how long the whole push (anchor to extreme) actually took, a
+    slow multi-hour drift being a much weaker "sharp move" than a fast one
+    even if the price distance is the same.
+
+    The overnight gap and `prev_close` play no part here, by the trader's
+    own call -- a gap-inclusive version of this idea is a distinct setup
+    (Gap Reversal, not yet built), not a variant of this one.
 
     RVOL is evaluated frozen at the extreme bar, not at fire time: by fire
     time more volume has accumulated during the retracement itself, which
@@ -504,11 +521,11 @@ class _ReversalBase(Setup):
     frozen figure; `rvol` (the same diagnostic name U&R/O&F use, and what
     Scanner's real-time grading reads) is the ordinary current-bar value.
 
-    A leg fires at most once: after firing, only a new, deeper extreme
-    (never the one just fired on) can arm it again. And per the trader's
+    A leg fires at most once: after firing, only a move in either boundary
+    away from what was fired on can arm it again. And per the trader's
     call, a leg that already gave back more than max_retrace_pct is dead
-    for good -- the right side of the V is gone -- until a new extreme
-    starts a new leg from scratch.
+    for good -- the right side of the V is gone -- until a new extreme or
+    anchor starts a new leg from scratch.
 
     "EXT" is used as level_name (there's no PDH/PDL here, so no 3-letter
     level code makes sense beyond "the extreme"); level_value is the leg's
@@ -536,12 +553,16 @@ class _ReversalBase(Setup):
         self.max_retrace_pct = max_retrace_pct
         self.min_confirm_minutes = min_confirm_minutes
         self.max_loss_dollars = max_loss_dollars
+        # Both running values -- see the class docstring. anchor is the
+        # running extreme in the OPPOSITE direction from extreme.
         self._anchor: float | None = None
+        self._anchor_bar: BarEvent | None = None
         self._extreme: float | None = None
         self._extreme_bar: BarEvent | None = None
         self._extreme_cum_volume: float = 0.0
         self._retrace_dead = False
         self._fired_extreme: float | None = None
+        self._fired_anchor: float | None = None
 
     # -- direction-specific hooks, overridden by Long/Short below -----------
 
@@ -550,6 +571,16 @@ class _ReversalBase(Setup):
 
     def _more_extreme(self, a: float, b: float) -> float:
         """The more extreme (further from anchor) of two candidates."""
+        raise NotImplementedError
+
+    def _session_anchor(self, indicators: SessionIndicators) -> float:
+        """The running extreme in the direction OPPOSITE to `_session_extreme`
+        -- session_high for REV-L, session_low for REV-S."""
+        raise NotImplementedError
+
+    def _more_extreme_anchor(self, a: float, b: float) -> float:
+        """The more extreme of two anchor candidates -- the opposite
+        comparator from `_more_extreme`."""
         raise NotImplementedError
 
     def _retrace_from(self, close: float, extreme: float) -> float:
@@ -570,27 +601,41 @@ class _ReversalBase(Setup):
         if indicators is None or indicators.session_open is None:
             return None
 
-        if self._anchor is None:
-            self._anchor = indicators.session_open
-
         session_extreme = self._session_extreme(indicators)
-        if self._extreme is None or self._more_extreme(
+        session_anchor = self._session_anchor(indicators)
+
+        extreme_moved = self._extreme is None or self._more_extreme(
             session_extreme, self._extreme
-        ) != self._extreme:
-            # A new, deeper extreme just formed (or this is the first bar) --
-            # the leg resets clean, and there is nothing to check this bar.
+        ) != self._extreme
+        anchor_moved = self._anchor is None or self._more_extreme_anchor(
+            session_anchor, self._anchor
+        ) != self._anchor
+
+        if extreme_moved:
             self._extreme = session_extreme
             self._extreme_bar = bar
             self._extreme_cum_volume = indicators.cum_volume
+        if anchor_moved:
+            self._anchor = session_anchor
+            self._anchor_bar = bar
+
+        if extreme_moved or anchor_moved:
+            # Either boundary just moved (or this is the first bar) -- the
+            # leg's shape changed, so it resets clean; nothing to check yet.
             self._retrace_dead = False
-            _trace(
-                trace, bar,
-                f"new extreme {self._extreme:.2f} "
-                f"(leg vs anchor {self._anchor:.2f} = {abs(self._anchor - self._extreme):.2f})",
-            )
+            leg_size_now = abs(self._anchor - self._extreme)
+            if extreme_moved and anchor_moved:
+                what = f"new extreme {self._extreme:.2f} and new anchor {self._anchor:.2f}"
+            elif extreme_moved:
+                what = f"new extreme {self._extreme:.2f} (anchor {self._anchor:.2f})"
+            else:
+                what = f"anchor moved to {self._anchor:.2f} (extreme {self._extreme:.2f})"
+            _trace(trace, bar, f"{what} -- leg={leg_size_now:.2f}")
             return None
 
-        if self._retrace_dead or self._extreme == self._fired_extreme:
+        if self._retrace_dead or (
+            self._extreme == self._fired_extreme and self._anchor == self._fired_anchor
+        ):
             return None
 
         leg_size = abs(self._anchor - self._extreme)
@@ -646,10 +691,16 @@ class _ReversalBase(Setup):
             )
             return None  # not enough volume behind the move
 
+        assert self._anchor_bar is not None
+        leg_duration_minutes = abs(
+            (self._extreme_bar.start - self._anchor_bar.start).total_seconds()
+        ) / 60.0
+
         _trace(
             trace, bar,
             f"FIRE @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
-            f"{elapsed_minutes:.0f}m leg {leg_size:.2f} move_rvol {move_rvol}",
+            f"{elapsed_minutes:.0f}m leg {leg_size:.2f} (built over {leg_duration_minutes:.0f}m) "
+            f"move_rvol {move_rvol}",
         )
 
         avwap = indicators.avwap
@@ -675,10 +726,12 @@ class _ReversalBase(Setup):
             level_value=self._extreme,
             extras={
                 "anchor": self._anchor,
+                "anchor_start": self._anchor_bar.start.isoformat(),
                 "leg_extreme": self._extreme,
                 "leg_extreme_start": self._extreme_bar.start.isoformat(),
                 "leg_size_adr": round(leg_size / adr, 4) if adr > 0 else None,
                 "leg_size_pct": _pct_of_level(leg_size, self._anchor),
+                "leg_duration_minutes": round(leg_duration_minutes, 1),
                 "retrace_pct": round(retrace_pct, 4),
                 "retrace_minutes": round(elapsed_minutes, 1),
                 "move_rvol": move_rvol,
@@ -700,6 +753,7 @@ class _ReversalBase(Setup):
             },
         )
         self._fired_extreme = self._extreme
+        self._fired_anchor = self._anchor
         return trigger
 
 
@@ -716,6 +770,13 @@ class ReversalLong(_ReversalBase):
 
     def _more_extreme(self, a: float, b: float) -> float:
         return min(a, b)
+
+    def _session_anchor(self, indicators: SessionIndicators) -> float:
+        assert indicators.session_high is not None
+        return indicators.session_high
+
+    def _more_extreme_anchor(self, a: float, b: float) -> float:
+        return max(a, b)
 
     def _retrace_from(self, close: float, extreme: float) -> float:
         return close - extreme
@@ -735,6 +796,13 @@ class ReversalShort(_ReversalBase):
 
     def _more_extreme(self, a: float, b: float) -> float:
         return max(a, b)
+
+    def _session_anchor(self, indicators: SessionIndicators) -> float:
+        assert indicators.session_low is not None
+        return indicators.session_low
+
+    def _more_extreme_anchor(self, a: float, b: float) -> float:
+        return min(a, b)
 
     def _retrace_from(self, close: float, extreme: float) -> float:
         return extreme - close

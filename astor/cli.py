@@ -351,9 +351,11 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     if fired:
         print(f"\n{len(fired)} trigger(s) fired:")
         for t in fired:
+            leg_duration = t.extras.get("leg_duration_minutes")
+            duration_s = f", leg built over {leg_duration:.0f}m" if leg_duration is not None else ""
             print(
                 f"  {t.bar_start:%H:%M:%S}  {t.symbol} {t.setup} {t.direction} "
-                f"@ {t.trigger_price:.2f}"
+                f"@ {t.trigger_price:.2f}{duration_s}"
             )
     else:
         print("\nNo trigger fired.")

@@ -107,13 +107,18 @@ SELECT
     json_extract(t.extras_json, '$.session_stop_dollars')     AS session_stop_dollars,
     -- Reversal (REV-L/REV-S) only: the leg it fired on. anchor/leg_extreme
     -- are dollars, leg_size_adr/leg_size_pct describe the same leg in ADR
-    -- and percent-of-anchor terms, and retrace_pct/retrace_minutes/move_rvol
-    -- are the three filters that actually gated the fire (25-50% retracement,
-    -- >=6 minutes since the extreme, RVOL frozen at the extreme bar).
+    -- and percent-of-anchor terms, leg_duration_minutes is how long the push
+    -- itself took to build (anchor bar to extreme bar -- a slow multi-hour
+    -- drift is a much weaker "sharp move" than a fast one of the same size,
+    -- not yet filtered on but recorded for future tuning), and
+    -- retrace_pct/retrace_minutes/move_rvol are the three filters that
+    -- actually gated the fire (25-50% retracement, >=6 minutes since the
+    -- extreme, RVOL frozen at the extreme bar).
     json_extract(t.extras_json, '$.anchor')                   AS anchor,
     json_extract(t.extras_json, '$.leg_extreme')               AS leg_extreme,
     json_extract(t.extras_json, '$.leg_size_adr')              AS leg_size_adr,
     json_extract(t.extras_json, '$.leg_size_pct')              AS leg_size_pct,
+    json_extract(t.extras_json, '$.leg_duration_minutes')      AS leg_duration_minutes,
     json_extract(t.extras_json, '$.retrace_pct')               AS retrace_pct,
     json_extract(t.extras_json, '$.retrace_minutes')           AS retrace_minutes,
     json_extract(t.extras_json, '$.move_rvol')                 AS move_rvol,
