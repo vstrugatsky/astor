@@ -59,6 +59,26 @@ BACKFILL_TIMEOUT = 15.0
 # review sees exactly what it would have otherwise.
 SUSPENDED_NOTIFY_SETUPS = {"U&R", "O&F"}
 
+# Reversal notifications bypass auto_grade entirely (2026-09-02, "for now"
+# -- not a permanent call) and use a flat time cutoff instead. grade_trigger
+# (astor.core.grading) was tuned around U&R/O&F and doesn't fit Reversal yet:
+# it rewards the 9:45-11:00 window, which silenced every real Reversal alert
+# after 11:00; it rewards RVOL, which every Reversal trigger already clears
+# by construction (RVOL is one of Reversal's own firing filters), so the
+# reward is meaningless there; and it rewards price beyond session_open,
+# which isn't a meaningful signal for a retracement setup. Revisit once
+# grading is redesigned per-setup rather than shared across all of them.
+REVERSAL_NOTIFY_SETUPS = {"REV-L", "REV-S"}
+REVERSAL_NOTIFY_CUTOFF = time(15, 0)
+
+
+def _should_notify(trigger: Trigger) -> bool:
+    if trigger.setup in SUSPENDED_NOTIFY_SETUPS:
+        return False
+    if trigger.setup in REVERSAL_NOTIFY_SETUPS:
+        return trigger.bar_start.time() < REVERSAL_NOTIFY_CUTOFF
+    return (trigger.extras.get("auto_grade") or 0) >= NOTIFY_GRADE_THRESHOLD
+
 
 def _format_trigger_line(t: Trigger) -> str:
     """Everything Notify shows for a fired trigger: the headline, then the
@@ -470,10 +490,7 @@ class LiveDriver:
                     # Every trigger is still stored regardless of grade or
                     # setup -- only the terminal alert is gated, so a look
                     # back at the full session never has gaps to explain.
-                    if (
-                        trigger.setup not in SUSPENDED_NOTIFY_SETUPS
-                        and (trigger.extras.get("auto_grade") or 0) >= NOTIFY_GRADE_THRESHOLD
-                    ):
+                    if _should_notify(trigger):
                         _print_trigger_alert(trigger)
 
                 track_alert = self.tracker.on_close(symbol, bar_event.close, bar_event.start)

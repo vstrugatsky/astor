@@ -934,6 +934,54 @@ def test_format_trigger_line() -> None:
     check("session position size shown", "196 sh ($470)" in line, True)
 
 
+def test_should_notify() -> None:
+    from astor.core.types import Trigger
+    from astor.drivers.live import _should_notify
+
+    def trigger_at(setup: str, hh: int, mm: int, grade: int | None) -> Trigger:
+        start = datetime(2026, 8, 14, hh, mm, tzinfo=ET)
+        return Trigger(
+            symbol="TEST", setup=setup, direction="long", trigger_price=1.0,
+            bar_start=start, bar_end=start + timedelta(minutes=1),
+            level_name="EXT", level_value=1.0,
+            extras={} if grade is None else {"auto_grade": grade},
+        )
+
+    # U&R/O&F: suppressed regardless of grade -- suspended while validating
+    # Reversal live.
+    check("U&R never notifies, even grade 4", _should_notify(trigger_at("U&R", 10, 0, 4)), False)
+    check("O&F never notifies, even grade 4", _should_notify(trigger_at("O&F", 10, 0, 4)), False)
+
+    # REV-L/REV-S: notify regardless of grade, cut off at 15:00 ET.
+    check(
+        "REV-L notifies with no grade at all, before the cutoff",
+        _should_notify(trigger_at("REV-L", 11, 30, None)),
+        True,
+    )
+    check(
+        "REV-S notifies with grade 1, before the cutoff",
+        _should_notify(trigger_at("REV-S", 14, 59, 1)),
+        True,
+    )
+    check(
+        "REV-L does not notify at/after the 15:00 cutoff, even grade 4",
+        _should_notify(trigger_at("REV-L", 15, 0, 4)),
+        False,
+    )
+
+    # Anything else (a future setup) falls back to the grade threshold.
+    check(
+        "unrecognized setup falls back to grade >= threshold (3 passes)",
+        _should_notify(trigger_at("FAKE", 12, 0, 3)),
+        True,
+    )
+    check(
+        "unrecognized setup falls back to grade >= threshold (2 fails)",
+        _should_notify(trigger_at("FAKE", 12, 0, 2)),
+        False,
+    )
+
+
 def test_setup_on_bar_defaults_indicators_and_curve_to_none() -> None:
     """Direct on_bar calls (as every other test in this file makes) must keep
     working without indicators/curve -- Scanner is the only caller expected
