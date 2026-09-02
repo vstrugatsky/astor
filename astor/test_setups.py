@@ -543,16 +543,20 @@ def test_compute_rvol() -> None:
         "TEST", sessions=5, cum_volume_by_minute={time(9, 30): 1000.0, time(9, 31): 2500.0}
     )
     b0 = bar(0, 100, 101, 99, 100)  # start 09:30
-    check("double the average rounds to 2.00", compute_rvol(2000.0, b0, curve), 2.00)
+    check("double the average rounds to 2.00", compute_rvol(2000.0, b0.start, curve), 2.00)
 
     b1 = bar(1, 100, 101, 99, 100)  # start 09:31
-    check("half the average rounds to 0.50", compute_rvol(1250.0, b1, curve), 0.50)
+    check("half the average rounds to 0.50", compute_rvol(1250.0, b1.start, curve), 0.50)
 
     b2 = bar(2, 100, 101, 99, 100)  # start 09:32, not in the curve
-    check("no curve coverage for this minute -> None", compute_rvol(500.0, b2, curve), None)
+    check("no curve coverage for this minute -> None", compute_rvol(500.0, b2.start, curve), None)
 
     zero_curve = VolumeCurve("TEST", sessions=0, cum_volume_by_minute={time(9, 30): 0.0})
-    check("zero average -> None, not a division error", compute_rvol(500.0, b0, zero_curve), None)
+    check(
+        "zero average -> None, not a division error",
+        compute_rvol(500.0, b0.start, zero_curve),
+        None,
+    )
 
 
 def test_build_cum_volume_curve() -> None:
@@ -1467,12 +1471,10 @@ def test_reversal_anchor_ignores_prev_close() -> None:
         )
 
 
-def test_reversal_short_anchor_shifts_to_pre_leg_low() -> None:
-    # The CDNA case that motivated this: price dips right after the open,
-    # *before* the real up-leg (the one REV-S actually tracks) begins. The
-    # anchor must be that pre-leg low (96.0), not session_open (100.0).
-    scanner = _rev_scanner(ReversalShort)
-    bars = [
+def _cdna_style_bars() -> list[BarEvent]:
+    """REV-S leg: pre-leg low at bar 2 (9:32), peak at bar 6 (9:36), fires
+    at bar 12 on a 32% retrace of the 96.0-106.0 leg."""
+    return [
         bar(0, 100.0, 100.0, 99.0, 99.5, 1000, symbol="REV"),  # session open 100.0
         bar(1, 99.5, 99.5, 97.0, 97.5, 1000, symbol="REV"),  # anchor moves to 97.0
         bar(2, 97.5, 97.5, 96.0, 96.3, 1000, symbol="REV"),  # anchor moves to 96.0 -- pre-leg low
@@ -1487,12 +1489,60 @@ def test_reversal_short_anchor_shifts_to_pre_leg_low() -> None:
         bar(11, 103.3, 103.8, 102.5, 103.0, 1000, symbol="REV"),  # retrace 30%, elapsed 5
         bar(12, 103.0, 103.5, 102.2, 102.8, 1000, symbol="REV"),  # retrace 32%, elapsed 6 -- fires
     ]
-    triggers = _feed(scanner, bars)
+
+
+def test_reversal_short_anchor_shifts_to_pre_leg_low() -> None:
+    # The CDNA case that motivated this: price dips right after the open,
+    # *before* the real up-leg (the one REV-S actually tracks) begins. The
+    # anchor must be that pre-leg low (96.0), not session_open (100.0).
+    scanner = _rev_scanner(ReversalShort)
+    triggers = _feed(scanner, _cdna_style_bars())
     check("exactly one trigger", len(triggers), 1)
     t = triggers[0]
     check("level_value is the leg extreme (session high)", t.level_value, 106.0)
     check("anchor is the pre-leg low, not session_open", t.extras["anchor"], 96.0)
     check("retrace_pct off the pre-leg-low leg (10.0 wide)", round(t.extras["retrace_pct"], 1), 32.0)
+    check("leg_duration_minutes (bar 2 to bar 6)", t.extras["leg_duration_minutes"], 4.0)
+
+
+def test_reversal_leg_timing_correct_for_symbol_added_mid_session() -> None:
+    # The real bug this fixes: a symbol added to Live mid-session gets a
+    # Setup that starts clean (Scanner.backfill_bar never calls setup.on_bar
+    # -- by design, so it doesn't re-detect a trigger from before it was
+    # tracked). Before this fix, the Setup would stamp whichever boundary
+    # had already stabilized *before* the symbol joined with the join time
+    # instead of its true historical moment, corrupting leg_duration_minutes
+    # (and, in the mirror case, retrace_minutes/move_rvol too). Splitting
+    # the exact same bars as the test above into "backfilled" (0-2, before
+    # the symbol supposedly joined) and "live" (3-12, after) must produce
+    # an identical trigger to the fully-live version.
+    bars = _cdna_style_bars()
+
+    baseline_scanner = _rev_scanner(ReversalShort)
+    baseline = _feed(baseline_scanner, bars)[0]
+
+    scanner = _rev_scanner(ReversalShort)
+    for b in bars[:3]:  # backfilled -- establishes the pre-leg low, bars 0-2
+        scanner.backfill_bar(b)
+    triggers = []
+    for b in bars[3:]:  # "joined" here -- setup.on_bar only sees these
+        triggers.extend(scanner.on_bar(b))
+
+    check("exactly one trigger", len(triggers), 1)
+    t = triggers[0]
+    check("anchor matches the fully-live run", t.extras["anchor"], baseline.extras["anchor"])
+    check(
+        "leg_duration_minutes matches the fully-live run (not truncated to the join time)",
+        t.extras["leg_duration_minutes"],
+        baseline.extras["leg_duration_minutes"],
+    )
+    check(
+        "anchor_start matches the fully-live run",
+        t.extras["anchor_start"],
+        baseline.extras["anchor_start"],
+    )
+    check("retrace_pct matches the fully-live run", t.extras["retrace_pct"], baseline.extras["retrace_pct"])
+    check("move_rvol matches the fully-live run", t.extras["move_rvol"], baseline.extras["move_rvol"])
     # anchor last set at bar 2 (9:32), extreme (106.0) last set at bar 6 (9:36).
     check("leg_duration_minutes", t.extras["leg_duration_minutes"], 4.0)
 

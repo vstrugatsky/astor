@@ -70,6 +70,7 @@ future work, not yet implemented here.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import ClassVar
 
 from astor.core.grading import rvol_threshold
@@ -294,7 +295,7 @@ class UndercutRally(Setup):
                 "combined_pct": combined_pct,
                 "avwap": avwap,
                 "avwap_pct": avwap_pct,
-                "rvol": compute_rvol(indicators.cum_volume, bar, curve)
+                "rvol": compute_rvol(indicators.cum_volume, bar.start, curve)
                 if indicators and curve
                 else None,
                 "max_loss_dollars": self.max_loss_dollars,
@@ -454,7 +455,7 @@ class OvershootFail(Setup):
                 "combined_pct": combined_pct,
                 "avwap": avwap,
                 "avwap_pct": avwap_pct,
-                "rvol": compute_rvol(indicators.cum_volume, bar, curve)
+                "rvol": compute_rvol(indicators.cum_volume, bar.start, curve)
                 if indicators and curve
                 else None,
                 "max_loss_dollars": self.max_loss_dollars,
@@ -501,14 +502,23 @@ class _ReversalBase(Setup):
     Whenever *either* boundary moves, the leg resets completely: a fresh
     clock, and (per the trader's call) any prior retracement progress is
     void -- the leg's shape just changed, so a partial bounce measured
-    against the old shape means nothing anymore. The RVOL freeze point
-    (`_extreme_bar`) only follows `extreme`, though, not `anchor` -- that's
-    still specifically "the moment the push ended and the retracement
-    began," regardless of where the anchor sits. `_anchor_bar` follows
-    `anchor` the same way, purely to compute `leg_duration_minutes` at fire
-    time -- how long the whole push (anchor to extreme) actually took, a
-    slow multi-hour drift being a much weaker "sharp move" than a fast one
-    even if the price distance is the same.
+    against the old shape means nothing anymore.
+
+    Timing (when extreme/anchor were set, and the cumulative volume at that
+    moment) is read fresh from SessionIndicators at fire time -- via
+    `_extreme_at`/`_extreme_cum_volume_at`/`_anchor_at` -- rather than
+    tracked locally against `bar`. A Setup added to Live mid-session starts
+    with no local history (by design -- it must not re-detect a trigger
+    from before it was tracked), so a local "the current bar is when this
+    extreme was set" would be wrong for whichever boundary had already
+    stabilized before the symbol joined; SessionIndicators stays continuous
+    through backfill regardless, so it always has the true timestamp. The
+    RVOL freeze point only follows `extreme`, not `anchor` -- that's still
+    specifically "the moment the push ended and the retracement began,"
+    regardless of where the anchor sits. `leg_duration_minutes` (anchor's
+    true timestamp to extreme's) is computed the same way, at fire time --
+    how long the whole push actually took, a slow multi-hour drift being a
+    much weaker "sharp move" than a fast one even at the same price size.
 
     The overnight gap and `prev_close` play no part here, by the trader's
     own call -- a gap-inclusive version of this idea is a distinct setup
@@ -554,12 +564,10 @@ class _ReversalBase(Setup):
         self.min_confirm_minutes = min_confirm_minutes
         self.max_loss_dollars = max_loss_dollars
         # Both running values -- see the class docstring. anchor is the
-        # running extreme in the OPPOSITE direction from extreme.
+        # running extreme in the OPPOSITE direction from extreme. Only the
+        # values live here; timing is read fresh from SessionIndicators.
         self._anchor: float | None = None
-        self._anchor_bar: BarEvent | None = None
         self._extreme: float | None = None
-        self._extreme_bar: BarEvent | None = None
-        self._extreme_cum_volume: float = 0.0
         self._retrace_dead = False
         self._fired_extreme: float | None = None
         self._fired_anchor: float | None = None
@@ -573,6 +581,15 @@ class _ReversalBase(Setup):
         """The more extreme (further from anchor) of two candidates."""
         raise NotImplementedError
 
+    def _extreme_at(self, indicators: SessionIndicators) -> datetime:
+        """When the current `_session_extreme` value was set -- session_low_at
+        for REV-L, session_high_at for REV-S."""
+        raise NotImplementedError
+
+    def _extreme_cum_volume_at(self, indicators: SessionIndicators) -> float:
+        """Cumulative volume as of `_extreme_at`."""
+        raise NotImplementedError
+
     def _session_anchor(self, indicators: SessionIndicators) -> float:
         """The running extreme in the direction OPPOSITE to `_session_extreme`
         -- session_high for REV-L, session_low for REV-S."""
@@ -581,6 +598,11 @@ class _ReversalBase(Setup):
     def _more_extreme_anchor(self, a: float, b: float) -> float:
         """The more extreme of two anchor candidates -- the opposite
         comparator from `_more_extreme`."""
+        raise NotImplementedError
+
+    def _anchor_at(self, indicators: SessionIndicators) -> datetime:
+        """When the current `_session_anchor` value was set -- the opposite
+        of `_extreme_at`."""
         raise NotImplementedError
 
     def _retrace_from(self, close: float, extreme: float) -> float:
@@ -613,11 +635,8 @@ class _ReversalBase(Setup):
 
         if extreme_moved:
             self._extreme = session_extreme
-            self._extreme_bar = bar
-            self._extreme_cum_volume = indicators.cum_volume
         if anchor_moved:
             self._anchor = session_anchor
-            self._anchor_bar = bar
 
         if extreme_moved or anchor_moved:
             # Either boundary just moved (or this is the first bar) -- the
@@ -656,8 +675,8 @@ class _ReversalBase(Setup):
         if retrace_pct < self.min_retrace_pct:
             return None
 
-        assert self._extreme_bar is not None
-        elapsed_minutes = (bar.start - self._extreme_bar.start).total_seconds() / 60.0
+        extreme_at = self._extreme_at(indicators)
+        elapsed_minutes = (bar.start - extreme_at).total_seconds() / 60.0
         if elapsed_minutes < self.min_confirm_minutes:
             _trace(
                 trace, bar,
@@ -678,7 +697,7 @@ class _ReversalBase(Setup):
             return None  # too small a move to be "sharp"
 
         move_rvol = (
-            compute_rvol(self._extreme_cum_volume, self._extreme_bar, curve)
+            compute_rvol(self._extreme_cum_volume_at(indicators), extreme_at, curve)
             if curve
             else None
         )
@@ -691,10 +710,8 @@ class _ReversalBase(Setup):
             )
             return None  # not enough volume behind the move
 
-        assert self._anchor_bar is not None
-        leg_duration_minutes = abs(
-            (self._extreme_bar.start - self._anchor_bar.start).total_seconds()
-        ) / 60.0
+        anchor_at = self._anchor_at(indicators)
+        leg_duration_minutes = abs((extreme_at - anchor_at).total_seconds()) / 60.0
 
         _trace(
             trace, bar,
@@ -710,7 +727,7 @@ class _ReversalBase(Setup):
             bar.close, self._extreme, self.max_loss_dollars
         )
         rvol = (
-            compute_rvol(indicators.cum_volume, bar, curve)
+            compute_rvol(indicators.cum_volume, bar.start, curve)
             if curve
             else None
         )
@@ -726,9 +743,9 @@ class _ReversalBase(Setup):
             level_value=self._extreme,
             extras={
                 "anchor": self._anchor,
-                "anchor_start": self._anchor_bar.start.isoformat(),
+                "anchor_start": anchor_at.isoformat(),
                 "leg_extreme": self._extreme,
-                "leg_extreme_start": self._extreme_bar.start.isoformat(),
+                "leg_extreme_start": extreme_at.isoformat(),
                 "leg_size_adr": round(leg_size / adr, 4) if adr > 0 else None,
                 "leg_size_pct": _pct_of_level(leg_size, self._anchor),
                 "leg_duration_minutes": round(leg_duration_minutes, 1),
@@ -771,12 +788,24 @@ class ReversalLong(_ReversalBase):
     def _more_extreme(self, a: float, b: float) -> float:
         return min(a, b)
 
+    def _extreme_at(self, indicators: SessionIndicators) -> datetime:
+        assert indicators.session_low_at is not None
+        return indicators.session_low_at
+
+    def _extreme_cum_volume_at(self, indicators: SessionIndicators) -> float:
+        assert indicators.cum_volume_at_low is not None
+        return indicators.cum_volume_at_low
+
     def _session_anchor(self, indicators: SessionIndicators) -> float:
         assert indicators.session_high is not None
         return indicators.session_high
 
     def _more_extreme_anchor(self, a: float, b: float) -> float:
         return max(a, b)
+
+    def _anchor_at(self, indicators: SessionIndicators) -> datetime:
+        assert indicators.session_high_at is not None
+        return indicators.session_high_at
 
     def _retrace_from(self, close: float, extreme: float) -> float:
         return close - extreme
@@ -797,12 +826,24 @@ class ReversalShort(_ReversalBase):
     def _more_extreme(self, a: float, b: float) -> float:
         return max(a, b)
 
+    def _extreme_at(self, indicators: SessionIndicators) -> datetime:
+        assert indicators.session_high_at is not None
+        return indicators.session_high_at
+
+    def _extreme_cum_volume_at(self, indicators: SessionIndicators) -> float:
+        assert indicators.cum_volume_at_high is not None
+        return indicators.cum_volume_at_high
+
     def _session_anchor(self, indicators: SessionIndicators) -> float:
         assert indicators.session_low is not None
         return indicators.session_low
 
     def _more_extreme_anchor(self, a: float, b: float) -> float:
         return min(a, b)
+
+    def _anchor_at(self, indicators: SessionIndicators) -> datetime:
+        assert indicators.session_low_at is not None
+        return indicators.session_low_at
 
     def _retrace_from(self, close: float, extreme: float) -> float:
         return extreme - close
