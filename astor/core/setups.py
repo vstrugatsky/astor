@@ -269,10 +269,19 @@ class _ReversalBase(Setup):
         REV-L, ema9_at_high for REV-S."""
         raise NotImplementedError
 
-    def _ema9_extension(self, extreme: float, ema9_at_extreme: float) -> float:
-        """How far the leg's extreme finished from the frozen 9EMA, in the
-        capitulation direction -- positive means further extended (below
-        the EMA for REV-L, above it for REV-S)."""
+    def _extreme_close_at(self, indicators: SessionIndicators) -> float | None:
+        """The bar's own close, frozen at `_extreme_at` -- close_at_low for
+        REV-L, close_at_high for REV-S. Used (not the high/low wick the
+        extreme itself is) to measure 9EMA extension, since the EMA line is
+        itself never computed from a wick either -- comparing it to one
+        would mix conventions."""
+        raise NotImplementedError
+
+    def _ema9_extension(self, extreme_close: float, ema9_at_extreme: float) -> float:
+        """How far the leg's extreme finished (by its own close, not its
+        high/low wick) from the frozen 9EMA, in the capitulation direction
+        -- positive means further extended (below the EMA for REV-L, above
+        it for REV-S)."""
         raise NotImplementedError
 
     def _ema9_reclaimed_now(self, close: float, ema9_now: float) -> bool:
@@ -332,39 +341,47 @@ class _ReversalBase(Setup):
         ) != self._anchor
         # Captured before self._extreme/self._anchor are updated below: was
         # the leg, as it stood coming into this bar, already dead (retraced
-        # past max_retrace_pct) or already fired-and-waiting-for-a-new-leg?
-        # A deeper extreme arriving right after either of those is a fresh
-        # push starting from scratch, not a continuation of the old one --
-        # _leg_bars needs to reset there too, not just on a new anchor. Real
-        # case that motivated this: a leg dies past the retrace ceiling,
-        # price consolidates for half an hour with the anchor untouched,
-        # then a genuinely new, much faster push sets a deeper extreme --
-        # without this, that new push's accel_price/accel_vol got compared
-        # against one stale leftover bar from the earlier, unrelated, dead
-        # push instead of its own bars. Deliberately NOT gated on
-        # push_active (below) -- accel_price/accel_vol are meant to cover
-        # the same anchor-to-extreme span leg_duration_minutes reports, not
-        # a narrower window. Real case that showed this: SEDG 2026-09-10's
-        # REV-S leg spent 09:37-10:55 (78 bars) with its anchor (session
-        # low) still setting fresh lows of its own while its extreme
-        # (session high) sat on a stale level from before that whole
-        # down-then-up move even started -- by the trader's own read, that
-        # stale high is REV-L's territory (the leg down), not relevant to
-        # scoping REV-S's leg up, so those bars still belong in this leg's
-        # accel sample even though push_active (below) is false for all of
-        # them.
-        rearming = self._retrace_dead or (
-            self._extreme == self._fired_extreme and self._anchor == self._fired_anchor
-        )
+        # past max_retrace_pct)? A deeper extreme arriving right after that
+        # is a fresh push starting from scratch, not a continuation of the
+        # old one -- _leg_bars needs to reset there too, not just on a new
+        # anchor. Real case that motivated this: a leg dies past the
+        # retrace ceiling, price consolidates for half an hour with the
+        # anchor untouched, then a genuinely new, much faster push sets a
+        # deeper extreme -- without this, that new push's accel_price/
+        # accel_vol got compared against one stale leftover bar from the
+        # earlier, unrelated, dead push instead of its own bars.
+        #
+        # Deliberately NOT reset just because the leg already fired once:
+        # a leg that fires, then keeps extending to a deeper extreme
+        # without ever dying, is -- by the trader's own call -- still the
+        # same continuing move (worth a second alert on, per the re-fire
+        # behavior below), not a new attempt. Real case: FSLY 2026-09-09's
+        # REV-S fired at 09:59, kept climbing, and fired again at 10:06 on
+        # the same anchor -- accel_price/accel_vol for the second fire
+        # should cover the whole 09:36-10:05 push, not just the few bars
+        # since the first fire.
+        #
+        # Also deliberately NOT gated on push_active (below) --
+        # accel_price/accel_vol are meant to cover the same anchor-to-
+        # extreme span leg_duration_minutes reports, not a narrower window.
+        # Real case that showed this: SEDG 2026-09-10's REV-S leg spent
+        # 09:37-10:55 (78 bars) with its anchor (session low) still setting
+        # fresh lows of its own while its extreme (session high) sat on a
+        # stale level from before that whole down-then-up move even
+        # started -- by the trader's own read, that stale high is REV-L's
+        # territory (the leg down), not relevant to scoping REV-S's leg up,
+        # so those bars still belong in this leg's accel sample even though
+        # push_active (below) is false for all of them.
+        leg_was_dead = self._retrace_dead
 
         if extreme_moved:
             self._extreme = session_extreme
         if anchor_moved:
             self._anchor = session_anchor
 
-        if anchor_moved or (extreme_moved and rearming):
+        if anchor_moved or (extreme_moved and leg_was_dead):
             self._leg_bars = [bar]
-        elif not rearming:
+        elif not leg_was_dead:
             # Append every bar of a currently-alive leg, not just the ones
             # that individually set a fresh extreme -- a real push often
             # pauses for a few bars between new highs/lows without dying
@@ -376,8 +393,7 @@ class _ReversalBase(Setup):
             # so "recent" and "earlier" ended up drawn from a handful of
             # cherry-picked bars rather than the leg's real pace.
             self._leg_bars.append(bar)
-        # else: the leg is dead or already-fired-and-unchanged -- inert,
-        # nothing worth adding.
+        # else: the leg is dead -- inert, nothing worth adding.
 
         extreme_at = self._extreme_at(indicators)
         anchor_at = self._anchor_at(indicators)
@@ -496,9 +512,10 @@ class _ReversalBase(Setup):
             return None  # not enough volume behind the move
 
         ema9_at_extreme = self._extreme_ema9_at(indicators)
+        extreme_close = self._extreme_close_at(indicators)
         ema9_extension_adr = (
-            round(self._ema9_extension(self._extreme, ema9_at_extreme) / adr, 4)
-            if ema9_at_extreme is not None
+            round(self._ema9_extension(extreme_close, ema9_at_extreme) / adr, 4)
+            if ema9_at_extreme is not None and extreme_close is not None
             else None
         )
         if self.min_ema9_extension_adr > 0 and (
@@ -583,6 +600,7 @@ class _ReversalBase(Setup):
                 "retrace_via": "ema9_reclaim" if reclaimed and retrace_pct < self.min_retrace_pct else "pct",
                 "move_rvol": move_rvol,
                 "ema9_at_extreme": ema9_at_extreme,
+                "extreme_close": extreme_close,
                 "ema9_extension_adr": ema9_extension_adr,
                 "accel_price": accel_price,
                 "accel_vol": accel_vol,
@@ -648,9 +666,10 @@ class _ReversalBase(Setup):
             return
 
         ema9_at_extreme = self._extreme_ema9_at(indicators)
+        extreme_close = self._extreme_close_at(indicators)
         ema9_extension_adr = (
-            self._ema9_extension(self._extreme, ema9_at_extreme) / adr
-            if ema9_at_extreme is not None
+            self._ema9_extension(extreme_close, ema9_at_extreme) / adr
+            if ema9_at_extreme is not None and extreme_close is not None
             else None
         )
         if self.min_ema9_extension_adr > 0 and (
@@ -706,8 +725,11 @@ class ReversalLong(_ReversalBase):
     def _extreme_ema9_at(self, indicators: SessionIndicators) -> float | None:
         return indicators.ema9_at_low
 
-    def _ema9_extension(self, extreme: float, ema9_at_extreme: float) -> float:
-        return ema9_at_extreme - extreme
+    def _extreme_close_at(self, indicators: SessionIndicators) -> float | None:
+        return indicators.close_at_low
+
+    def _ema9_extension(self, extreme_close: float, ema9_at_extreme: float) -> float:
+        return ema9_at_extreme - extreme_close
 
     def _ema9_reclaimed_now(self, close: float, ema9_now: float) -> bool:
         return close > ema9_now
@@ -757,8 +779,11 @@ class ReversalShort(_ReversalBase):
     def _extreme_ema9_at(self, indicators: SessionIndicators) -> float | None:
         return indicators.ema9_at_high
 
-    def _ema9_extension(self, extreme: float, ema9_at_extreme: float) -> float:
-        return extreme - ema9_at_extreme
+    def _extreme_close_at(self, indicators: SessionIndicators) -> float | None:
+        return indicators.close_at_high
+
+    def _ema9_extension(self, extreme_close: float, ema9_at_extreme: float) -> float:
+        return extreme_close - ema9_at_extreme
 
     def _ema9_reclaimed_now(self, close: float, ema9_now: float) -> bool:
         return close < ema9_now

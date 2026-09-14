@@ -62,6 +62,12 @@ class SessionIndicators:
     ema9: float | None = None
     ema9_at_high: float | None = None
     ema9_at_low: float | None = None
+    # The bar's own close, frozen at the same moment as ema9_at_high/low --
+    # by the trader's own call, 9EMA extension is measured close-to-close
+    # (how far the leg actually settled from its own trend), not against the
+    # high/low wick, which the EMA itself was never computed from either.
+    close_at_high: float | None = None
+    close_at_low: float | None = None
 
     _EMA9_ALPHA = 2.0 / (9 + 1)
 
@@ -82,11 +88,13 @@ class SessionIndicators:
             self.session_high_at = bar.start
             self.cum_volume_at_high = self.cum_volume
             self.ema9_at_high = self.ema9
+            self.close_at_high = bar.close
         if self.session_low is None or bar.low < self.session_low:
             self.session_low = bar.low
             self.session_low_at = bar.start
             self.cum_volume_at_low = self.cum_volume
             self.ema9_at_low = self.ema9
+            self.close_at_low = bar.close
 
     @property
     def avwap(self) -> float | None:
