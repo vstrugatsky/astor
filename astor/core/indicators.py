@@ -62,12 +62,22 @@ class SessionIndicators:
     ema9: float | None = None
     ema9_at_high: float | None = None
     ema9_at_low: float | None = None
-    # The bar's own close, frozen at the same moment as ema9_at_high/low --
-    # by the trader's own call, 9EMA extension is measured close-to-close
-    # (how far the leg actually settled from its own trend), not against the
-    # high/low wick, which the EMA itself was never computed from either.
-    close_at_high: float | None = None
-    close_at_low: float | None = None
+    # The close that best represents how far the push behind the current
+    # session_high/session_low actually got, measured close-to-close (same
+    # convention the EMA line itself uses) rather than off the wick. If the
+    # bar that set the extreme is itself still going the leg's own direction
+    # (close > open for a push up to session_high, close < open for a push
+    # down to session_low), its own close is the most extended point the
+    # push actually settled at, and gets used directly. If that bar instead
+    # closed back the *other* way -- it already reversed within itself,
+    # real case: FSLY 2026-09-09 10:05, high 24.59 but close 24.25, itself
+    # a down bar -- its own close is measuring the reversal candle, not the
+    # push, so the previous bar's close is used instead (the last close
+    # that was still genuinely part of the push). Bar 1 has no previous bar
+    # to fall back to either way.
+    close_before_high: float | None = None
+    close_before_low: float | None = None
+    _prev_close: float | None = None
 
     _EMA9_ALPHA = 2.0 / (9 + 1)
 
@@ -83,18 +93,20 @@ class SessionIndicators:
             if self.ema9 is None
             else self.ema9 + self._EMA9_ALPHA * (bar.close - self.ema9)
         )
+        prior_close = self._prev_close if self._prev_close is not None else bar.close
         if self.session_high is None or bar.high > self.session_high:
             self.session_high = bar.high
             self.session_high_at = bar.start
             self.cum_volume_at_high = self.cum_volume
             self.ema9_at_high = self.ema9
-            self.close_at_high = bar.close
+            self.close_before_high = bar.close if bar.close > bar.open else prior_close
         if self.session_low is None or bar.low < self.session_low:
             self.session_low = bar.low
             self.session_low_at = bar.start
             self.cum_volume_at_low = self.cum_volume
             self.ema9_at_low = self.ema9
-            self.close_at_low = bar.close
+            self.close_before_low = bar.close if bar.close < bar.open else prior_close
+        self._prev_close = bar.close
 
     @property
     def avwap(self) -> float | None:

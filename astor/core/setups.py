@@ -270,18 +270,23 @@ class _ReversalBase(Setup):
         raise NotImplementedError
 
     def _extreme_close_at(self, indicators: SessionIndicators) -> float | None:
-        """The bar's own close, frozen at `_extreme_at` -- close_at_low for
-        REV-L, close_at_high for REV-S. Used (not the high/low wick the
-        extreme itself is) to measure 9EMA extension, since the EMA line is
-        itself never computed from a wick either -- comparing it to one
-        would mix conventions."""
+        """The close that best represents how far the push actually got --
+        close_before_low for REV-L, close_before_high for REV-S. The
+        extreme bar's own close if that bar was still going the leg's own
+        direction (a genuine continuation), otherwise the bar before it (the
+        extreme bar itself already reversed within itself, so its own close
+        would measure the reversal candle instead of the push). Never the
+        high/low wick the extreme itself is tracked by, since the EMA line
+        is never computed from a wick either -- comparing it to one would
+        mix conventions."""
         raise NotImplementedError
 
     def _ema9_extension(self, extreme_close: float, ema9_at_extreme: float) -> float:
-        """How far the leg's extreme finished (by its own close, not its
-        high/low wick) from the frozen 9EMA, in the capitulation direction
-        -- positive means further extended (below the EMA for REV-L, above
-        it for REV-S)."""
+        """How far the leg's extreme finished (by the representative close
+        described in _extreme_close_at, not its high/low wick) from the
+        frozen 9EMA, in
+        the capitulation direction -- positive means further extended
+        (below the EMA for REV-L, above it for REV-S)."""
         raise NotImplementedError
 
     def _ema9_reclaimed_now(self, close: float, ema9_now: float) -> bool:
@@ -726,7 +731,7 @@ class ReversalLong(_ReversalBase):
         return indicators.ema9_at_low
 
     def _extreme_close_at(self, indicators: SessionIndicators) -> float | None:
-        return indicators.close_at_low
+        return indicators.close_before_low
 
     def _ema9_extension(self, extreme_close: float, ema9_at_extreme: float) -> float:
         return ema9_at_extreme - extreme_close
@@ -780,7 +785,7 @@ class ReversalShort(_ReversalBase):
         return indicators.ema9_at_high
 
     def _extreme_close_at(self, indicators: SessionIndicators) -> float | None:
-        return indicators.close_at_high
+        return indicators.close_before_high
 
     def _ema9_extension(self, extreme_close: float, ema9_at_extreme: float) -> float:
         return extreme_close - ema9_at_extreme
