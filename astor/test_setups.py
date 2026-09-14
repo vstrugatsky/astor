@@ -1196,7 +1196,7 @@ def test_reversal_long_basic() -> None:
     check("leg_duration_minutes -- anchor (bar 0) to extreme (bar 4)", t.extras["leg_duration_minutes"], 4.0)
     check("move_rvol", t.extras["move_rvol"], 250_000.0)
     check("ema9_extension_adr", t.extras["ema9_extension_adr"], 0.6416)
-    check("accel_price recorded (diagnostic only)", t.extras["accel_price"], 1.1667)
+    check("accel_price recorded (diagnostic only)", t.extras["accel_price"], 0.6667)
     check("accel_vol recorded (diagnostic only)", t.extras["accel_vol"], 1.0)
     check("reclaim_pct aliases level_stop_pct", t.extras["reclaim_pct"], t.extras["level_stop_pct"])
 

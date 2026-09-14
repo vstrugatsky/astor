@@ -734,8 +734,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Bars used for the accel_price/accel_vol diagnostics: the last "
-        "N bars' average range/volume against the rest of the leg's. "
-        "Diagnostic only -- not yet filtered on.",
+        "N bars' net close-to-close speed (accel_price) and average volume "
+        "(accel_vol) against the rest of the leg's. Diagnostic only -- not "
+        "yet filtered on.",
     )
     r.add_argument(
         "--min-retrace-pct",

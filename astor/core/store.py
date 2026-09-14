@@ -152,9 +152,11 @@ SELECT
     -- it -- the capitulation "extended from the 9EMA" filter. Measured
     -- close-to-close (extreme_close, the extreme bar's own close), not
     -- against the high/low wick the extreme itself is, since the EMA line
-    -- was never computed from a wick either. accel_price/accel_vol: the
-    -- leg's last few bars' average range/volume against the rest of the
-    -- leg's -- diagnostic only, not yet filtered on.
+    -- was never computed from a wick either. accel_price: net close-to-
+    -- close displacement per bar, last few bars vs. the rest of the leg's
+    -- (not average bar range -- rewards actual directional speed, not
+    -- wick noise). accel_vol: average per-bar volume, last few bars vs.
+    -- the rest. Both diagnostic only, not yet filtered on.
     json_extract(t.extras_json, '$.ema9_at_extreme')           AS ema9_at_extreme,
     json_extract(t.extras_json, '$.extreme_close')             AS extreme_close,
     json_extract(t.extras_json, '$.ema9_extension_adr')        AS ema9_extension_adr,

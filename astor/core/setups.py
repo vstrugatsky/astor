@@ -543,17 +543,34 @@ class _ReversalBase(Setup):
         # exactly the push itself.
         push_bars = [b for b in self._leg_bars if b.start <= extreme_at]
         recent = push_bars[-self.accel_window :]
-        earlier = push_bars[: -self.accel_window] or push_bars
-        recent_range, earlier_range = _mean([b.high - b.low for b in recent]), _mean(
-            [b.high - b.low for b in earlier]
-        )
-        accel_price = (
-            round(recent_range / earlier_range, 4)
-            if recent_range is not None and earlier_range
-            else None
-        )
+        earlier = push_bars[: -self.accel_window]
+
+        # accel_price: net close-to-close displacement per bar, recent vs.
+        # earlier -- not average bar range. Real case that motivated this:
+        # DELL 2026-09-02's REV-L leg opened with several equally-wide,
+        # choppy bars (the initial sharp drop), which made the leg's
+        # *average bar range* a poor baseline -- the last 3 bars' genuine
+        # ~$9 net move looked unremarkable (0.96) next to that already-wide
+        # opening, even though net progress had clearly sped up. Rate-based
+        # and close-to-close (matching the EMA9/retrace convention) cancels
+        # out wick noise and rewards actual directional speed: needs at
+        # least 2 earlier bars to form even one earlier "step"; below that,
+        # same neutral fallback as too-few-bars ever was.
+        if len(earlier) >= 2:
+            recent_move = abs(recent[-1].close - earlier[-1].close)
+            earlier_move = abs(earlier[-1].close - earlier[0].close)
+            earlier_rate = earlier_move / (len(earlier) - 1)
+            recent_rate = recent_move / self.accel_window
+            accel_price = round(recent_rate / earlier_rate, 4) if earlier_rate > 0 else None
+        else:
+            accel_price = 1.0
+
+        # accel_vol has no directional analog (volume doesn't net out), so
+        # it stays an average-per-bar comparison, same "not enough bars"
+        # fallback as before.
+        earlier_for_vol = earlier or push_bars
         recent_vol, earlier_vol = _mean([b.volume for b in recent]), _mean(
-            [b.volume for b in earlier]
+            [b.volume for b in earlier_for_vol]
         )
         accel_vol = (
             round(recent_vol / earlier_vol, 4)
