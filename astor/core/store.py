@@ -140,6 +140,13 @@ SELECT
     json_extract(t.extras_json, '$.leg_extreme')               AS leg_extreme,
     json_extract(t.extras_json, '$.leg_size_adr')              AS leg_size_adr,
     json_extract(t.extras_json, '$.leg_size_pct')              AS leg_size_pct,
+    -- Where leg_duration_minutes actually starts counting from: the true
+    -- anchor's own timestamp, unless the leg died and revived, in which
+    -- case this is the dead retracement's own turnaround instead (the
+    -- unrelated dead stretch before that doesn't count as part of "how
+    -- long this push took"). `anchor` itself (the price level) never
+    -- moves regardless -- this only affects the duration measurement.
+    json_extract(t.extras_json, '$.push_started_at')          AS push_started_at,
     json_extract(t.extras_json, '$.leg_duration_minutes')      AS leg_duration_minutes,
     json_extract(t.extras_json, '$.retrace_pct')               AS retrace_pct,
     json_extract(t.extras_json, '$.retrace_minutes')           AS retrace_minutes,

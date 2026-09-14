@@ -1332,21 +1332,28 @@ def test_reversal_retrace_past_50pct_kills_leg_until_new_extreme() -> None:
     ]
     check("dead leg never fires even back in-band", _feed(sc, bars), [])
 
-    # A new, deeper low re-arms a fresh leg (own anchor reused, own clock,
-    # own extreme).
+    # A new, deeper low re-arms a fresh leg (own anchor reused, own extreme).
+    # Duration is now measured from the dead retracement's own turnaround
+    # (bar 11, the first bar that stops climbing further -- see _dead_bars),
+    # not from the original anchor at bar 0 -- so bars 11-12 keep declining
+    # (still dead, not yet past session_low) before bar 13 finally breaks
+    # through, giving leg2 a real (>= min_leg_minutes) span of its own.
     more_bars = [
-        bar(11, 96.9, 97.0, 94.0, 94.3, 1000, symbol="REV"),
-        bar(12, 94.3, 94.7, 92.0, 92.3, 1000, symbol="REV"),
-        bar(13, 92.3, 92.7, 90.0, 90.3, 1000, symbol="REV"),
-        bar(14, 90.3, 90.6, 89.0, 89.3, 1000, symbol="REV"),  # new leg2 extreme 89.0 (anchor 98, size 9.0)
-        bar(15, 89.3, 90.5, 89.1, 90.0, 1000, symbol="REV"),  # retrace 11%, elapsed 1
+        bar(11, 96.9, 97.0, 94.0, 94.3, 1000, symbol="REV"),  # dead, but turns down (push start)
+        bar(12, 94.3, 94.5, 93.5, 93.8, 1000, symbol="REV"),  # still dead (low 93.5 > 93.0), declining
+        bar(13, 93.8, 94.0, 92.0, 92.3, 1000, symbol="REV"),  # breaks session_low -- leg2 revives
+        bar(14, 92.3, 92.7, 90.0, 90.3, 1000, symbol="REV"),
+        bar(15, 90.3, 90.6, 89.0, 89.3, 1000, symbol="REV"),  # new leg2 extreme 89.0 (anchor 98, size 9.0)
+        bar(16, 89.3, 90.5, 89.1, 90.0, 1000, symbol="REV"),  # retrace 11%, elapsed 1
     ]
     triggers = _feed(sc, more_bars)
     check("exactly one trigger for leg2", len(triggers), 1)
     t = triggers[0]
     check("fires on the new, deeper extreme", t.level_value, 89.0)
     check("anchor unchanged (not recomputed, still session_open)", t.extras["anchor"], 98.0)
-    check("leg_duration_minutes", t.extras["leg_duration_minutes"], 14.0)
+    # bar 11 (the turn) to bar 15 (leg2's extreme) -- not bar 0 (the original,
+    # now-irrelevant anchor timestamp).
+    check("leg_duration_minutes measured from the dead leg's own turnaround", t.extras["leg_duration_minutes"], 4.0)
 
 
 def test_reversal_leg_bars_reset_on_rearm_after_dead_leg() -> None:

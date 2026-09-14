@@ -240,6 +240,24 @@ class _ReversalBase(Setup):
         # docstring's note on _leg_bars. Used only for the accel_price/
         # accel_vol diagnostics.
         self._leg_bars: list[BarEvent] = []
+        # While the leg is dead, tracks the retracement's own running local
+        # extreme (the close, in the same direction _more_extreme_anchor
+        # already compares) and every bar since it was last set -- so a
+        # later revival can seed _leg_bars from where the retracement
+        # actually turned around, not from whenever the stale old extreme
+        # eventually gets re-broken (which can be many bars later). See
+        # on_bar's _leg_bars reset logic for how this gets consumed.
+        self._dead_extreme: float | None = None
+        self._dead_bars: list[BarEvent] = []
+        # When the push currently being measured actually began -- normally
+        # the true anchor's own timestamp, but reset to the dead leg's own
+        # retracement turnaround (self._dead_bars[0]'s timestamp) on a
+        # revival from a genuine death, mirroring _leg_bars' reset exactly.
+        # Feeds leg_duration_minutes/min_leg_minutes below: the anchor VALUE
+        # (self._anchor) stays the real technical level regardless (still
+        # useful as a stop reference), but "how long did this push take"
+        # shouldn't count the dead, unrelated stretch before the revival.
+        self._push_started_at: datetime | None = None
         # The last _extreme value a capitulation alert was already fired
         # for, so a leg that keeps deepening bar-by-bar doesn't re-alert
         # every single bar -- only once per distinct (deeper) extreme.
@@ -385,7 +403,24 @@ class _ReversalBase(Setup):
             self._anchor = session_anchor
 
         if anchor_moved or (extreme_moved and leg_was_dead):
-            self._leg_bars = [bar]
+            if extreme_moved and leg_was_dead and not anchor_moved and self._dead_bars:
+                # The revival's push very likely began earlier than this
+                # bar -- right where the dead leg's own retracement turned
+                # around (self._dead_bars, tracked below), not wherever the
+                # stale old (session-wide) extreme happens to finally get
+                # re-broken. Real case: DELL 2026-09-03's REV-S leg died at
+                # 09:45, its retracement bottomed at 09:48 and climbed
+                # immediately -- but session_high (monotonic, untouched by
+                # the death) wasn't re-broken until 09:58, 9 bars after the
+                # real push actually began, which had been starving
+                # accel_price/accel_vol of exactly the bars that mattered.
+                self._leg_bars = self._dead_bars + [bar]
+                self._push_started_at = self._dead_bars[0].start
+            else:
+                self._leg_bars = [bar]
+                self._push_started_at = self._anchor_at(indicators)
+            self._dead_extreme = None
+            self._dead_bars = []
         elif not leg_was_dead:
             # Append every bar of a currently-alive leg, not just the ones
             # that individually set a fresh extreme -- a real push often
@@ -398,7 +433,32 @@ class _ReversalBase(Setup):
             # so "recent" and "earlier" ended up drawn from a handful of
             # cherry-picked bars rather than the leg's real pace.
             self._leg_bars.append(bar)
-        # else: the leg is dead -- inert, nothing worth adding.
+        else:
+            # Still dead: track the retracement's own running local extreme
+            # (the close, compared the same direction _more_extreme_anchor
+            # already uses -- retracing is a move toward the anchor's own
+            # side) and every bar since it was last set. Mirrors _leg_bars'
+            # own reset/append shape exactly, just scoped to the dead period.
+            dead_extreme_moved = self._dead_extreme is None or self._more_extreme_anchor(
+                bar.close, self._dead_extreme
+            ) != self._dead_extreme
+            if dead_extreme_moved:
+                # This bar itself IS the new local extreme of the
+                # retracement (still moving toward the anchor) -- not yet a
+                # bar of the turn back toward the anchor's opposite side, so
+                # it doesn't belong in _dead_bars. Only bars that arrive
+                # *after* the local extreme stops moving are the turn
+                # itself. Real case that pinned this down: a retracement
+                # that bottoms out and the very next bar already breaks back
+                # past the old extreme (no bars in between) must seed the
+                # revived leg with a clean [] here, not that single bottom
+                # bar -- else a same-bar-as-fired-earlier bar from the dead
+                # leg's own tail (session-wide monotonic anchor never
+                # having moved) leaks into the revived leg's history.
+                self._dead_extreme = bar.close
+                self._dead_bars = []
+            else:
+                self._dead_bars.append(bar)
 
         extreme_at = self._extreme_at(indicators)
         anchor_at = self._anchor_at(indicators)
@@ -480,7 +540,12 @@ class _ReversalBase(Setup):
             return None
 
         anchor_at = self._anchor_at(indicators)
-        leg_duration_minutes = abs((extreme_at - anchor_at).total_seconds()) / 60.0
+        # Duration is measured from push_started_at, not the raw anchor_at:
+        # a leg that died and later revived shouldn't have the dead,
+        # unrelated stretch in between counted as part of "how long this
+        # push took" -- see _push_started_at's own comment in __init__.
+        push_started_at = self._push_started_at if self._push_started_at is not None else anchor_at
+        leg_duration_minutes = abs((extreme_at - push_started_at).total_seconds()) / 60.0
         if leg_duration_minutes < self.min_leg_minutes:
             _trace(
                 trace, bar,
@@ -629,6 +694,7 @@ class _ReversalBase(Setup):
                 "leg_extreme_start": extreme_at.isoformat(),
                 "leg_size_adr": round(leg_size / adr, 4) if adr > 0 else None,
                 "leg_size_pct": _pct_of_level(leg_size, self._anchor),
+                "push_started_at": push_started_at.isoformat(),
                 "leg_duration_minutes": round(leg_duration_minutes, 1),
                 "retrace_pct": round(retrace_pct, 4),
                 "retrace_minutes": round(elapsed_minutes, 1),
@@ -688,7 +754,8 @@ class _ReversalBase(Setup):
 
         extreme_at = self._extreme_at(indicators)
         anchor_at = self._anchor_at(indicators)
-        leg_duration_minutes = abs((extreme_at - anchor_at).total_seconds()) / 60.0
+        push_started_at = self._push_started_at if self._push_started_at is not None else anchor_at
+        leg_duration_minutes = abs((extreme_at - push_started_at).total_seconds()) / 60.0
         if leg_duration_minutes < self.min_leg_minutes:
             return
 
