@@ -556,8 +556,21 @@ class _ReversalBase(Setup):
         # out wick noise and rewards actual directional speed: needs at
         # least 2 earlier bars to form even one earlier "step"; below that,
         # same neutral fallback as too-few-bars ever was.
+        #
+        # The recent window's endpoint is extreme_close, not recent[-1]'s
+        # own close: recent[-1] *is* the extreme bar (push_bars always ends
+        # there), so if it was itself a reversal candle, its raw close would
+        # understate the move the exact same way it did for ema9_extension_adr
+        # above -- extreme_close already picks the representative close
+        # (its own if a genuine continuation, the bar before it otherwise),
+        # so reusing it here keeps both diagnostics consistent. Real case:
+        # FSLY 2026-09-09 REV-S 10:06 -- the recent window closed choppy and
+        # nearly flat (10:05 gave back most of its own spike), reading
+        # accel_price 0.27, while the actual push (via extreme_close, the
+        # close before that reversal) was still accelerating at 1.42.
         if len(earlier) >= 2:
-            recent_move = abs(recent[-1].close - earlier[-1].close)
+            recent_end = extreme_close if extreme_close is not None else recent[-1].close
+            recent_move = abs(recent_end - earlier[-1].close)
             earlier_move = abs(earlier[-1].close - earlier[0].close)
             earlier_rate = earlier_move / (len(earlier) - 1)
             recent_rate = recent_move / self.accel_window
