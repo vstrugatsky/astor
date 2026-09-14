@@ -31,9 +31,8 @@ from pathlib import Path
 
 from ib_async import IB
 
-from astor.core.grading import rvol_threshold
 from astor.core.scanner import Scanner
-from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME
+from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME, rev_rvol_threshold
 from astor.core.store import TriggerStore
 from astor.drivers.live import LiveDriver
 from astor.drivers.replay import (
@@ -89,26 +88,12 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
         "min_retrace_pct": args.min_retrace_pct,
         "max_retrace_pct": args.max_retrace_pct,
         "min_confirm_minutes": args.min_confirm_minutes,
+        "min_leg_minutes": args.min_leg_minutes,
+        "min_ema9_extension_adr": args.min_ema9_extension_adr,
+        "accel_window": args.accel_window,
         "max_loss_dollars": args.max_loss,
     }
-    return {
-        "U&R": {
-            "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
-            "min_excursion_pct": args.min_excursion_pct,
-            "min_reclaim_pct": args.min_reclaim_pct,
-            "min_combined_pct": args.min_combined_pct,
-            "max_loss_dollars": args.max_loss,
-        },
-        "O&F": {
-            "allow_same_bar_fail": args.allow_same_bar_reclaim,
-            "min_excursion_pct": args.min_excursion_pct,
-            "min_reclaim_pct": args.min_reclaim_pct,
-            "min_combined_pct": args.min_combined_pct,
-            "max_loss_dollars": args.max_loss,
-        },
-        "REV-L": reversal_kwargs,
-        "REV-S": reversal_kwargs,
-    }
+    return {"REV-L": reversal_kwargs, "REV-S": reversal_kwargs}
 
 
 def _setups_and_kwargs(args: argparse.Namespace):
@@ -144,15 +129,14 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         "start": args.start,
         "end": args.end,
         "setups": [s.name for s in setups],
-        "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
-        "min_excursion_pct": args.min_excursion_pct,
-        "min_reclaim_pct": args.min_reclaim_pct,
-        "min_combined_pct": args.min_combined_pct,
         "adr_sessions": args.adr_sessions,
         "min_leg_adr": args.min_leg_adr,
         "min_retrace_pct": args.min_retrace_pct,
         "max_retrace_pct": args.max_retrace_pct,
         "min_confirm_minutes": args.min_confirm_minutes,
+        "min_leg_minutes": args.min_leg_minutes,
+        "min_ema9_extension_adr": args.min_ema9_extension_adr,
+        "accel_window": args.accel_window,
         "max_loss": args.max_loss,
     }
 
@@ -193,7 +177,26 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         # latency, so Replay's value is the floor.
         store.record(run_id, t, t.bar_end)
 
-    fed = run_replay(scanner, bars, start_t, end_t, on_trigger)
+    def on_capitulation_alert(a):
+        store.record_alert(
+            run_id,
+            "capitulation",
+            a.symbol,
+            a.direction,
+            a.bar_start,
+            a.price,
+            a.bar_end,
+            {
+                "leg_extreme": a.leg_extreme,
+                "anchor": a.anchor,
+                "leg_size_adr": a.leg_size_adr,
+                "move_rvol": a.move_rvol,
+                "ema9_extension_adr": a.ema9_extension_adr,
+            },
+            bar_end=a.bar_end,
+        )
+
+    fed = run_replay(scanner, bars, start_t, end_t, on_trigger, on_capitulation_alert)
     store.commit()
     store.close()
 
@@ -214,13 +217,9 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
             f"{min(adrs):.2f}% - {max(adrs):.2f}% across symbols"
         )
     print(
-        f"Filters (U&R/O&F)   : excursion >= {args.min_excursion_pct}% of level, "
-        f"reclaim >= {args.min_reclaim_pct}% of level, "
-        f"excursion+reclaim >= {args.min_combined_pct}%"
-    )
-    print(
-        f"Filters (REV-L/S)   : leg >= {args.min_leg_adr}x ADR, "
-        f"retrace {args.min_retrace_pct}%-{args.max_retrace_pct}% of leg, "
+        f"Filters (REV-L/S)   : leg >= {args.min_leg_adr}x ADR built over "
+        f">= {args.min_leg_minutes}min, ema9 ext >= {args.min_ema9_extension_adr} ADR, "
+        f"retrace {args.min_retrace_pct}%-{args.max_retrace_pct}% of leg (or EMA9 reclaim), "
         f"held >= {args.min_confirm_minutes}min since the extreme"
     )
     print(f"Bars fed to scanner : {fed}")
@@ -229,42 +228,36 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
     if scanner.skipped_no_levels:
         print(f"Dropped, no levels  : {', '.join(sorted(scanner.skipped_no_levels))}")
     print(f"\nTriggers: {len(triggers)}")
+    print(f"Capitulation alerts (leg still extending, no retrace yet): "
+          f"{len(scanner.capitulation_alerts)}")
 
     if triggers:
         print(
             f"\n{'time':<9} {'symbol':<7} {'setup':<5} {'grd':>3} {'price':>9} {'level':>9}"
-            f" {'exc(%)':>7} {'rec(%)':>7} {'sum(%)':>7}"
+            f" {'leg(x)':>7} {'retr%':>7} {'m_rvol':>7} {'ema9x':>7} {'accel':>6}"
             f" {'avwap':>9} {'rvol':>6}"
-            f" {'beyond':>7} {'armed':>6}"
         )
-        print("-" * 92)
+        print("-" * 96)
         for t in triggers:
             e = t.extras
-            # bars_below/bars_above/bars_armed are U&R/O&F-specific -- absent
-            # (None) for REV-L/REV-S, which has no analogous bar count.
-            nbars = e.get("bars_below", e.get("bars_above"))
-            bars_armed = e.get("bars_armed")
-            exc_pct, rec_pct, sum_pct = (
-                e.get("excursion_pct"),
-                e.get("reclaim_pct"),
-                e.get("combined_pct"),
-            )
+            leg_adr, retrace_pct = e.get("leg_size_adr"), e.get("retrace_pct")
+            move_rvol, ema9_ext = e.get("move_rvol"), e.get("ema9_extension_adr")
+            accel = e.get("accel_price")
             avwap, rvol = e.get("avwap"), e.get("rvol")
             auto_grade = e.get("auto_grade")
             grade_s = str(auto_grade) if auto_grade is not None else "-"
-            exc_pct_s = f"{exc_pct:.2f}%" if exc_pct is not None else "-"
-            rec_pct_s = f"{rec_pct:.2f}%" if rec_pct is not None else "-"
-            sum_pct_s = f"{sum_pct:.2f}%" if sum_pct is not None else "-"
+            leg_s = f"{leg_adr:.2f}" if leg_adr is not None else "-"
+            retrace_s = f"{retrace_pct:.1f}%" if retrace_pct is not None else "-"
+            move_rvol_s = f"{move_rvol:.2f}" if move_rvol is not None else "-"
+            ema9_s = f"{ema9_ext:.2f}" if ema9_ext is not None else "-"
+            accel_s = f"{accel:.2f}" if accel is not None else "-"
             avwap_s = f"{avwap:.2f}" if avwap is not None else "-"
             rvol_s = f"{rvol:.2f}" if rvol is not None else "-"
-            nbars_s = str(nbars) if nbars is not None else "-"
-            armed_s = str(bars_armed) if bars_armed is not None else "-"
             print(
                 f"{t.bar_start:%H:%M:%S}  {t.symbol:<7} {t.setup:<5} {grade_s:>3} "
                 f"{t.trigger_price:>9.2f} {t.level_value:>9.2f} "
-                f"{exc_pct_s:>7} {rec_pct_s:>7} {sum_pct_s:>7}"
+                f"{leg_s:>7} {retrace_s:>7} {move_rvol_s:>7} {ema9_s:>7} {accel_s:>6}"
                 f" {avwap_s:>9} {rvol_s:>6}"
-                f" {nbars_s:>7} {armed_s:>6}"
             )
 
         by_symbol: dict[str, int] = {}
@@ -324,7 +317,7 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     print("=" * 78)
     print(
         f"PDH {lv.pdh:.2f}  PDL {lv.pdl:.2f}  ADR({args.adr_sessions}) {lv.adr_pct:.2f}% "
-        f"(${lv.adr:.2f})  ADV ${lv.adv:,.0f}  RVOL floor {rvol_threshold(lv.adv)}"
+        f"(${lv.adr:.2f})  ADV ${lv.adv:,.0f}  move_rvol floor {rev_rvol_threshold(lv.adv)}"
     )
     ind = scanner.indicators.get(symbol)
     if ind is not None and ind.session_open is not None:
@@ -531,14 +524,13 @@ async def cmd_live(args: argparse.Namespace) -> int:
                 "session": str(driver.session),
                 "bar_size": args.bar_size,
                 "setups": [s.name for s in setups],
-                "allow_same_bar_reclaim": args.allow_same_bar_reclaim,
-                "min_excursion_pct": args.min_excursion_pct,
-                "min_reclaim_pct": args.min_reclaim_pct,
-                "min_combined_pct": args.min_combined_pct,
                 "min_leg_adr": args.min_leg_adr,
                 "min_retrace_pct": args.min_retrace_pct,
                 "max_retrace_pct": args.max_retrace_pct,
                 "min_confirm_minutes": args.min_confirm_minutes,
+                "min_leg_minutes": args.min_leg_minutes,
+                "min_ema9_extension_adr": args.min_ema9_extension_adr,
+                "accel_window": args.accel_window,
                 "max_loss": args.max_loss,
             },
         )
@@ -702,34 +694,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--start", default="", help="Session start HH:MM ET (default: open)")
     r.add_argument("--end", default="", help="Session end HH:MM ET (default: close)")
     r.add_argument(
-        "--setups", default="", help="Comma separated, e.g. 'U&R'. Default: all"
-    )
-    r.add_argument(
-        "--allow-same-bar-reclaim",
-        action="store_true",
-        help="Let a single bar both breach and reclaim the level",
-    )
-    r.add_argument(
-        "--min-excursion-pct",
-        type=float,
-        default=0.6,
-        help="Minimum breach depth past the level, as %% of the level's price "
-        "(0 = off).",
-    )
-    r.add_argument(
-        "--min-reclaim-pct",
-        type=float,
-        default=0.6,
-        help="Minimum reclaim distance past the level, as %% of the level's "
-        "price (0 = off).",
-    )
-    r.add_argument(
-        "--min-combined-pct",
-        type=float,
-        default=1.5,
-        help="Minimum excursion + reclaim combined, as %% of the level's "
-        "price (0 = off). Catches a move that clears both individual floors "
-        "but is still small overall.",
+        "--setups", default="", help="Comma separated, e.g. 'REV-L'. Default: all"
     )
     r.add_argument(
         "--adr-sessions",
@@ -743,32 +708,58 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--min-leg-adr",
         type=float,
-        default=0.5,
-        help="REV-L/REV-S only: minimum directional-leg size, in ADR units "
-        "(0.5 = the leg must be at least half the symbol's ADR).",
+        default=1.0,
+        help="Minimum directional-leg size, in ADR units, for both the final "
+        "trigger and the earlier capitulation-in-progress alert "
+        "(1.0 = the leg must be at least the symbol's full ADR).",
+    )
+    r.add_argument(
+        "--min-leg-minutes",
+        type=float,
+        default=4.0,
+        help="Minimum time the leg itself took to build, anchor to extreme -- "
+        "for both the final trigger and the capitulation alert. Below this "
+        "it's too fast to trust as a real leg.",
+    )
+    r.add_argument(
+        "--min-ema9-extension-adr",
+        type=float,
+        default=0.05,
+        help="Minimum distance the leg's extreme finished from the frozen "
+        "9EMA (1-min), in ADR units, for both the final trigger and the "
+        "capitulation alert (0 = off).",
+    )
+    r.add_argument(
+        "--accel-window",
+        type=int,
+        default=3,
+        help="Bars used for the accel_price/accel_vol diagnostics: the last "
+        "N bars' average range/volume against the rest of the leg's. "
+        "Diagnostic only -- not yet filtered on.",
     )
     r.add_argument(
         "--min-retrace-pct",
         type=float,
-        default=25.0,
-        help="REV-L/REV-S only: minimum retracement of the leg, as %% of "
-        "the leg's size, to count as a real reversal (not too early).",
+        default=10.0,
+        help="Minimum retracement of the leg, as %% of the leg's size, to "
+        "count as a real reversal -- OR'd with an EMA9 reclaim (whichever "
+        "comes first).",
     )
     r.add_argument(
         "--max-retrace-pct",
         type=float,
         default=50.0,
-        help="REV-L/REV-S only: maximum retracement of the leg, as %% of "
-        "the leg's size -- past this the move has round-tripped (too late), "
-        "and the leg is dead until a new, deeper extreme forms.",
+        help="Maximum retracement of the leg, as %% of the leg's size -- "
+        "past this the move has round-tripped (too late) regardless of an "
+        "EMA9 reclaim, and the leg is dead until a new, deeper extreme forms.",
     )
     r.add_argument(
         "--min-confirm-minutes",
         type=float,
-        default=6.0,
-        help="REV-L/REV-S only: minutes that must elapse since the leg's "
-        "extreme before a retracement in the target band is trusted, so a "
-        "same-bar or two-bar bounce doesn't count as confirmed.",
+        default=0.0,
+        help="Minutes that must elapse since the leg's extreme before a "
+        "retracement in the target band is trusted (0 = the very next bar "
+        "can confirm).",
     )
     r.add_argument(
         "--max-loss",
@@ -797,60 +788,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also the update frequency: setups evaluate on bar completion",
     )
     lv.add_argument(
-        "--setups", default="", help="Comma separated, e.g. 'U&R'. Default: all"
-    )
-    lv.add_argument(
-        "--allow-same-bar-reclaim",
-        action="store_true",
-        help="Let a single bar both breach and reclaim the level",
-    )
-    lv.add_argument(
-        "--min-excursion-pct",
-        type=float,
-        default=0.6,
-        help="Minimum breach depth past the level, as %% of the level's price "
-        "(0 = off).",
-    )
-    lv.add_argument(
-        "--min-reclaim-pct",
-        type=float,
-        default=0.6,
-        help="Minimum reclaim distance past the level, as %% of the level's "
-        "price (0 = off).",
-    )
-    lv.add_argument(
-        "--min-combined-pct",
-        type=float,
-        default=1.5,
-        help="Minimum excursion + reclaim combined, as %% of the level's "
-        "price (0 = off).",
+        "--setups", default="", help="Comma separated, e.g. 'REV-L'. Default: all"
     )
     lv.add_argument(
         "--min-leg-adr",
         type=float,
-        default=0.5,
-        help="REV-L/REV-S only: minimum directional-leg size, in ADR units.",
+        default=1.0,
+        help="Minimum directional-leg size, in ADR units, for both the final "
+        "trigger and the earlier capitulation-in-progress alert.",
+    )
+    lv.add_argument(
+        "--min-leg-minutes",
+        type=float,
+        default=4.0,
+        help="Minimum time the leg itself took to build, anchor to extreme -- "
+        "for both the final trigger and the capitulation alert.",
+    )
+    lv.add_argument(
+        "--min-ema9-extension-adr",
+        type=float,
+        default=0.05,
+        help="Minimum distance the leg's extreme finished from the frozen "
+        "9EMA (1-min), in ADR units, for both the final trigger and the "
+        "capitulation alert (0 = off).",
+    )
+    lv.add_argument(
+        "--accel-window",
+        type=int,
+        default=3,
+        help="Bars used for the accel_price/accel_vol diagnostics. "
+        "Diagnostic only -- not yet filtered on.",
     )
     lv.add_argument(
         "--min-retrace-pct",
         type=float,
-        default=25.0,
-        help="REV-L/REV-S only: minimum retracement of the leg, as %% of "
-        "the leg's size, to count as a real reversal.",
+        default=10.0,
+        help="Minimum retracement of the leg, as %% of the leg's size, to "
+        "count as a real reversal -- OR'd with an EMA9 reclaim.",
     )
     lv.add_argument(
         "--max-retrace-pct",
         type=float,
         default=50.0,
-        help="REV-L/REV-S only: maximum retracement of the leg, as %% of "
-        "the leg's size, before the leg is dead until a new extreme forms.",
+        help="Maximum retracement of the leg, as %% of the leg's size, "
+        "before the leg is dead until a new extreme forms -- regardless of "
+        "an EMA9 reclaim.",
     )
     lv.add_argument(
         "--min-confirm-minutes",
         type=float,
-        default=6.0,
-        help="REV-L/REV-S only: minutes since the leg's extreme before a "
-        "retracement in the target band is trusted.",
+        default=0.0,
+        help="Minutes since the leg's extreme before a retracement in the "
+        "target band is trusted (0 = the very next bar can confirm).",
     )
     lv.add_argument(
         "--max-loss",
@@ -884,19 +873,14 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument(
         "--setup", required=True, help=f"One of: {', '.join(SETUPS_BY_NAME)}"
     )
-    ex.add_argument(
-        "--allow-same-bar-reclaim",
-        action="store_true",
-        help="U&R/O&F only: let a single bar both breach and reclaim the level",
-    )
-    ex.add_argument("--min-excursion-pct", type=float, default=0.6, help="U&R/O&F only.")
-    ex.add_argument("--min-reclaim-pct", type=float, default=0.6, help="U&R/O&F only.")
-    ex.add_argument("--min-combined-pct", type=float, default=1.5, help="U&R/O&F only.")
     ex.add_argument("--adr-sessions", type=int, default=14)
-    ex.add_argument("--min-leg-adr", type=float, default=0.5, help="REV-L/REV-S only.")
-    ex.add_argument("--min-retrace-pct", type=float, default=25.0, help="REV-L/REV-S only.")
-    ex.add_argument("--max-retrace-pct", type=float, default=50.0, help="REV-L/REV-S only.")
-    ex.add_argument("--min-confirm-minutes", type=float, default=6.0, help="REV-L/REV-S only.")
+    ex.add_argument("--min-leg-adr", type=float, default=1.0)
+    ex.add_argument("--min-leg-minutes", type=float, default=4.0)
+    ex.add_argument("--min-ema9-extension-adr", type=float, default=0.05)
+    ex.add_argument("--accel-window", type=int, default=3)
+    ex.add_argument("--min-retrace-pct", type=float, default=10.0)
+    ex.add_argument("--max-retrace-pct", type=float, default=50.0)
+    ex.add_argument("--min-confirm-minutes", type=float, default=0.0)
     ex.add_argument("--max-loss", type=float, default=100.0)
     ex.add_argument("--cache-dir", default="data/bars")
     ex.add_argument("--host", default="127.0.0.1")

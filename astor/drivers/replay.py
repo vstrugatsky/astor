@@ -555,6 +555,7 @@ def run_replay(
     start_time: time | None = None,
     end_time: time | None = None,
     on_trigger=None,
+    on_capitulation_alert=None,
 ) -> int:
     """Drive the scanner over a replay stream. Returns bars fed."""
     fed = 0
@@ -563,4 +564,7 @@ def run_replay(
         for trigger in scanner.on_bar(bar):
             if on_trigger:
                 on_trigger(trigger)
+        for alert in scanner.pop_capitulation_alerts():
+            if on_capitulation_alert:
+                on_capitulation_alert(alert)
     return fed

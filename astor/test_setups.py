@@ -10,7 +10,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from astor.core.scanner import Scanner
-from astor.core.setups import OvershootFail, ReversalLong, ReversalShort, UndercutRally
+from astor.core.setups import ReversalLong, ReversalShort
 from astor.core.types import BarEvent, DailyLevels, VolumeCurve
 from astor.drivers.replay import ReplayDriver, run_replay
 
@@ -29,110 +29,28 @@ def check(label: str, got, want) -> None:
     assert got == want, f"{label}: expected {want}, got {got}"
 
 
-def test_undercut_rally_basic() -> None:
-    s = UndercutRally()
-    # Above PDL -- nothing.
-    check("no arm above level", s.on_bar(bar(0, 101, 102, 100.5, 101.5), LEVELS), None)
-    # Dips below PDL, closes below -- armed, no trigger yet.
-    check("arm on undercut", s.on_bar(bar(1, 101, 101, 99.0, 99.5), LEVELS), None)
-    # Still below.
-    check("stay armed", s.on_bar(bar(2, 99.5, 99.8, 98.5, 99.0), LEVELS), None)
-    # Closes back above PDL -- trigger.
-    t = s.on_bar(bar(3, 99, 101, 99, 100.5), LEVELS)
-    assert t is not None, "expected U&R trigger"
-    check("trigger price", t.trigger_price, 100.5)
-    check("level", t.level_value, 100.0)
-    check("direction", t.direction, "long")
-    check("bars below", t.extras["bars_below"], 3)
-    check("undercut low", t.extras["undercut_low"], 98.5)
-    # Absolute dollar figures are deliberately not stored -- only ADR units.
-    for gone in ("depth_below_level", "reclaim_close", "reclaim_distance", "adr"):
-        assert gone not in t.extras, f"{gone} should no longer be recorded"
-    # Re-armed: a bar above PDL must not fire again without a new undercut.
-    check("no repeat fire", s.on_bar(bar(4, 100.5, 102, 100.4, 101.5), LEVELS), None)
-
-
-def test_undercut_rally_same_bar_flag() -> None:
-    # One bar that wicks below PDL and closes above it.
-    wick = bar(1, 101, 101.5, 99.0, 100.8)
-
-    off = UndercutRally(allow_same_bar_reclaim=False)
-    check("same-bar suppressed by default", off.on_bar(wick, LEVELS), None)
-    # It is armed though, so the next close above fires. That second bar never
-    # dips below PDL, so it is an armed bar but not a bar below the level.
-    t = off.on_bar(bar(2, 100.8, 101.2, 100.7, 101.0), LEVELS)
-    assert t is not None, "expected trigger on following bar"
-    check("only the wick bar broke the level", t.extras["bars_below"], 1)
-    check("but two bars elapsed since the breach", t.extras["bars_armed"], 2)
-
-    on = UndercutRally(allow_same_bar_reclaim=True)
-    t2 = on.on_bar(wick, LEVELS)
-    assert t2 is not None, "expected same-bar trigger when enabled"
-    check("same-bar bars_below", t2.extras["bars_below"], 1)
-    check("same-bar price", t2.trigger_price, 100.8)
-
-
-def test_undercut_rally_fires_twice() -> None:
-    s = UndercutRally()
-    fires = 0
-    for b in [
-        bar(0, 101, 101, 99, 99.5),  # arm
-        bar(1, 99.5, 101, 99.5, 100.5),  # fire 1
-        bar(2, 100.5, 101, 98, 99),  # arm again
-        bar(3, 99, 101, 99, 100.7),  # fire 2
-    ]:
-        if s.on_bar(b, LEVELS):
-            fires += 1
-    check("two undercut-reclaim cycles fire twice", fires, 2)
-
-
-def test_overshoot_fail_basic() -> None:
-    s = OvershootFail()
-    check("no arm below level", s.on_bar(bar(0, 104, 104.5, 103, 104), LEVELS), None)
-    check("arm on overshoot", s.on_bar(bar(1, 104.5, 106.5, 104.5, 106), LEVELS), None)
-    t = s.on_bar(bar(2, 106, 106, 104, 104.5), LEVELS)
-    assert t is not None, "expected O&F trigger"
-    check("trigger price", t.trigger_price, 104.5)
-    check("level", t.level_value, 105.0)
-    check("direction", t.direction, "short")
-    check("bars above", t.extras["bars_above"], 2)
-    check("overshoot high", t.extras["overshoot_high"], 106.5)
-    for gone in ("height_above_level", "fail_close", "reclaim_distance", "adr"):
-        assert gone not in t.extras, f"{gone} should no longer be recorded"
-
-
-def test_boundary_is_strict() -> None:
-    # Exactly touching the level is not a breach, and closing exactly at the
-    # level is not a reclaim. Strict inequalities both ways.
-    s = UndercutRally()
-    check(
-        "touch PDL is not undercut",
-        s.on_bar(bar(0, 101, 101, 100.0, 100.5), LEVELS),
-        None,
-    )
-    s.on_bar(bar(1, 101, 101, 99, 99), LEVELS)  # arm
-    check(
-        "close AT PDL is not reclaim",
-        s.on_bar(bar(2, 99, 100.0, 99, 100.0), LEVELS),
-        None,
-    )
-    assert s.on_bar(bar(3, 100, 100.5, 100, 100.01), LEVELS) is not None
-
-
 def test_scanner_drops_zero_volume() -> None:
-    sc = Scanner({"TEST": LEVELS}, [UndercutRally])
-    sc.on_bar(bar(0, 101, 101, 99, 99))  # arm, real volume
-    # A padded zero-volume bar carrying price above PDL must not fire.
+    sc = Scanner({"TEST": LEVELS}, [ReversalLong])
+    sc.on_bar(bar(0, 101, 101, 99, 99.5))  # real volume, seeds indicators/leg state
+    # A padded zero-volume bar carrying price above the session low must not
+    # be evaluated at all.
     check("zero-volume dropped", sc.on_bar(bar(1, 100.5, 100.5, 100.5, 100.5, v=0)), [])
     check("counted as skipped", sc.skipped_zero_volume, 1)
     check("not evaluated", sc.bars_evaluated, 1)
-    # A real bar at the same price does fire, proving the level logic was fine
-    # and it was the volume filter that suppressed the phantom.
-    assert sc.on_bar(bar(2, 100.5, 100.6, 100.4, 100.5)), "real bar should fire"
+    check(
+        "zero-volume bar never touched indicators",
+        sc.indicators["TEST"].cum_volume,
+        1000,
+    )
+    # A real bar at the same price is evaluated (bars_evaluated increments),
+    # proving it was the volume filter that suppressed the phantom bar, not
+    # some Setup/level issue.
+    sc.on_bar(bar(2, 100.5, 100.6, 100.4, 100.5))
+    check("real bar was evaluated", sc.bars_evaluated, 2)
 
 
 def test_scanner_skips_symbols_without_levels() -> None:
-    sc = Scanner({"TEST": LEVELS}, [UndercutRally])
+    sc = Scanner({"TEST": LEVELS}, [ReversalLong])
     check("unknown symbol dropped", sc.on_bar(bar(0, 1, 2, 0.5, 1, symbol="NOLVL")), [])
     check("recorded", sc.skipped_no_levels, {"NOLVL"})
 
@@ -159,82 +77,80 @@ def test_stream_window_filter() -> None:
     )
 
 
-def test_run_replay_end_to_end() -> None:
-    bars = {
-        "TEST": [
-            bar(0, 101, 101, 100.5, 101),
-            bar(1, 101, 101, 99, 99.5),  # arm
-            bar(2, 99.5, 101, 99.5, 100.6),  # fire
-        ]
-    }
-    sc = Scanner({"TEST": LEVELS}, [UndercutRally, OvershootFail])
-    seen = []
-    fed = run_replay(sc, bars, on_trigger=seen.append)
-    check("bars fed", fed, 3)
-    check("one trigger", len(seen), 1)
-    check(
-        "detection ts is bar completion",
-        seen[0].bar_end,
-        seen[0].bar_start + timedelta(minutes=1),
+def _canonical_long_bars() -> list[BarEvent]:
+    """A REV-L leg built to clear every default Reversal filter at once:
+    anchor pinned at bar 0's high (98.0, session open), leg deepens to an
+    extreme of 93.0 at minute 4 (leg=5.0 >= 1.0x the $4.00 ADR, built over
+    exactly the 4-minute floor), then a bar 5 retrace to 94.0 (20% of the
+    leg, comfortably in the 10-50% band) with a wide-open default volume
+    curve so move_rvol trivially clears the 2.0x floor for this ADV tier.
+    Reused across every generic (non-Reversal-specific) test that just
+    needs *a* trigger to fire.
+    """
+    return [
+        bar(0, 98.0, 98.0, 97.5, 97.8, 50_000, symbol="REV"),
+        bar(1, 97.8, 97.9, 96.0, 96.3, 50_000, symbol="REV"),
+        bar(2, 96.3, 96.4, 95.0, 95.3, 50_000, symbol="REV"),
+        bar(3, 95.3, 95.4, 94.0, 94.3, 50_000, symbol="REV"),
+        bar(4, 94.3, 94.4, 93.0, 93.3, 50_000, symbol="REV"),  # extreme, minute 4
+        bar(5, 93.3, 93.8, 93.1, 94.0, 10_000, symbol="REV"),  # retrace 20%
+    ]
+
+
+def _canonical_short_bars() -> list[BarEvent]:
+    """Mirror of _canonical_long_bars for REV-S: anchor pinned at bar 0's
+    low (102.0), leg extends to 107.7 at minute 4 (leg=5.7), retrace to
+    106.5 at minute 5 (21% of the leg)."""
+    return [
+        bar(0, 102.0, 102.0, 102.0, 102.2, 50_000, symbol="REV"),
+        bar(1, 102.2, 104.0, 102.1, 103.8, 50_000, symbol="REV"),
+        bar(2, 103.8, 105.5, 103.5, 105.2, 50_000, symbol="REV"),
+        bar(3, 105.2, 106.7, 105.0, 106.4, 50_000, symbol="REV"),
+        bar(4, 106.4, 107.7, 106.2, 107.4, 50_000, symbol="REV"),  # extreme, minute 4
+        bar(5, 107.4, 107.6, 106.4, 106.5, 10_000, symbol="REV"),  # retrace 21%
+    ]
+
+
+def _generous_curve(symbol: str = "REV", n: int = 60) -> VolumeCurve:
+    """A curve whose average is tiny at every minute, so any real bar volume
+    trivially clears the RVOL floor -- for tests where RVOL isn't the point."""
+    return VolumeCurve(
+        symbol, sessions=10,
+        cum_volume_by_minute={(OPEN + timedelta(minutes=i)).timetz().replace(tzinfo=None): 1.0 for i in range(n)},
     )
 
 
-def test_bars_beyond_counts_only_bars_past_the_level() -> None:
-    """bars_below is time spent below the level, not time spent armed.
-
-    These diverge whenever a filter suppresses a reclaim: the setup stays armed
-    while price sits back above the level. Counting those bars as "below"
-    overstated how sustained the breach was -- AAPL reported 52 when only 39
-    bars had actually broken the level.
-    """
-    s = UndercutRally(min_reclaim_pct=1.0)  # needs a 1% reclaim on PDL=100
-    s.on_bar(bar(0, 101, 101, 97, 97.5), ADR_LEVELS)  # breaks level, armed
-    # Three bars back above PDL but reclaiming too weakly to fire. They are
-    # armed bars, not bars below the level.
-    for i in (1, 2, 3):
-        check(
-            f"weak reclaim bar {i} suppressed",
-            s.on_bar(bar(i, 100.2, 100.4, 100.1, 100.3), ADR_LEVELS),
-            None,
-        )
-    t = s.on_bar(bar(4, 100.3, 101.5, 100.2, 101.2), ADR_LEVELS)
-    assert t is not None, "expected fire once the reclaim was convincing"
-    check("bars actually below the level", t.extras["bars_below"], 1)
-    check("bars since the breach", t.extras["bars_armed"], 5)
+def _rev_scanner(setup_cls, symbol: str = "REV", curve: VolumeCurve | None = None) -> Scanner:
+    levels = DailyLevels(
+        symbol, date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
+    )
+    scanner = Scanner({symbol: levels}, [setup_cls])
+    scanner.curves[symbol] = curve or _generous_curve(symbol)
+    return scanner
 
 
-def test_bars_above_counts_only_bars_past_the_level() -> None:
-    s = OvershootFail(min_reclaim_pct=1.0)
-    s.on_bar(bar(0, 105, 108, 105, 107.5), ADR_LEVELS)  # breaks PDH, armed
-    for i in (1, 2):
-        check(
-            f"weak fail bar {i} suppressed",
-            s.on_bar(bar(i, 104.9, 104.95, 104.8, 104.9), ADR_LEVELS),
-            None,
-        )
-    t = s.on_bar(bar(3, 104.9, 104.9, 103, 103.5), ADR_LEVELS)
-    assert t is not None, "expected fire on a decisive fail"
-    check("bars actually above the level", t.extras["bars_above"], 1)
-    check("bars since the breach", t.extras["bars_armed"], 4)
+def _feed(scanner: Scanner, bars: list[BarEvent]) -> list:
+    triggers = []
+    for b in bars:
+        triggers.extend(scanner.on_bar(b))
+    return triggers
 
 
-def test_reclaim_may_span_many_bars() -> None:
-    """A reclaim is not required to complete in one bar.
-
-    It is a point-in-time distance from the level, re-tested on every bar while
-    the setup stays armed, so price may grind up over many bars and fire when it
-    finally gets far enough past.
-    """
-    s = UndercutRally(min_reclaim_pct=1.0)  # needs close >= 101.00 (PDL=100)
-    s.on_bar(bar(0, 101, 101, 97, 97.5), ADR_LEVELS)
-    closes = [100.2, 100.5, 100.8, 100.95]  # creeping up, all short of 101.00
-    for i, c in enumerate(closes, start=1):
-        check(
-            f"still short at {c}", s.on_bar(bar(i, c, c, c - 0.1, c), ADR_LEVELS), None
-        )
-    t = s.on_bar(bar(5, 100.95, 101.3, 100.9, 101.05), ADR_LEVELS)
-    assert t is not None, "a gradual reclaim must still fire"
-    check("fired on the 6th bar of the sequence", t.extras["bars_armed"], 6)
+def test_run_replay_end_to_end() -> None:
+    sc = _rev_scanner(ReversalLong)
+    triggers, alerts = [], []
+    fed = run_replay(
+        sc, {"REV": _canonical_long_bars()}, on_trigger=triggers.append,
+        on_capitulation_alert=alerts.append,
+    )
+    check("bars fed", fed, 6)
+    check("one trigger", len(triggers), 1)
+    check("one capitulation alert (leg still extending at minute 4)", len(alerts), 1)
+    check(
+        "detection ts is bar completion",
+        triggers[0].bar_end,
+        triggers[0].bar_start + timedelta(minutes=1),
+    )
 
 
 def test_compute_adr_pct() -> None:
@@ -379,144 +295,12 @@ def test_adr_property() -> None:
     check("no adr data -> zero", LEVELS.adr, 0.0)
 
 
-def test_excursion_filter_rejects_shallow_breach() -> None:
-    """A 1-cent undercut is chop, not a setup, at a 1%-of-level threshold."""
-    s = UndercutRally(min_excursion_pct=1.0)  # needs >= $1.00 of undercut on PDL=100
-    s.on_bar(bar(0, 100.5, 100.5, 99.99, 100.2), ADR_LEVELS)  # 0.01 deep -> armed
-    check(
-        "shallow breach suppressed",
-        s.on_bar(bar(1, 100.2, 101, 100.1, 100.9), ADR_LEVELS),
-        None,
-    )
-    # Still armed. A deeper push then a reclaim does fire.
-    s.on_bar(bar(2, 100.2, 100.2, 98.5, 98.8), ADR_LEVELS)  # now 1.50 deep
-    t = s.on_bar(bar(3, 98.8, 101, 98.8, 100.9), ADR_LEVELS)
-    assert t is not None, "expected fire once the undercut was deep enough"
-    check("excursion in adr units", t.extras["excursion_adr"], 0.15)
-
-
-def test_reclaim_filter_rejects_limp_reclaim() -> None:
-    """Closing a cent past the level is not a reclaim worth an alert."""
-    s = UndercutRally(min_reclaim_pct=1.0)  # needs close >= $1.00 above PDL (=100)
-    s.on_bar(bar(0, 101, 101, 97, 97.5), ADR_LEVELS)  # deep undercut, armed
-    check(
-        "limp reclaim suppressed",
-        s.on_bar(bar(1, 97.5, 100.2, 97.5, 100.01), ADR_LEVELS),
-        None,
-    )
-    # Stays armed, so a convincing reclaim later still fires.
-    t = s.on_bar(bar(2, 100.01, 101.5, 100.0, 101.2), ADR_LEVELS)
-    assert t is not None, "expected fire on a convincing reclaim"
-    check("reclaim in adr units", t.extras["reclaim_adr"], 0.12)
-
-
-def test_filters_apply_to_short_side() -> None:
-    s = OvershootFail(min_excursion_pct=1.0, min_reclaim_pct=1.0)
-    s.on_bar(bar(0, 105, 105.05, 105, 105.02), ADR_LEVELS)  # 0.05 over -> armed
-    check(
-        "shallow overshoot suppressed",
-        s.on_bar(bar(1, 105.02, 105.02, 104.9, 104.99), ADR_LEVELS),
-        None,
-    )
-    s.on_bar(bar(2, 105, 107, 105, 106.5), ADR_LEVELS)  # now 2.00 over
-    check(
-        "limp fail suppressed",
-        s.on_bar(bar(3, 106.5, 106.5, 104.9, 104.99), ADR_LEVELS),
-        None,
-    )
-    t = s.on_bar(bar(4, 104.99, 105, 103, 103.5), ADR_LEVELS)
-    assert t is not None, "expected fire on a decisive fail"
-    # excursion_adr/reclaim_adr are recorded as diagnostics regardless of the
-    # (now percent-only) filter -- levels.adr is still available here.
-    check("excursion adr", t.extras["excursion_adr"], 0.2)
-    check("reclaim adr", t.extras["reclaim_adr"], 0.15)
-
-
-def test_filters_work_without_adr() -> None:
-    """Filtering is percent-only now, so it never depends on ADR being
-    available -- only the excursion_adr/reclaim_adr diagnostics do."""
-    s = UndercutRally(min_excursion_pct=0.5, min_reclaim_pct=0.5)
-    s.on_bar(bar(0, 101, 101, 99, 99.5), LEVELS)  # LEVELS has adr_pct 0, PDL=100
-    t = s.on_bar(bar(1, 99.5, 101, 99.5, 100.5), LEVELS)
-    assert t is not None, "percent filter must not depend on ADR availability"
-    check("adr diagnostic unavailable", t.extras["excursion_adr"], None)
-
-
-def test_excursion_pct_catches_aeva() -> None:
-    """AEVA's real U&R on 2026-08-14: PDL=22.25, undercut bottomed at 22.05, a
-    $0.20 breach -- 0.8989% of level, clears a 0.5% floor comfortably. This is
-    the case that originally motivated a flat-percent excursion measure
-    (ADR alone missed it by five cents) before ADR was dropped from filtering
-    entirely.
-    """
-    aeva = DailyLevels(
-        "AEVA",
-        date(2026, 8, 13),
-        pdh=25.86,
-        pdl=22.25,
-        adr_pct=11.00,
-        prev_close=22.42,
-        adr_sessions=14,
-    )
-    s = UndercutRally(min_excursion_pct=0.5)
-    s.on_bar(bar(0, 22.35, 22.40, 22.05, 22.27), aeva)  # arm, low=22.05
-    t = s.on_bar(bar(1, 22.20, 22.35, 22.10, 22.30), aeva)  # close 22.30
-    assert t is not None, "excursion clears the flat-percent floor"
-    check("excursion_pct", t.extras["excursion_pct"], 0.8989)
-
-
-def test_min_pct_passes_semantics() -> None:
-    """Direct coverage of the percent-floor helper's degenerate cases."""
-    from astor.core.setups import _min_pct_passes
-
-    ok, pct = _min_pct_passes(amount=2.0, level_value=100.0, min_pct=1.0)
-    check("clears the floor", ok, True)
-    check("pct computed", pct, 2.0)
-
-    ok2, _ = _min_pct_passes(amount=0.5, level_value=100.0, min_pct=1.0)
-    check("short of the floor rejects", ok2, False)
-
-    # min_pct <= 0 disables the check -- always passes, pct still reported.
-    ok3, pct3 = _min_pct_passes(amount=0.0001, level_value=100.0, min_pct=0.0)
-    check("no threshold configured means no filtering at all", ok3, True)
-    check("pct is still reported even when unused as a filter", pct3, 0.0001)
-
-    # level_value <= 0 means pct can't be computed; a configured floor fails
-    # closed rather than silently passing.
-    ok4, pct4 = _min_pct_passes(amount=1.0, level_value=0.0, min_pct=1.0)
-    check("unresolvable pct must not auto-pass a configured floor", ok4, False)
-    check("pct is None when the level is unusable", pct4, None)
-
-
-def test_combined_pct_filter_rejects_two_weak_halves() -> None:
-    """Excursion and reclaim can each clear their own floor while the whole
-    move is still small -- the combined floor catches that pair."""
-    s = UndercutRally(min_excursion_pct=0.6, min_reclaim_pct=0.6, min_combined_pct=1.5)
-    s.on_bar(bar(0, 100.6, 100.6, 99.35, 99.5), LEVELS)  # undercut_low=99.35
-    # excursion 0.65%, reclaim 0.65% -- each clears its own floor, sum 1.3%
-    # doesn't clear 1.5%.
-    t = s.on_bar(bar(1, 99.5, 100.65, 99.4, 100.65), LEVELS)
-    check("both halves pass individually but combined is too small", t, None)
-    # A deeper reclaim pushes the sum over 1.5% without changing excursion.
-    t2 = s.on_bar(bar(2, 100.65, 101.0, 100.6, 100.9), LEVELS)
-    assert t2 is not None, "combined floor should now clear"
-    check("combined_pct", t2.extras["combined_pct"], 1.55)
-
-
-def test_reclaim_pct_recorded() -> None:
-    """reclaim_pct is a diagnostic, always recorded -- not gated by any filter,
-    same as excursion_pct."""
-    s = UndercutRally()
-    s.on_bar(bar(0, 101, 101, 99, 99.5), LEVELS)  # arm, PDL=100
-    t = s.on_bar(bar(1, 99.5, 101, 99.5, 100.5), LEVELS)  # close 0.5 above PDL
-    assert t is not None
-    check("reclaim_pct = 0.5/100*100", t.extras["reclaim_pct"], 0.5)
-
-    o = OvershootFail()
-    o.on_bar(bar(0, 104, 106, 104, 105.5), LEVELS)  # arm, PDH=105
-    t2 = o.on_bar(bar(1, 105.5, 105.5, 104.475, 104.475), LEVELS)  # 0.525 below PDH
-    assert t2 is not None
-    check("reclaim_pct = 0.525/105*100", t2.extras["reclaim_pct"], 0.5)
+# adr_pct=4.0 on a $100 prev_close -> $4.00 of ADR -- matches the canonical
+# REV-L/REV-S fixtures below (_canonical_long_bars/_canonical_short_bars),
+# which are sized against a $4.00 ADR, not ADR_LEVELS's $10.00.
+REV_LEVELS = DailyLevels(
+    "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
+)
 
 
 def test_session_indicators_avwap() -> None:
@@ -533,6 +317,31 @@ def test_session_indicators_avwap() -> None:
     # (100*1000 + 102*2000) / 3000 = 304000 / 3000
     assert abs(ind.avwap - 101.3333) < 0.0001, f"avwap={ind.avwap}"
     check("first_bar_start doesn't move on later bars", ind.first_bar_start, OPEN)
+
+
+def test_session_indicators_ema9() -> None:
+    """ema9 is seeded from the first bar's close (no SMA warmup) and decays
+    with alpha=2/(9+1)=0.2 thereafter. ema9_at_high/low freeze the reading
+    at the same bar session_high/session_low themselves were set -- the
+    same relationship cum_volume_at_high/low already has."""
+    from astor.core.indicators import SessionIndicators
+
+    ind = SessionIndicators("TEST")
+    ind.update(bar(0, 100, 101, 99, 100))  # close=100 -> seeds ema9
+    check("ema9 seeded from the first close", ind.ema9, 100.0)
+    check("ema9_at_low frozen at the seeding bar (also the first low)", ind.ema9_at_low, 100.0)
+    check("ema9_at_high frozen at the seeding bar (also the first high)", ind.ema9_at_high, 100.0)
+
+    ind.update(bar(1, 100, 100.5, 98.5, 95))  # new low (98.5 < 99), close=95
+    # ema9 = 100 + 0.2*(95-100) = 99.0
+    check("ema9 decays toward the new close", round(ind.ema9, 4), 99.0)
+    check("ema9_at_low updates -- a new session low was just set", ind.ema9_at_low, 99.0)
+    check("ema9_at_high stays at the earlier freeze -- no new session high", ind.ema9_at_high, 100.0)
+
+    ind.update(bar(2, 95, 96, 99.0, 96))  # low=99.0 is not below 98.5 -- no new low
+    # ema9 = 99.0 + 0.2*(96-99.0) = 98.4
+    check("ema9 keeps updating on every bar", round(ind.ema9, 4), 98.4)
+    check("ema9_at_low unaffected -- no new session low this bar", ind.ema9_at_low, 99.0)
 
 
 def test_compute_rvol() -> None:
@@ -592,7 +401,7 @@ def test_build_cum_volume_curve() -> None:
 
 
 def test_scanner_backfill_bar_updates_indicators_not_setups() -> None:
-    sc = Scanner({"TEST": LEVELS}, [UndercutRally])
+    sc = Scanner({"TEST": LEVELS}, [ReversalLong])
 
     b0 = bar(0, 101, 101, 99, 99.5)
     sc.backfill_bar(b0)
@@ -601,9 +410,9 @@ def test_scanner_backfill_bar_updates_indicators_not_setups() -> None:
     check("no triggers recorded by backfill", sc.triggers, [])
 
     # Setup state starts clean: on_bar sees this as the FIRST bar it has ever
-    # evaluated for TEST, so it only arms (this bar's low is itself below
-    # PDL) -- it can't fire, because it never saw the backfilled undercut.
-    b1 = bar(1, 99.5, 101, 99.5, 100.5)
+    # evaluated for TEST, so both extreme and anchor "move" (they were None)
+    # -- it can only arm a fresh leg, never fire off a push it never saw form.
+    b1 = bar(1, 99.5, 100, 99.4, 99.8)
     fired = sc.on_bar(b1)
     check("setup starts clean -- this bar only arms it, can't fire yet", fired, [])
     check("but indicators keep accumulating across backfill and live bars",
@@ -612,20 +421,13 @@ def test_scanner_backfill_bar_updates_indicators_not_setups() -> None:
 
 def test_trigger_extras_include_avwap_and_rvol() -> None:
     """Scanner wires its running indicators/curve into Setup.on_bar, so every
-    trigger carries the current AVWAP and RVOL as diagnostics -- no setup
-    filters on them yet, but they're useful context for all of them."""
-    from astor.core.types import VolumeCurve
-
-    curve = VolumeCurve("TEST", sessions=5, cum_volume_by_minute={time(9, 31): 500.0})
-    sc = Scanner({"TEST": LEVELS}, [UndercutRally])
-    sc.curves["TEST"] = curve
-
-    sc.on_bar(bar(0, 101, 101, 99, 99.5))  # arm, also seeds indicators
-    fired = sc.on_bar(bar(1, 99.5, 101, 99.5, 100.5))  # fire
+    trigger carries the current AVWAP and RVOL as diagnostics."""
+    sc = _rev_scanner(ReversalLong)
+    fired = _feed(sc, _canonical_long_bars())
     assert fired, "expected a trigger"
     t = fired[0]
     assert t.extras["avwap"] is not None, "avwap should be populated from indicators"
-    check("rvol = cum_volume(2000) / curve avg at 09:31(500)", t.extras["rvol"], 4.0)
+    assert t.extras["rvol"] is not None, "rvol should be populated from the curve"
 
 
 def test_position_size() -> None:
@@ -645,74 +447,69 @@ def test_position_size() -> None:
 
 
 def test_trigger_extras_include_notify_fields() -> None:
-    """avwap_pct and both stop/position-size pairs (technical level, session
-    extreme) are computed the same way avwap/rvol are -- from Scanner-
-    supplied indicators, recorded but never filtered on."""
-    from astor.core.indicators import SessionIndicators
-
-    ind = SessionIndicators("TEST")
-    s = UndercutRally(max_loss_dollars=100.0)
-
-    b0 = bar(0, 101, 101, 99, 99.5)  # arm, low=99
-    ind.update(b0)
-    s.on_bar(b0, LEVELS, ind)
-
-    b1 = bar(1, 99.5, 101, 98, 102)  # session low drops to 98, close=102 -> fire
-    ind.update(b1)
-    t = s.on_bar(b1, LEVELS, ind)
-    assert t is not None, "expected a fire on the reclaim"
-
-    check("avwap_pct is populated", t.extras["avwap_pct"] is not None, True)
-    # entry=102 vs PDL=100 -> abs((102-100)/100*100)
-    check("level_stop_pct", t.extras["level_stop_pct"], 2.0)
-    # level stop at PDL=100, entry=102 -> $2 risk/share -> 50 shares @ $102
-    check("level_stop_shares", t.extras["level_stop_shares"], 50)
-    check("level_stop_dollars", t.extras["level_stop_dollars"], 5100.0)
-    # session low is 98 (set by b1), entry=102 -> $4 risk/share -> 25 shares
-    check("session_extreme is the session low", t.extras["session_extreme"], 98)
-    check("session_stop_shares", t.extras["session_stop_shares"], 25)
-    check("session_stop_dollars", t.extras["session_stop_dollars"], 2550.0)
-    check("max_loss_dollars recorded", t.extras["max_loss_dollars"], 100.0)
-    # session_open is b0's open (101); session_high is b1's high (101, unchanged
-    # since b1's high never beat b0's), session_low is b1's low (98)
-    check("session_open recorded", t.extras["session_open"], 101)
-    check("session_high recorded", t.extras["session_high"], 101)
-    check("session_low recorded", t.extras["session_low"], 98)
-
-
-def test_notify_pct_fields_are_unsigned_for_short_setups() -> None:
-    """level_stop_pct/session_extreme_pct are a stop's distance -- a trader
-    thinks of that as a positive number regardless of direction, unlike
-    avwap_pct, which stays signed since above/below AVWAP is meaningfully
-    directional. For a short (O&F), (close - PDH)/PDH and (close - session
-    high)/session high are both naturally negative; this locks in that they
-    get reported as positive magnitudes anyway.
+    """avwap_pct and the level stop/position-size pair are computed the same
+    way avwap/rvol are -- from Scanner-supplied indicators, recorded but
+    never filtered on. Unlike the retired U&R/O&F, Reversal has no second,
+    distinct "technical vs. actual" stop to show -- the level *is* the
+    session extreme already -- so session_extreme/session_stop_* are left
+    unset entirely rather than duplicating level_stop_*.
     """
     from astor.core.indicators import SessionIndicators
 
-    ind = SessionIndicators("TEST")
-    s = OvershootFail(max_loss_dollars=100.0)
+    ind = SessionIndicators("REV")
+    s = ReversalLong(max_loss_dollars=100.0)
+    curve = _generous_curve()
 
-    b0 = bar(0, 104, 106, 104, 105.5)  # arm, high=106 -> overshoot_high=106
-    ind.update(b0)
-    s.on_bar(b0, LEVELS, ind)
+    t = None
+    for b in _canonical_long_bars():
+        ind.update(b)
+        r = s.on_bar(b, REV_LEVELS, ind, curve)
+        if r is not None:
+            t = r
+    assert t is not None, "expected a fire"
 
-    b1 = bar(1, 105.5, 107, 104.5, 104.0)  # session high -> 107, close=104 -> fire
-    ind.update(b1)
-    t = s.on_bar(b1, LEVELS, ind)
-    assert t is not None, "expected a fire on the fail"
+    check("avwap_pct is populated", t.extras["avwap_pct"] is not None, True)
+    # entry=94.0 vs the leg extreme=93.0 -> abs((94-93)/93*100)
+    check("level_stop_pct", t.extras["level_stop_pct"], 1.0753)
+    check("max_loss_dollars recorded", t.extras["max_loss_dollars"], 100.0)
+    check("session_open recorded", t.extras["session_open"], 98.0)
+    check("session_high recorded", t.extras["session_high"], 98.0)
+    check("session_low recorded", t.extras["session_low"], 93.0)
+    check("session_extreme is not recorded for Reversal", "session_extreme" in t.extras, False)
+    check(
+        "session_stop_shares is not recorded for Reversal",
+        "session_stop_shares" in t.extras,
+        False,
+    )
 
-    # close=104 vs PDH=105 -> abs((104-105)/105*100)
-    check("level_stop_pct is a positive magnitude", t.extras["level_stop_pct"], 0.9524)
-    # session high = 107 (set by b1) -> abs((104-107)/107*100)
-    check("session_extreme_pct is a positive magnitude", t.extras["session_extreme_pct"], 2.8037)
-    check("session_open recorded", t.extras["session_open"], 104)
-    check("session_high recorded", t.extras["session_high"], 107)
-    check("session_low recorded", t.extras["session_low"], 104)
+
+def test_notify_pct_fields_are_unsigned_for_short_setups() -> None:
+    """level_stop_pct is a stop's distance -- a trader thinks of that as a
+    positive number regardless of direction, unlike avwap_pct, which stays
+    signed since above/below AVWAP is meaningfully directional."""
+    from astor.core.indicators import SessionIndicators
+
+    ind = SessionIndicators("REV")
+    s = ReversalShort(max_loss_dollars=100.0)
+    curve = _generous_curve()
+
+    t = None
+    for b in _canonical_short_bars():
+        ind.update(b)
+        r = s.on_bar(b, REV_LEVELS, ind, curve)
+        if r is not None:
+            t = r
+    assert t is not None, "expected a fire"
+
+    # entry=106.5 vs the leg extreme=107.7 -> abs((106.5-107.7)/107.7*100)
+    check("level_stop_pct is a positive magnitude", t.extras["level_stop_pct"], 1.1142)
+    check("session_open recorded", t.extras["session_open"], 102.0)
+    check("session_high recorded", t.extras["session_high"], 107.7)
+    check("session_low recorded", t.extras["session_low"], 102.0)
 
 
 def _grading_fixture(**overrides):
-    """A long (U&R) trigger with every grade_trigger factor set to *miss*:
+    """A long (REV-L) trigger with every grade_trigger factor set to *miss*:
     price below session_open, rvol below every tier's threshold, no AVWAP
     extension (avwap unset), fired at minute 200 (outside both the early
     window and the last hour). Grade should come out to the base of 1.
@@ -738,14 +535,15 @@ def _grading_fixture(**overrides):
     avwap = overrides.pop("avwap", None)
     if avwap is not None:
         extras["avwap"] = avwap
+    direction = overrides.pop("direction", "long")
     trigger = Trigger(
         symbol="TEST",
-        setup="U&R",
-        direction=overrides.pop("direction", "long"),
+        setup="REV-L" if direction == "long" else "REV-S",
+        direction=direction,
         trigger_price=overrides.pop("price", 101.0),
         bar_start=OPEN + timedelta(minutes=minute),
         bar_end=OPEN + timedelta(minutes=minute + 1),
-        level_name="PDL",
+        level_name="EXT",
         level_value=100.0,
         extras=extras,
     )
@@ -873,7 +671,7 @@ def test_grade_trigger_floor_clamped_to_one() -> None:
 
 
 def test_grade_trigger_mirrors_for_short_setups() -> None:
-    """O&F needs price *below* open to add, the opposite of U&R."""
+    """A short setup needs price *below* open to add, the opposite of a long."""
     from astor.core.grading import grade_trigger
 
     t, levels, ind = _grading_fixture(direction="short", price=101.0, session_open=102.0)
@@ -885,13 +683,9 @@ def test_grade_trigger_mirrors_for_short_setups() -> None:
 
 def test_scanner_attaches_auto_grade() -> None:
     """Scanner, not Setup, computes auto_grade. A raw Setup.on_bar call
-    (every other test in this file) never sees auto_grade at all."""
-    scanner = Scanner({"TEST": LEVELS}, [UndercutRally])
-
-    b0 = bar(0, 101, 101, 99, 99.5)  # arm
-    scanner.on_bar(b0)
-    b1 = bar(1, 99.5, 101, 99.5, 100.5)  # reclaim -> fire
-    fired = scanner.on_bar(b1)
+    (as in test_trigger_extras_include_notify_fields) never sees it at all."""
+    sc = _rev_scanner(ReversalLong)
+    fired = _feed(sc, _canonical_long_bars())
     assert len(fired) == 1
     check("auto_grade present on a Scanner-fired trigger", "auto_grade" in fired[0].extras, True)
 
@@ -902,12 +696,12 @@ def test_format_trigger_line() -> None:
 
     t = Trigger(
         symbol="ABAT",
-        setup="O&F",
+        setup="REV-S",
         direction="short",
         trigger_price=2.40,
         bar_start=OPEN,
         bar_end=OPEN + timedelta(minutes=1),
-        level_name="PDH",
+        level_name="EXT",
         level_value=2.50,
         extras={
             "auto_grade": 3,
@@ -918,20 +712,14 @@ def test_format_trigger_line() -> None:
             "level_stop_pct": 0.85,
             "level_stop_shares": 417,
             "level_stop_dollars": 1000.80,
-            "session_extreme": 2.55,
-            "session_extreme_pct": 5.23,  # unsigned -- a stop distance, not a direction
-            "session_stop_shares": 196,
-            "session_stop_dollars": 470.40,
         },
     )
     line = _format_trigger_line(t)
     check("headline present", "TRIGGER ABAT" in line, True)
     check("grade shown", "grade 3/4" in line, True)
     check("avwap shown signed", "avwap -3.10%" in line, True)
-    check("level line reads as a magnitude + word, short -> below", "PDH 0.85% below" in line, True)
+    check("level line reads as a magnitude + word, short -> below", "EXT 0.85% below" in line, True)
     check("level position size shown", "417 sh ($1,001)" in line, True)
-    check("session line uses CDH for a short, aligned with PDH", "CDH 5.23% below" in line, True)
-    check("session position size shown", "196 sh ($470)" in line, True)
 
 
 def test_should_notify() -> None:
@@ -946,11 +734,6 @@ def test_should_notify() -> None:
             level_name="EXT", level_value=1.0,
             extras={} if grade is None else {"auto_grade": grade},
         )
-
-    # U&R/O&F: suppressed regardless of grade -- suspended while validating
-    # Reversal live.
-    check("U&R never notifies, even grade 4", _should_notify(trigger_at("U&R", 10, 0, 4)), False)
-    check("O&F never notifies, even grade 4", _should_notify(trigger_at("O&F", 10, 0, 4)), False)
 
     # REV-L/REV-S: notify regardless of grade, cut off at 15:00 ET.
     check(
@@ -969,36 +752,18 @@ def test_should_notify() -> None:
         False,
     )
 
-    # Anything else (a future setup) falls back to the grade threshold.
+    # Anything else (a retired or future setup name) falls back to the grade
+    # threshold -- U&R/O&F's old blanket suppression is gone along with them.
     check(
         "unrecognized setup falls back to grade >= threshold (3 passes)",
-        _should_notify(trigger_at("FAKE", 12, 0, 3)),
+        _should_notify(trigger_at("U&R", 12, 0, 3)),
         True,
     )
     check(
         "unrecognized setup falls back to grade >= threshold (2 fails)",
-        _should_notify(trigger_at("FAKE", 12, 0, 2)),
+        _should_notify(trigger_at("O&F", 12, 0, 2)),
         False,
     )
-
-
-def test_setup_on_bar_defaults_indicators_and_curve_to_none() -> None:
-    """Direct on_bar calls (as every other test in this file makes) must keep
-    working without indicators/curve -- Scanner is the only caller expected
-    to supply them."""
-    s = UndercutRally()
-    s.on_bar(bar(0, 101, 101, 99, 99.5), LEVELS)
-    t = s.on_bar(bar(1, 99.5, 101, 99.5, 100.5), LEVELS)
-    assert t is not None
-    check("avwap is None without indicators", t.extras["avwap"], None)
-    check("rvol is None without indicators/curve", t.extras["rvol"], None)
-    check("avwap_pct is None without indicators", t.extras["avwap_pct"], None)
-    check("session_extreme is None without indicators", t.extras["session_extreme"], None)
-    check("session_stop_shares is None without indicators", t.extras["session_stop_shares"], None)
-    # level_stop_shares/dollars don't need indicators -- PDL and trigger_price
-    # are already known -- so they should still be populated here. close=100.5,
-    # PDL=100 -> $0.50 risk/share, $100 max loss -> 200 shares.
-    check("level_stop_shares still computed from levels alone", t.extras["level_stop_shares"], 200)
 
 
 def test_latest_triggers_spans_sessions_and_supersedes_reruns() -> None:
@@ -1029,14 +794,14 @@ def test_latest_triggers_spans_sessions_and_supersedes_reruns() -> None:
             run_id,
             Trigger(
                 symbol="TEST",
-                setup="U&R",
+                setup="REV-L",
                 direction="long",
                 trigger_price=price,
                 bar_start=session_open,
                 bar_end=session_open + timedelta(minutes=1),
-                level_name="PDL",
+                level_name="EXT",
                 level_value=100.0,
-                extras={"bars_below": 1, "bars_armed": 1, "excursion_adr": 0.2},
+                extras={"leg_size_adr": 1.2},
             ),
             session_open + timedelta(minutes=1),
         )
@@ -1080,12 +845,12 @@ def test_grade_defaults_to_null_and_notes_is_editable() -> None:
         "r1",
         Trigger(
             symbol="TEST",
-            setup="U&R",
+            setup="REV-L",
             direction="long",
             trigger_price=100.1,
             bar_start=OPEN,
             bar_end=OPEN + timedelta(minutes=1),
-            level_name="PDL",
+            level_name="EXT",
             level_value=100.0,
             extras={},
         ),
@@ -1130,12 +895,12 @@ def test_latest_triggers_review_columns_editable_through_the_view() -> None:
         "r1",
         Trigger(
             symbol="TEST",
-            setup="U&R",
+            setup="REV-L",
             direction="long",
             trigger_price=100.1,
             bar_start=OPEN,
             bar_end=OPEN + timedelta(minutes=1),
-            level_name="PDL",
+            level_name="EXT",
             level_value=100.0,
             extras={},
         ),
@@ -1245,14 +1010,14 @@ def test_latest_triggers_includes_live_runs() -> None:
         "live-1",
         Trigger(
             symbol="ABAT",
-            setup="O&F",
+            setup="REV-S",
             direction="short",
             trigger_price=2.40,
             bar_start=session_open,
             bar_end=session_open + timedelta(minutes=1),
-            level_name="PDH",
+            level_name="EXT",
             level_value=2.50,
-            extras={"bars_above": 1, "bars_armed": 1},
+            extras={},
         ),
         session_open + timedelta(minutes=21),
     )
@@ -1287,14 +1052,14 @@ def test_latest_triggers_keeps_live_alongside_the_latest_replay() -> None:
             run_id,
             Trigger(
                 symbol="TEST",
-                setup="U&R",
+                setup="REV-L",
                 direction="long",
                 trigger_price=price,
                 bar_start=session_open,
                 bar_end=session_open + timedelta(minutes=1),
-                level_name="PDL",
+                level_name="EXT",
                 level_value=100.0,
-                extras={"bars_below": 1, "bars_armed": 1},
+                extras={},
             ),
             session_open + timedelta(minutes=1),
         )
@@ -1333,184 +1098,134 @@ def test_store_view_keeps_eastern_time() -> None:
     store.start_run("r1", "replay", {})
     trig = Trigger(
         symbol="TEST",
-        setup="U&R",
+        setup="REV-L",
         direction="long",
         trigger_price=100.5,
         bar_start=OPEN,
         bar_end=OPEN + timedelta(minutes=1),
-        level_name="PDL",
+        level_name="EXT",
         level_value=100.0,
-        extras={"bars_below": 3, "bars_armed": 4, "excursion_adr": 0.15},
+        extras={"leg_size_adr": 1.5},
     )
     store.record("r1", trig, trig.bar_end)
     store.commit()
 
     row = store.conn.execute(
-        "SELECT session, trigger_time, bars_beyond, latency_sec FROM latest_triggers"
+        "SELECT session, trigger_time, leg_size_adr, latency_sec FROM latest_triggers"
     ).fetchone()
     check("session date is ET", row[0], "2026-08-14")
     check("trigger time is ET, not UTC", row[1], "09:30:00")
-    check("bars_beyond coalesced", row[2], 3)
+    check("leg_size_adr passed through", row[2], 1.5)
     # Replay detects at bar completion, so latency is zero by construction.
     check("replay latency is zero", row[3], 0.0)
     check("WAL enabled", store.conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
     store.close()
 
 
-def test_store_view_coalesces_short_setup() -> None:
-    """O&F records the mirrored extras keys; the view must map them too."""
+def test_record_alert_and_alert_detail_view() -> None:
+    """Capitulation alerts and sell-rule track alerts (breakeven/sell) share
+    one table and one view -- kind-specific columns simply read NULL for
+    the other kind's rows, same COALESCE-free "just extract what's there"
+    pattern trigger_detail already uses for U&R/O&F's mirrored key names.
+    Track alerts have no bar_end concept (they're not a completed bar
+    firing a setup) -- that column stays NULL for them, unlike capitulation
+    alerts which always have one.
+    """
     import tempfile
 
     from astor.core.store import TriggerStore
-    from astor.core.types import Trigger
 
     store = TriggerStore(Path(tempfile.mkdtemp()) / "t.db")
-    store.start_run("r1", "replay", {})
-    store.record(
-        "r1",
-        Trigger(
-            symbol="TEST",
-            setup="O&F",
-            direction="short",
-            trigger_price=104.5,
-            bar_start=OPEN,
-            bar_end=OPEN + timedelta(minutes=1),
-            level_name="PDH",
-            level_value=105.0,
-            extras={"bars_above": 2, "bars_armed": 3, "excursion_adr": 0.15},
-        ),
-        OPEN + timedelta(minutes=1),
+    store.start_run("r1", "live", {"session": "2026-08-14"})
+    store.record_alert(
+        "r1", "capitulation", "REV", "long", OPEN, 93.3,
+        OPEN + timedelta(minutes=4, seconds=30),
+        {
+            "leg_extreme": 93.0, "anchor": 98.0, "leg_size_adr": 1.25,
+            "move_rvol": 250_000.0, "ema9_extension_adr": 0.7166,
+        },
+        bar_end=OPEN + timedelta(minutes=5),
+    )
+    store.record_alert(
+        "r1", "breakeven", "REV", "long", OPEN + timedelta(minutes=10), 96.0,
+        OPEN + timedelta(minutes=10, seconds=5),
+        {"entry": 94.0, "stop": 93.0, "peak": 96.0, "r": 1.0, "target_1r": 95.0, "account": "U123"},
     )
     store.commit()
-    row = store.conn.execute(
-        "SELECT bars_beyond, bars_armed, excursion_adr FROM latest_triggers"
-    ).fetchone()
-    check("short-side coalesce", row, (2, 3, 0.15))
+
+    rows = store.conn.execute(
+        "SELECT kind, leg_extreme, entry, bar_end FROM alert_detail ORDER BY kind"
+    ).fetchall()
+    check("two alerts recorded", len(rows), 2)
+    by_kind = {r[0]: r for r in rows}
+    check(
+        "capitulation row has leg_extreme, no entry",
+        by_kind["capitulation"][1:3],
+        (93.0, None),
+    )
+    check(
+        "breakeven row has entry, no leg_extreme",
+        by_kind["breakeven"][1:3],
+        (None, 94.0),
+    )
+    check("track alert has no bar_end", by_kind["breakeven"][3], None)
+    check("capitulation alert has a real bar_end", by_kind["capitulation"][3] is not None, True)
     store.close()
 
 
-def _minute(i: int):
-    return (OPEN + timedelta(minutes=i)).time()
-
-
-def _generous_curve(symbol: str, n: int = 40) -> VolumeCurve:
-    """A curve whose average is tiny at every minute, so any real bar volume
-    trivially clears the RVOL floor -- for tests where RVOL isn't the point."""
-    return VolumeCurve(symbol, sessions=10, cum_volume_by_minute={_minute(i): 1.0 for i in range(n)})
-
-
-def _rev_scanner(
-    setup_cls, prev_close: float = 100.0, adr_pct: float = 4.0, curve: VolumeCurve | None = None
-) -> Scanner:
-    levels = DailyLevels(
-        "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=adr_pct, prev_close=prev_close, adv=100_000_000.0
-    )
-    scanner = Scanner({"REV": levels}, [setup_cls])
-    scanner.curves["REV"] = curve or _generous_curve("REV")
-    return scanner
-
-
-def _feed(scanner: Scanner, bars: list[BarEvent]) -> list:
-    triggers = []
-    for b in bars:
-        triggers.extend(scanner.on_bar(b))
-    return triggers
-
-
-def _leg3_bars(final_close: float = 96.0) -> list[BarEvent]:
-    """A REV-L scenario where anchor (the running session high) never moves
-    past bar 0's high, so it stays pinned at session_open=98.0 -- extreme
-    (session low) settles at 95.0, so leg_size=3.0. Bars 3-8 ramp gently up
-    to `final_close` at elapsed=6 (bar index 8), never dipping below the
-    95.0 extreme, never exceeding 98.0 (which would move the anchor), and
-    never exceeding the 50% retrace line (96.5) along the way.
-    """
-    return [
-        bar(0, 98.0, 98.0, 97.5, 97.8, 50_000, symbol="REV"),  # session open 98.0, high pinned at 98.0
-        bar(1, 97.8, 98.0, 96.0, 96.2, 60_000, symbol="REV"),  # new low
-        bar(2, 96.2, 96.5, 95.0, 95.3, 70_000, symbol="REV"),  # new low -- becomes the leg extreme
-        bar(3, 95.3, 95.6, 95.2, 95.4, 10_000, symbol="REV"),  # retrace 13%, elapsed 1
-        bar(4, 95.4, 95.8, 95.3, 95.6, 10_000, symbol="REV"),  # retrace 20%, elapsed 2
-        bar(5, 95.6, 95.9, 95.4, 95.7, 10_000, symbol="REV"),  # retrace 23%, elapsed 3
-        bar(6, 95.7, 96.0, 95.5, 95.8, 10_000, symbol="REV"),  # retrace 27%, elapsed 4 -- in band, too early
-        bar(7, 95.8, 96.1, 95.6, 95.9, 10_000, symbol="REV"),  # retrace 30%, elapsed 5
-        bar(8, 95.9, 96.2, 95.7, final_close, 10_000, symbol="REV"),  # elapsed 6
-    ]
+# ---------------------------------------------------------------------------
+# Reversal (REV-L/REV-S): leg tracking, capitulation-quality filters, and the
+# capitulation-in-progress alert.
+# ---------------------------------------------------------------------------
 
 
 def test_reversal_long_basic() -> None:
-    curve = VolumeCurve("REV", 10, {time(9, 32): 100_000.0})
-    scanner = _rev_scanner(ReversalLong, curve=curve)
-    triggers = _feed(scanner, _leg3_bars())
+    sc = _rev_scanner(ReversalLong)
+    triggers = _feed(sc, _canonical_long_bars())
     check("exactly one trigger", len(triggers), 1)
     t = triggers[0]
     check("setup", t.setup, "REV-L")
     check("direction", t.direction, "long")
     check("level_name", t.level_name, "EXT")
-    check("level_value is the leg extreme", t.level_value, 95.0)
-    check("trigger_price", t.trigger_price, 96.0)
+    check("level_value is the leg extreme", t.level_value, 93.0)
+    check("trigger_price", t.trigger_price, 94.0)
     check("anchor is session_open (prev_close/gap out of scope)", t.extras["anchor"], 98.0)
-    check("retrace_pct", round(t.extras["retrace_pct"], 1), 33.3)
-    check("retrace_minutes", t.extras["retrace_minutes"], 6.0)
-    check("move_rvol", t.extras["move_rvol"], 1.8)
+    check("leg_size_adr", t.extras["leg_size_adr"], 1.25)
+    check("retrace_pct", t.extras["retrace_pct"], 20.0)
+    check("retrace_via pct, not an EMA9 reclaim", t.extras["retrace_via"], "pct")
+    check("leg_duration_minutes -- anchor (bar 0) to extreme (bar 4)", t.extras["leg_duration_minutes"], 4.0)
+    check("move_rvol", t.extras["move_rvol"], 250_000.0)
+    check("ema9_extension_adr", t.extras["ema9_extension_adr"], 0.7166)
+    check("accel_price recorded (diagnostic only)", t.extras["accel_price"], 1.1667)
+    check("accel_vol recorded (diagnostic only)", t.extras["accel_vol"], 1.0)
     check("reclaim_pct aliases level_stop_pct", t.extras["reclaim_pct"], t.extras["level_stop_pct"])
-    # anchor set at bar 0 (9:30), extreme (95.0) last set at bar 2 (9:32).
-    check("leg_duration_minutes", t.extras["leg_duration_minutes"], 2.0)
 
 
-def test_reversal_long_too_early_does_not_fire() -> None:
-    curve = VolumeCurve("REV", 10, {time(9, 32): 100_000.0})
-    scanner = _rev_scanner(ReversalLong, curve=curve)
-    bars = _leg3_bars()[:8]  # stop at elapsed 5 (in-band, but too early)
-    check("no trigger before 6 minutes elapsed", _feed(scanner, bars), [])
-
-
-def test_reversal_retrace_past_50pct_kills_leg_until_new_extreme() -> None:
-    # Every bar's high is capped at 98.0 throughout (never exceeding bar 0's
-    # high) so the anchor never itself moves during this test -- isolating
-    # the extreme/retrace/dead-leg behavior from the anchor-movement one,
-    # which gets its own test below.
-    scanner = _rev_scanner(ReversalLong)
-    bars = [
-        bar(0, 98.0, 98.0, 97.5, 97.8, 1000, symbol="REV"),
-        bar(1, 97.8, 98.0, 96.0, 96.2, 1000, symbol="REV"),
-        bar(2, 96.2, 96.5, 95.0, 95.3, 1000, symbol="REV"),  # leg1 extreme 95.0 (anchor 98, size 3.0)
-        bar(3, 95.3, 98.0, 95.5, 98.0, 1000, symbol="REV"),  # retrace 100% -- kills leg1
-        bar(4, 98.0, 98.0, 96.0, 96.5, 1000, symbol="REV"),  # back in-band, but dead
-        bar(5, 96.5, 96.8, 96.0, 96.6, 1000, symbol="REV"),
-        bar(6, 96.6, 96.9, 96.0, 96.7, 1000, symbol="REV"),
-        bar(7, 96.7, 97.0, 96.0, 96.8, 1000, symbol="REV"),
-        bar(8, 96.8, 97.1, 96.0, 96.9, 1000, symbol="REV"),  # elapsed 6 since leg1 extreme, still dead
-    ]
-    check("dead leg never fires even in-band past 6 minutes", _feed(scanner, bars), [])
-
-    # A new, deeper low re-arms a fresh leg (own anchor reused, own clock, own extreme).
-    more_bars = [
-        bar(9, 96.9, 97.0, 94.0, 94.3, 1000, symbol="REV"),  # new leg2 extreme 94.0 (anchor 98, size 4.0)
-        bar(10, 94.3, 94.7, 94.2, 94.6, 1000, symbol="REV"),
-        bar(11, 94.6, 95.1, 94.5, 95.0, 1000, symbol="REV"),
-        bar(12, 95.0, 95.4, 94.8, 95.3, 1000, symbol="REV"),
-        bar(13, 95.3, 95.7, 95.0, 95.6, 1000, symbol="REV"),
-        bar(14, 95.6, 96.0, 95.2, 95.9, 1000, symbol="REV"),
-        bar(15, 95.9, 96.1, 95.4, 96.0, 1000, symbol="REV"),  # retrace 50%, elapsed 6 -- fires
-    ]
-    triggers = _feed(scanner, more_bars)
-    check("exactly one trigger for leg2", len(triggers), 1)
+def test_reversal_short_mirrors_long() -> None:
+    sc = _rev_scanner(ReversalShort)
+    triggers = _feed(sc, _canonical_short_bars())
+    check("exactly one trigger", len(triggers), 1)
     t = triggers[0]
-    check("fires on the new, deeper extreme", t.level_value, 94.0)
-    check("anchor unchanged (not recomputed, still session_open)", t.extras["anchor"], 98.0)
-    check("trigger price", t.trigger_price, 96.0)
+    check("setup", t.setup, "REV-S")
+    check("direction", t.direction, "short")
+    check("level_value is the leg extreme", t.level_value, 107.7)
+    check("trigger_price", t.trigger_price, 106.5)
+    check("anchor is session_open (prev_close/gap out of scope)", t.extras["anchor"], 102.0)
+    check("retrace_pct", round(t.extras["retrace_pct"], 4), 21.0526)
 
 
 def test_reversal_anchor_ignores_prev_close() -> None:
     # prev_close set far from session_open, on both sides -- anchor (98.0,
     # the running session high, which happens to stay pinned at the open in
     # this bar shape) must be unaffected regardless, since prev_close/gap
-    # play no part in this setup's anchor at all anymore.
+    # play no part in this setup's anchor at all.
     for prev_close in (90.0, 110.0):
-        curve = VolumeCurve("REV", 10, {time(9, 32): 100_000.0})
-        scanner = _rev_scanner(ReversalLong, prev_close=prev_close, curve=curve)
-        triggers = _feed(scanner, _leg3_bars())
+        levels = DailyLevels(
+            "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=prev_close, adv=100_000_000.0
+        )
+        sc = Scanner({"REV": levels}, [ReversalLong])
+        sc.curves["REV"] = _generous_curve()
+        triggers = _feed(sc, _canonical_long_bars())
         check(f"exactly one trigger (prev_close={prev_close})", len(triggers), 1)
         check(
             f"anchor unaffected by prev_close={prev_close}",
@@ -1519,9 +1234,180 @@ def test_reversal_anchor_ignores_prev_close() -> None:
         )
 
 
+def test_reversal_requires_min_leg_adr() -> None:
+    # adr_pct=20 -> ADR=$20.00, so the default 1.0x-ADR floor (=20.0) exceeds
+    # the 5.0 leg this scenario forms -- same bars as the otherwise-passing
+    # basic case, isolating the ADR floor specifically.
+    levels = DailyLevels(
+        "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=20.0, prev_close=100.0, adv=100_000_000.0
+    )
+    sc = Scanner({"REV": levels}, [ReversalLong])
+    sc.curves["REV"] = _generous_curve()
+    check("leg too small relative to ADR never fires", _feed(sc, _canonical_long_bars()), [])
+
+
+def test_reversal_requires_rvol_floor() -> None:
+    # Average volume at the extreme minute set absurdly high, so the frozen
+    # move_rvol comes in far below the 2.0x default floor for this ADV tier
+    # -- same bars as the otherwise-passing basic case, isolating the RVOL
+    # floor.
+    demanding_curve = VolumeCurve(
+        "REV", sessions=10,
+        cum_volume_by_minute={(OPEN + timedelta(minutes=4)).timetz().replace(tzinfo=None): 10_000_000.0},
+    )
+    sc = _rev_scanner(ReversalLong, curve=demanding_curve)
+    check("thin RVOL relative to average never fires", _feed(sc, _canonical_long_bars()), [])
+
+
+def test_reversal_requires_min_leg_minutes() -> None:
+    """A leg that built in only 2 minutes never fires under the default
+    4-minute floor, even though it clears every other filter -- but does
+    fire once that floor is explicitly loosened."""
+    fast_bars = [
+        bar(0, 98.0, 98.0, 97.5, 97.8, 50_000, symbol="REV"),
+        bar(1, 97.8, 97.9, 95.0, 95.3, 50_000, symbol="REV"),
+        bar(2, 95.3, 95.4, 93.0, 93.3, 50_000, symbol="REV"),  # extreme at minute 2 -- leg=5.0
+        bar(3, 93.3, 93.8, 93.1, 94.0, 10_000, symbol="REV"),  # retrace 20%, elapsed 1
+    ]
+    default_sc = _rev_scanner(ReversalLong)
+    check(
+        "2-minute leg never fires under the default 4-minute floor",
+        _feed(default_sc, fast_bars),
+        [],
+    )
+
+    levels = DailyLevels(
+        "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
+    )
+    loose_sc = Scanner({"REV": levels}, [ReversalLong], {"REV-L": {"min_leg_minutes": 0.0}})
+    loose_sc.curves["REV"] = _generous_curve()
+    triggers = _feed(loose_sc, fast_bars)
+    check("same leg fires once the floor is loosened", len(triggers), 1)
+    check("leg_duration_minutes", triggers[0].extras["leg_duration_minutes"], 2.0)
+
+
+def test_reversal_min_confirm_minutes_still_works_when_set() -> None:
+    """min_confirm_minutes defaults to 0 (the very next bar can confirm),
+    but the knob still works when explicitly set -- a same-bar-ish retrace
+    is rejected until enough time has passed since the extreme."""
+    bars = _canonical_long_bars() + [
+        bar(6, 94.0, 94.2, 93.9, 94.1, 5_000, symbol="REV"),  # elapsed 2 minutes
+    ]
+    levels = DailyLevels(
+        "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
+    )
+
+    sc = Scanner({"REV": levels}, [ReversalLong], {"REV-L": {"min_confirm_minutes": 2.0}})
+    sc.curves["REV"] = _generous_curve()
+    check(
+        "bar 5 (elapsed 1 minute) too early for a 2-minute confirm wait",
+        _feed(sc, bars[:6]),
+        [],
+    )
+
+    sc2 = Scanner({"REV": levels}, [ReversalLong], {"REV-L": {"min_confirm_minutes": 2.0}})
+    sc2.curves["REV"] = _generous_curve()
+    triggers = _feed(sc2, bars)
+    check("bar 6 (elapsed 2 minutes) confirms", len(triggers), 1)
+    check("retrace_minutes", triggers[0].extras["retrace_minutes"], 2.0)
+
+
+def test_reversal_retrace_past_50pct_kills_leg_until_new_extreme() -> None:
+    # Every bar's high is capped at 98.0 throughout (never exceeding bar 0's
+    # high) so the anchor never itself moves during this test -- isolating
+    # the extreme/retrace/dead-leg behavior from anchor movement.
+    sc = _rev_scanner(ReversalLong)
+    bars = [
+        bar(0, 98.0, 98.0, 97.5, 97.8, 1000, symbol="REV"),
+        bar(1, 97.8, 98.0, 96.0, 96.2, 1000, symbol="REV"),
+        bar(2, 96.2, 96.5, 95.0, 95.3, 1000, symbol="REV"),
+        bar(3, 95.3, 96.0, 94.0, 94.3, 1000, symbol="REV"),
+        bar(4, 94.3, 95.0, 93.0, 93.3, 1000, symbol="REV"),  # leg1 extreme 93.0 (anchor 98, size 5.0)
+        bar(5, 93.3, 98.0, 93.5, 98.0, 1000, symbol="REV"),  # retrace 100% -- kills leg1
+        bar(6, 98.0, 98.0, 96.0, 96.5, 1000, symbol="REV"),  # back in-band, but dead
+        bar(7, 96.5, 96.8, 96.0, 96.6, 1000, symbol="REV"),
+        bar(8, 96.6, 96.9, 96.0, 96.7, 1000, symbol="REV"),
+        bar(9, 96.7, 97.0, 96.0, 96.8, 1000, symbol="REV"),
+        bar(10, 96.8, 97.1, 96.0, 96.9, 1000, symbol="REV"),
+    ]
+    check("dead leg never fires even back in-band", _feed(sc, bars), [])
+
+    # A new, deeper low re-arms a fresh leg (own anchor reused, own clock,
+    # own extreme).
+    more_bars = [
+        bar(11, 96.9, 97.0, 94.0, 94.3, 1000, symbol="REV"),
+        bar(12, 94.3, 94.7, 92.0, 92.3, 1000, symbol="REV"),
+        bar(13, 92.3, 92.7, 90.0, 90.3, 1000, symbol="REV"),
+        bar(14, 90.3, 90.6, 89.0, 89.3, 1000, symbol="REV"),  # new leg2 extreme 89.0 (anchor 98, size 9.0)
+        bar(15, 89.3, 90.5, 89.1, 90.0, 1000, symbol="REV"),  # retrace 11%, elapsed 1
+    ]
+    triggers = _feed(sc, more_bars)
+    check("exactly one trigger for leg2", len(triggers), 1)
+    t = triggers[0]
+    check("fires on the new, deeper extreme", t.level_value, 89.0)
+    check("anchor unchanged (not recomputed, still session_open)", t.extras["anchor"], 98.0)
+    check("leg_duration_minutes", t.extras["leg_duration_minutes"], 14.0)
+
+
+def test_reversal_leg_bars_reset_on_rearm_after_dead_leg() -> None:
+    """Regression test for a real bug found reviewing SEDG's 2026-09-10
+    10:59 REV-S trigger: a leg that died (retrace > 50%) and later re-armed
+    with a deeper extreme, anchor unchanged throughout, must compute
+    accel_price/accel_vol only from the *new* push's own bars -- not mixed
+    with a stale leftover bar from the earlier, unrelated, dead push. Before
+    the fix, _leg_bars only reset on a new anchor, so the dead leg's last
+    _leg_bars entry (here, a single huge-volume bar) survived into the
+    revived leg's "earlier" bucket and produced a misleadingly low ratio.
+    """
+    sc = _rev_scanner(ReversalLong)
+    bars = [
+        # leg1: huge, distinctive volume so any leakage into leg2 is obvious.
+        bar(0, 98.0, 98.0, 97.5, 97.8, 500_000, symbol="REV"),
+        bar(1, 97.8, 98.0, 96.0, 96.2, 500_000, symbol="REV"),
+        bar(2, 96.2, 96.5, 95.0, 95.3, 500_000, symbol="REV"),
+        bar(3, 95.3, 96.0, 94.0, 94.3, 500_000, symbol="REV"),
+        bar(4, 94.3, 95.0, 93.0, 93.3, 500_000, symbol="REV"),  # leg1 extreme 93.0 (anchor 98, size 5.0)
+        bar(5, 93.3, 98.0, 93.5, 98.0, 500_000, symbol="REV"),  # retrace 100% -- kills leg1
+        bar(6, 98.0, 98.0, 96.0, 96.5, 500_000, symbol="REV"),  # dead, back in-band
+        bar(7, 96.5, 96.8, 96.0, 96.6, 500_000, symbol="REV"),
+        bar(8, 96.6, 96.9, 96.0, 96.7, 500_000, symbol="REV"),
+        bar(9, 96.7, 97.0, 96.0, 96.8, 500_000, symbol="REV"),
+        bar(10, 96.8, 97.1, 96.0, 96.9, 500_000, symbol="REV"),
+        # leg2: same anchor (98), a fresh deeper extreme with small, distinct,
+        # steadily rising volume -- this is the only data accel should see.
+        bar(11, 96.9, 97.0, 92.0, 92.3, 5_000, symbol="REV"),
+        bar(12, 92.3, 92.7, 90.5, 90.8, 10_000, symbol="REV"),
+        bar(13, 90.8, 91.0, 89.0, 89.3, 20_000, symbol="REV"),
+        bar(14, 89.3, 89.6, 87.5, 87.8, 30_000, symbol="REV"),
+        bar(15, 87.8, 88.0, 86.0, 86.3, 40_000, symbol="REV"),  # leg2 extreme 86.0 (anchor 98, size 12.0)
+        bar(16, 86.3, 87.5, 86.1, 87.4, 5_000, symbol="REV"),  # retrace 11.7%, fires
+    ]
+    triggers = _feed(sc, bars)
+    check("exactly one trigger, off leg2", len(triggers), 1)
+    t = triggers[0]
+    check("fires on leg2's extreme", t.level_value, 86.0)
+    setup = sc._state[("REV", "REV-L")]
+    # leg2's 5 push bars, plus the retrace bar that fired (16) -- _leg_bars
+    # keeps accumulating past the extreme since a pause and the start of a
+    # retrace look identical in real time; accel filters back down to just
+    # the bars at-or-before extreme_at (see push_bars in on_bar), which is
+    # what the accel_vol assertion below actually exercises. Either way,
+    # none of leg1's stale 500k-volume bars are present.
+    check(
+        "leg_bars holds only leg2's bars -- none of leg1's",
+        [b.volume for b in setup._leg_bars],
+        [5_000, 10_000, 20_000, 30_000, 40_000, 5_000],
+    )
+    # recent = mean(20k,30k,40k)=30k, earlier = mean(5k,10k)=7.5k -> 4.0.
+    # Before the fix, "earlier" picked up a single 500k-volume leftover bar
+    # from leg1, producing a ratio near-zero instead.
+    check("accel_vol computed only from leg2's own bars", t.extras["accel_vol"], 4.0)
+
+
 def _cdna_style_bars() -> list[BarEvent]:
-    """REV-S leg: pre-leg low at bar 2 (9:32), peak at bar 6 (9:36), fires
-    at bar 12 on a 32% retrace of the 96.0-106.0 leg."""
+    """REV-S leg: pre-leg low at bar 2 (9:32), peak at bar 6 (9:36). Under
+    the new looser defaults this now fires at bar 7 (a 15% retrace already
+    clears the 10% floor), not bar 12 as it did under the old 25% floor."""
     return [
         bar(0, 100.0, 100.0, 99.0, 99.5, 1000, symbol="REV"),  # session open 100.0
         bar(1, 99.5, 99.5, 97.0, 97.5, 1000, symbol="REV"),  # anchor moves to 97.0
@@ -1530,12 +1416,12 @@ def _cdna_style_bars() -> list[BarEvent]:
         bar(4, 100.2, 102.0, 100.0, 101.8, 1000, symbol="REV"),  # new extreme 102.0
         bar(5, 101.8, 104.0, 101.5, 103.8, 1000, symbol="REV"),  # new extreme 104.0
         bar(6, 103.8, 106.0, 103.5, 105.7, 1000, symbol="REV"),  # new extreme 106.0 -- the leg's peak
-        bar(7, 105.7, 105.5, 104.0, 104.5, 1000, symbol="REV"),  # retrace 15%, elapsed 1
-        bar(8, 104.5, 105.0, 103.5, 104.0, 1000, symbol="REV"),  # retrace 20%, elapsed 2
-        bar(9, 104.0, 104.5, 103.0, 103.6, 1000, symbol="REV"),  # retrace 24%, elapsed 3
-        bar(10, 103.6, 104.0, 102.8, 103.3, 1000, symbol="REV"),  # retrace 27%, elapsed 4
-        bar(11, 103.3, 103.8, 102.5, 103.0, 1000, symbol="REV"),  # retrace 30%, elapsed 5
-        bar(12, 103.0, 103.5, 102.2, 102.8, 1000, symbol="REV"),  # retrace 32%, elapsed 6 -- fires
+        bar(7, 105.7, 105.5, 104.0, 104.5, 1000, symbol="REV"),  # retrace 15%, elapsed 1 -- fires
+        bar(8, 104.5, 105.0, 103.5, 104.0, 1000, symbol="REV"),
+        bar(9, 104.0, 104.5, 103.0, 103.6, 1000, symbol="REV"),
+        bar(10, 103.6, 104.0, 102.8, 103.3, 1000, symbol="REV"),
+        bar(11, 103.3, 103.8, 102.5, 103.0, 1000, symbol="REV"),
+        bar(12, 103.0, 103.5, 102.2, 102.8, 1000, symbol="REV"),
     ]
 
 
@@ -1543,13 +1429,14 @@ def test_reversal_short_anchor_shifts_to_pre_leg_low() -> None:
     # The CDNA case that motivated this: price dips right after the open,
     # *before* the real up-leg (the one REV-S actually tracks) begins. The
     # anchor must be that pre-leg low (96.0), not session_open (100.0).
-    scanner = _rev_scanner(ReversalShort)
-    triggers = _feed(scanner, _cdna_style_bars())
+    sc = _rev_scanner(ReversalShort)
+    triggers = _feed(sc, _cdna_style_bars())
     check("exactly one trigger", len(triggers), 1)
     t = triggers[0]
+    check("fires at bar 7, the first bar clearing the 10% floor", t.bar_start, OPEN + timedelta(minutes=7))
     check("level_value is the leg extreme (session high)", t.level_value, 106.0)
     check("anchor is the pre-leg low, not session_open", t.extras["anchor"], 96.0)
-    check("retrace_pct off the pre-leg-low leg (10.0 wide)", round(t.extras["retrace_pct"], 1), 32.0)
+    check("retrace_pct off the pre-leg-low leg (10.0 wide)", t.extras["retrace_pct"], 15.0)
     check("leg_duration_minutes (bar 2 to bar 6)", t.extras["leg_duration_minutes"], 4.0)
 
 
@@ -1566,15 +1453,15 @@ def test_reversal_leg_timing_correct_for_symbol_added_mid_session() -> None:
     # an identical trigger to the fully-live version.
     bars = _cdna_style_bars()
 
-    baseline_scanner = _rev_scanner(ReversalShort)
-    baseline = _feed(baseline_scanner, bars)[0]
+    baseline_sc = _rev_scanner(ReversalShort)
+    baseline = _feed(baseline_sc, bars)[0]
 
-    scanner = _rev_scanner(ReversalShort)
+    sc = _rev_scanner(ReversalShort)
     for b in bars[:3]:  # backfilled -- establishes the pre-leg low, bars 0-2
-        scanner.backfill_bar(b)
+        sc.backfill_bar(b)
     triggers = []
     for b in bars[3:]:  # "joined" here -- setup.on_bar only sees these
-        triggers.extend(scanner.on_bar(b))
+        triggers.extend(sc.on_bar(b))
 
     check("exactly one trigger", len(triggers), 1)
     t = triggers[0]
@@ -1598,8 +1485,9 @@ def test_reversal_leg_timing_correct_for_symbol_added_mid_session() -> None:
 def test_reversal_long_anchor_shifts_to_pre_leg_high() -> None:
     # Mirror of the above: price ticks up right after the open, before the
     # real down-leg begins. The anchor must be that pre-leg high (104.0),
-    # not session_open (100.0).
-    scanner = _rev_scanner(ReversalLong)
+    # not session_open (100.0). Fires at bar 7 (12% retrace) under the new
+    # 10% floor, not bar 12 as it did under the old 25% floor.
+    sc = _rev_scanner(ReversalLong)
     bars = [
         bar(0, 100.0, 101.0, 100.0, 100.5, 1000, symbol="REV"),  # session open 100.0
         bar(1, 100.5, 103.0, 100.2, 102.8, 1000, symbol="REV"),  # anchor moves to 103.0
@@ -1608,64 +1496,263 @@ def test_reversal_long_anchor_shifts_to_pre_leg_high() -> None:
         bar(4, 100.0, 100.2, 98.0, 98.3, 1000, symbol="REV"),  # new extreme 98.0
         bar(5, 98.3, 98.5, 96.0, 96.3, 1000, symbol="REV"),  # new extreme 96.0
         bar(6, 96.3, 96.5, 94.0, 94.3, 1000, symbol="REV"),  # new extreme 94.0 -- the leg's trough
-        bar(7, 94.3, 95.5, 94.2, 95.2, 1000, symbol="REV"),  # retrace 12%, elapsed 1
-        bar(8, 95.2, 96.0, 94.5, 95.8, 1000, symbol="REV"),  # retrace 18%, elapsed 2
-        bar(9, 95.8, 96.3, 94.8, 96.0, 1000, symbol="REV"),  # retrace 20%, elapsed 3
-        bar(10, 96.0, 96.6, 95.0, 96.3, 1000, symbol="REV"),  # retrace 23%, elapsed 4
-        bar(11, 96.3, 97.0, 95.2, 96.8, 1000, symbol="REV"),  # retrace 28%, elapsed 5
-        bar(12, 96.8, 97.3, 95.5, 97.0, 1000, symbol="REV"),  # retrace 30%, elapsed 6 -- fires
+        bar(7, 94.3, 95.5, 94.2, 95.2, 1000, symbol="REV"),  # retrace 12%, elapsed 1 -- fires
+        bar(8, 95.2, 96.0, 94.5, 95.8, 1000, symbol="REV"),
+        bar(9, 95.8, 96.3, 94.8, 96.0, 1000, symbol="REV"),
+        bar(10, 96.0, 96.6, 95.0, 96.3, 1000, symbol="REV"),
+        bar(11, 96.3, 97.0, 95.2, 96.8, 1000, symbol="REV"),
+        bar(12, 96.8, 97.3, 95.5, 97.0, 1000, symbol="REV"),
     ]
-    triggers = _feed(scanner, bars)
+    triggers = _feed(sc, bars)
     check("exactly one trigger", len(triggers), 1)
     t = triggers[0]
+    check("fires at bar 7, the first bar clearing the 10% floor", t.bar_start, OPEN + timedelta(minutes=7))
     check("level_value is the leg extreme (session low)", t.level_value, 94.0)
     check("anchor is the pre-leg high, not session_open", t.extras["anchor"], 104.0)
-    check("retrace_pct off the pre-leg-high leg (10.0 wide)", round(t.extras["retrace_pct"], 1), 30.0)
+    check("retrace_pct off the pre-leg-high leg (10.0 wide)", t.extras["retrace_pct"], 12.0)
     # anchor last set at bar 2 (9:32), extreme (94.0) last set at bar 6 (9:36).
     check("leg_duration_minutes", t.extras["leg_duration_minutes"], 4.0)
 
 
-def test_reversal_requires_min_leg_adr() -> None:
-    # adr_pct=20 -> ADR=20.0, so the required 0.5*ADR=10.0 floor exceeds the
-    # 3.0 leg this scenario forms -- should never fire, same bars as the
-    # otherwise-passing basic case (isolating the ADR floor specifically).
-    curve = VolumeCurve("REV", 10, {time(9, 32): 100_000.0})
-    scanner = _rev_scanner(ReversalLong, adr_pct=20.0, curve=curve)
-    check("leg too small relative to ADR never fires", _feed(scanner, _leg3_bars()), [])
+def _slow_converge_bars() -> list[BarEvent]:
+    """A leg built slowly enough (30 minutes) that the 9EMA has time to
+    converge close to price -- unlike a fast capitulation-style crash,
+    where the EMA lags far behind (see test_reversal_long_basic's much
+    bigger ema9_extension_adr for the same-shaped fast leg). This is what
+    lets a small bounce reclaim the EMA well before a 10% retrace, and lets
+    the ema9_extension_adr filter have something meaningful to reject.
+    """
+    bars = [bar(0, 100.0, 100.5, 99.8, 100.0, 50_000, symbol="REV")]
+    for i, c in enumerate([98.0, 96.5, 95.2, 94.6], start=1):
+        bars.append(bar(i, c + 0.3, c + 0.3, c - 0.05, c, 50_000, symbol="REV"))
+    for i in range(5, 30):  # flat, letting ema9 converge toward 94.6
+        bars.append(bar(i, 94.6, 94.65, 94.55, 94.6, 50_000, symbol="REV"))
+    bars.append(bar(30, 94.6, 94.6, 94.5, 94.55, 50_000, symbol="REV"))  # extreme 94.5
+    bars.append(bar(31, 94.55, 95.0, 94.5, 94.9, 10_000, symbol="REV"))  # small bounce
+    return bars
 
 
-def test_reversal_requires_rvol_floor() -> None:
-    # Average volume at the extreme minute set absurdly high, so the frozen
-    # move_rvol comes in far below the 1.5x default floor -- same bars as
-    # the otherwise-passing basic case, isolating the RVOL floor.
-    curve = VolumeCurve("REV", 10, {time(9, 32): 10_000_000.0})
-    scanner = _rev_scanner(ReversalLong, curve=curve)
-    check("thin RVOL relative to average never fires", _feed(scanner, _leg3_bars()), [])
-
-
-def test_reversal_short_mirrors_long() -> None:
-    # Bar 0's low is pinned at the open (102.0, never below it) so the
-    # anchor (running session low, for REV-S) never itself moves.
-    scanner = _rev_scanner(ReversalShort)
-    bars = [
-        bar(0, 102.0, 102.5, 102.0, 102.2, 1000, symbol="REV"),  # session open 102.0, low pinned
-        bar(1, 102.2, 104.0, 102.0, 103.8, 1000, symbol="REV"),  # new high
-        bar(2, 103.8, 105.0, 103.5, 104.7, 1000, symbol="REV"),  # new high -- leg extreme 105.0
-        bar(3, 104.7, 104.8, 104.4, 104.6, 1000, symbol="REV"),  # retrace 13%, elapsed 1
-        bar(4, 104.6, 104.6, 104.2, 104.4, 1000, symbol="REV"),  # retrace 20%, elapsed 2
-        bar(5, 104.4, 104.5, 104.1, 104.3, 1000, symbol="REV"),  # retrace 23%, elapsed 3
-        bar(6, 104.3, 104.4, 104.0, 104.2, 1000, symbol="REV"),  # retrace 27%, elapsed 4
-        bar(7, 104.2, 104.3, 103.9, 104.1, 1000, symbol="REV"),  # retrace 30%, elapsed 5
-        bar(8, 104.1, 104.2, 103.8, 104.0, 1000, symbol="REV"),  # retrace 33%, elapsed 6 -- fires
-    ]
-    triggers = _feed(scanner, bars)
+def test_reversal_retrace_via_ema9_reclaim_below_pct_floor() -> None:
+    """A bounce that reclaims the 9EMA fires even though the retrace itself
+    is well under the 10% floor -- the OR side of the retrace-or-reclaim
+    condition. Isolated from the separate ema9_extension_adr floor (which
+    this same slow-building leg fails -- see the next test) via an explicit
+    override, since that filter is a distinct question ("was the move
+    extended enough to begin with") from this one ("has price come back").
+    """
+    levels = DailyLevels(
+        "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
+    )
+    sc = Scanner({"REV": levels}, [ReversalLong], {"REV-L": {"min_ema9_extension_adr": 0.0}})
+    sc.curves["REV"] = _generous_curve()
+    triggers = _feed(sc, _slow_converge_bars())
     check("exactly one trigger", len(triggers), 1)
     t = triggers[0]
-    check("setup", t.setup, "REV-S")
-    check("direction", t.direction, "short")
-    check("level_value is the leg extreme (session high)", t.level_value, 105.0)
-    check("anchor is session_open (prev_close/gap out of scope)", t.extras["anchor"], 102.0)
-    check("retrace_pct", round(t.extras["retrace_pct"], 1), 33.3)
+    check("retrace_pct is well under the 10% floor", t.extras["retrace_pct"], 6.6667)
+    check("fired via the EMA9 reclaim, not the pct floor", t.extras["retrace_via"], "ema9_reclaim")
+
+
+def test_reversal_requires_min_ema9_extension() -> None:
+    """The same slow-building leg (EMA9 has had time to converge close to
+    price) fails to fire under the default 0.05-ADR extension floor, even
+    though the retrace-or-reclaim condition is already satisfied."""
+    sc = _rev_scanner(ReversalLong)
+    check(
+        "leg not extended enough from its own 9EMA never fires",
+        _feed(sc, _slow_converge_bars()),
+        [],
+    )
+
+
+def test_reversal_ignores_retrace_against_a_stale_extreme() -> None:
+    """Regression test for a real bug found reviewing SEDG's 2026-09-10
+    REV-S leg: while the anchor is still setting fresh extremes of its own
+    (session low dropping bar after bar) and the *extreme* hasn't been
+    refreshed since before that started, retrace_pct measured against that
+    stale, disconnected extreme is arithmetic noise, not a real
+    retracement -- a close sitting near the ever-deepening anchor reads as
+    a huge "retrace" purely because the stale extreme is far away, killing
+    the leg over and over for no real reason. The fix: don't evaluate
+    retrace/death at all until extreme_at is more recent than anchor_at --
+    i.e. until a genuine push from the current anchor exists.
+
+    This is deliberately about retrace/death only, not _leg_bars: by the
+    trader's own call, the stale extreme here is the *other* setup's
+    territory (REV-L's leg down), not a reason to exclude these bars from
+    REV-S's own accel sample -- accel_price/accel_vol are meant to cover
+    the same anchor-to-extreme span leg_duration_minutes reports, so these
+    bars still accumulate in _leg_bars normally; only the
+    death-by-stale-arithmetic is what gets suppressed.
+    """
+    sc = _rev_scanner(ReversalShort)
+    bars = [
+        bar(0, 100.0, 106.0, 99.0, 100.5, 50_000, symbol="REV"),  # extreme=106 (stale), anchor=99
+        bar(1, 100.5, 101.0, 98.0, 99.5, 50_000, symbol="REV"),  # anchor -> 98
+        bar(2, 99.5, 99.6, 97.0, 97.5, 50_000, symbol="REV"),  # anchor -> 97
+        bar(3, 97.5, 97.6, 95.0, 96.0, 50_000, symbol="REV"),  # anchor -> 95
+        # Neither boundary moves -- close (96.5) sits near the anchor (95),
+        # far from the stale extreme (106). Old code: retrace ~86%, dead.
+        bar(4, 96.0, 97.0, 95.2, 96.5, 50_000, symbol="REV"),
+        bar(5, 96.5, 96.6, 93.0, 93.5, 50_000, symbol="REV"),  # anchor -> 93
+        # Same shape again -- old code would have killed the leg a second time.
+        bar(6, 93.5, 94.0, 93.2, 93.8, 50_000, symbol="REV"),
+    ]
+    trace: dict[str, list[dict]] = {}
+    for b in bars:
+        sc.on_bar(b, trace=trace)
+    check(
+        "no phantom 'leg dead' events while the anchor is still catching up",
+        [e["text"] for e in trace["REV-S"] if "dead" in e["text"]],
+        [],
+    )
+    setup = sc._state[("REV", "REV-S")]
+    # bar4 (appended after bar3's anchor move) and bar6 (appended after
+    # bar5's) both survive -- neither was ever "dead", so neither gets
+    # discarded, unlike the pre-existing anchor-move resets that keep
+    # wiping bars 0-3 clean as the anchor keeps deepening.
+    check(
+        "the stale-extreme candidate bars (4, 6) still accumulate normally",
+        [b.volume for b in setup._leg_bars],
+        [50_000, 50_000],
+    )
+
+    # A genuinely fresh high arrives -- since the anchor hasn't moved since
+    # bar 5 and nothing here was ever really dead, this extends the same
+    # leg rather than resetting it.
+    fired7 = sc.on_bar(bar(7, 93.8, 107.0, 93.5, 106.5, 5_000, symbol="REV"), trace=trace)
+    check("no trigger yet (just a fresh extreme, no retrace checked)", fired7, [])
+    check(
+        "leg_bars keeps accumulating across the same anchor's whole span",
+        [b.volume for b in setup._leg_bars],
+        [50_000, 50_000, 5_000],
+    )
+
+    # And a real retrace against this genuine extreme still correctly dies.
+    fired8 = sc.on_bar(bar(8, 106.5, 106.6, 95.0, 95.5, 5_000, symbol="REV"), trace=trace)
+    check("a real retrace past max still kills the leg", fired8, [])
+    check(
+        "this time the death is real, not stale-arithmetic noise",
+        any("dead" in e["text"] for e in trace["REV-S"] if e["time"].strftime("%H:%M") == "09:38"),
+        True,
+    )
+
+
+def test_reversal_meets_ur_condition_flag() -> None:
+    """meets_ur_condition (REV-L) is a recorded diagnostic against PDL --
+    the retired U&R's own breach+reclaim condition -- not a filter."""
+    levels_true = DailyLevels(
+        "REV", date(2026, 8, 13), pdh=0.0, pdl=93.5, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
+    )
+    sc = Scanner({"REV": levels_true}, [ReversalLong])
+    sc.curves["REV"] = _generous_curve()
+    t = _feed(sc, _canonical_long_bars())[0]
+    check(
+        "extreme (93.0) < PDL (93.5) and close (94.0) > PDL -> True",
+        t.extras["meets_ur_condition"],
+        True,
+    )
+
+    levels_false = DailyLevels(
+        "REV", date(2026, 8, 13), pdh=0.0, pdl=90.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
+    )
+    sc2 = Scanner({"REV": levels_false}, [ReversalLong])
+    sc2.curves["REV"] = _generous_curve()
+    t2 = _feed(sc2, _canonical_long_bars())[0]
+    check(
+        "extreme (93.0) is not below PDL (90.0) -> False",
+        t2.extras["meets_ur_condition"],
+        False,
+    )
+
+
+def test_reversal_meets_of_condition_flag() -> None:
+    """meets_of_condition (REV-S) mirrors meets_ur_condition against PDH."""
+    levels = DailyLevels(
+        "REV", date(2026, 8, 13), pdh=107.0, pdl=0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
+    )
+    sc = Scanner({"REV": levels}, [ReversalShort])
+    sc.curves["REV"] = _generous_curve()
+    t = _feed(sc, _canonical_short_bars())[0]
+    check(
+        "extreme (107.7) > PDH (107.0) and close (106.5) < PDH -> True",
+        t.extras["meets_of_condition"],
+        True,
+    )
+
+
+def test_capitulation_alert_fires_once_per_deepening_extreme() -> None:
+    """A leg already clearing the trigger's own leg-quality bar (size,
+    duration, volume, EMA extension) gets a one-time alert while it is
+    still extending -- not on every bar, and not on a pure retrace bar,
+    only again if the extreme goes on to deepen further.
+    """
+    sc = _rev_scanner(ReversalLong)
+    bars = _canonical_long_bars() + [
+        bar(6, 94.0, 94.2, 93.9, 94.1, 5_000, symbol="REV"),  # more retrace, no boundary move
+        bar(7, 94.1, 94.3, 91.0, 91.3, 50_000, symbol="REV"),  # deeper extreme -- alerts again
+    ]
+    seen = []
+    for b in bars:
+        sc.on_bar(b)
+        seen.append(len(sc.pop_capitulation_alerts()))
+    check(
+        "alerts only at the extreme bar (minute 4) and the deeper one (minute 7)",
+        seen,
+        [0, 0, 0, 0, 1, 0, 0, 1],
+    )
+    check("full-history list accumulates both", len(sc.capitulation_alerts), 2)
+    check("first alert's leg matches the first extreme", sc.capitulation_alerts[0].leg_extreme, 93.0)
+    check("second alert's leg matches the deeper extreme", sc.capitulation_alerts[1].leg_extreme, 91.0)
+
+
+def test_capitulation_alert_gated_by_leg_quality() -> None:
+    """The alert requires the same leg-size, RVOL, and duration floors the
+    final trigger does -- reusing the fixtures that isolate each of those
+    filters above."""
+    levels_wide_adr = DailyLevels(
+        "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=20.0, prev_close=100.0, adv=100_000_000.0
+    )
+    sc_adr = Scanner({"REV": levels_wide_adr}, [ReversalLong])
+    sc_adr.curves["REV"] = _generous_curve()
+    alerts = []
+    for b in _canonical_long_bars():
+        sc_adr.on_bar(b)
+        alerts.extend(sc_adr.pop_capitulation_alerts())
+    check("leg too small relative to ADR never alerts", alerts, [])
+
+    demanding_curve = VolumeCurve(
+        "REV", sessions=10,
+        cum_volume_by_minute={(OPEN + timedelta(minutes=4)).timetz().replace(tzinfo=None): 10_000_000.0},
+    )
+    sc_rvol = _rev_scanner(ReversalLong, curve=demanding_curve)
+    alerts = []
+    for b in _canonical_long_bars():
+        sc_rvol.on_bar(b)
+        alerts.extend(sc_rvol.pop_capitulation_alerts())
+    check("thin RVOL relative to average never alerts", alerts, [])
+
+    fast_bars = [
+        bar(0, 98.0, 98.0, 97.5, 97.8, 50_000, symbol="REV"),
+        bar(1, 97.8, 97.9, 95.0, 95.3, 50_000, symbol="REV"),
+        bar(2, 95.3, 95.4, 93.0, 93.3, 50_000, symbol="REV"),  # extreme at minute 2 -- leg built in 2.0min
+    ]
+    sc_fast = _rev_scanner(ReversalLong)
+    alerts = []
+    for b in fast_bars:
+        sc_fast.on_bar(b)
+        alerts.extend(sc_fast.pop_capitulation_alerts())
+    check("leg built too fast (< 4-minute floor) never alerts", alerts, [])
+
+    levels = DailyLevels(
+        "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
+    )
+    sc_loose = Scanner({"REV": levels}, [ReversalLong], {"REV-L": {"min_leg_minutes": 0.0}})
+    sc_loose.curves["REV"] = _generous_curve()
+    alerts = []
+    for b in fast_bars:
+        sc_loose.on_bar(b)
+        alerts.extend(sc_loose.pop_capitulation_alerts())
+    check("same fast leg alerts once the duration floor is loosened", len(alerts), 1)
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

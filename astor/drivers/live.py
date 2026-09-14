@@ -23,7 +23,7 @@ from astor.core.grading import NOTIFY_GRADE_THRESHOLD
 from astor.core.scanner import Scanner
 from astor.core.store import TriggerStore
 from astor.core.tracking import SellRuleTracker, TrackAlert, TrackedTrade
-from astor.core.types import BarEvent, Trigger
+from astor.core.types import BarEvent, CapitulationAlert, Trigger
 from astor.drivers.replay import (
     ET,
     ReplayDriver,
@@ -52,13 +52,6 @@ ACTIVATION_PACE_SECONDS = 0.75
 # most of a second per symbol out of an already-paced activation batch.
 BACKFILL_TIMEOUT = 15.0
 
-# Suspended while validating REV-L/REV-S live: the trader expects Reversal
-# to generate enough alerts on its own, and stacking U&R/O&F's on top risks
-# bell-fatigue during the session. This only silences the terminal alert --
-# every U&R/O&F trigger is still detected and stored, so a later replay/SQL
-# review sees exactly what it would have otherwise.
-SUSPENDED_NOTIFY_SETUPS = {"U&R", "O&F"}
-
 # Reversal notifications bypass auto_grade entirely (2026-09-02, "for now"
 # -- not a permanent call) and use a flat time cutoff instead. grade_trigger
 # (astor.core.grading) was tuned around U&R/O&F and doesn't fit Reversal yet:
@@ -73,8 +66,6 @@ REVERSAL_NOTIFY_CUTOFF = time(15, 0)
 
 
 def _should_notify(trigger: Trigger) -> bool:
-    if trigger.setup in SUSPENDED_NOTIFY_SETUPS:
-        return False
     if trigger.setup in REVERSAL_NOTIFY_SETUPS:
         return trigger.bar_start.time() < REVERSAL_NOTIFY_CUTOFF
     return (trigger.extras.get("auto_grade") or 0) >= NOTIFY_GRADE_THRESHOLD
@@ -142,6 +133,10 @@ _ANSI_RESET = "\033[0m"
 # black would risk vanishing on a dark background.
 _ANSI_BLACK = "\033[30m"
 _ANSI_BROWN = "\033[38;5;130m"
+# A third, distinct color for a capitulation-in-progress alert -- neither a
+# fresh trigger (TRIGGER) nor an open-position lifecycle event (TRACK), so it
+# shouldn't share either's color at a glance.
+_ANSI_YELLOW = "\033[93m"
 
 
 def _print_trigger_alert(t: Trigger) -> None:
@@ -168,6 +163,20 @@ def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
 def _print_track_alert(alert: TrackAlert, trade: TrackedTrade) -> None:
     color = _ANSI_BLACK if alert.kind == "breakeven" else _ANSI_BROWN
     print(f"{_BELL}{_ANSI_BOLD}{color}{_format_track_alert(alert, trade)}{_ANSI_RESET}")
+
+
+def _format_capitulation_alert(a: CapitulationAlert) -> str:
+    move_rvol = a.move_rvol if a.move_rvol is not None else "n/a"
+    ema9_ext = f"{a.ema9_extension_adr:.2f}" if a.ema9_extension_adr is not None else "n/a"
+    return (
+        f"[{a.bar_start:%H:%M:%S} ET] CAPITULATION {a.symbol:<6} {a.direction:<5} "
+        f"@ {a.price:.2f}   leg {a.leg_size_adr:.2f}x ADR   move_rvol {move_rvol}"
+        f"   ema9_ext {ema9_ext} ADR   extreme {a.leg_extreme:.2f} (anchor {a.anchor:.2f})"
+    )
+
+
+def _print_capitulation_alert(a: CapitulationAlert) -> None:
+    print(f"{_BELL}{_ANSI_BOLD}{_ANSI_YELLOW}{_format_capitulation_alert(a)}{_ANSI_RESET}")
 
 
 async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | None:
@@ -493,9 +502,49 @@ class LiveDriver:
                     if _should_notify(trigger):
                         _print_trigger_alert(trigger)
 
+                for alert in scanner.pop_capitulation_alerts():
+                    store.record_alert(
+                        run_id,
+                        "capitulation",
+                        alert.symbol,
+                        alert.direction,
+                        alert.bar_start,
+                        alert.price,
+                        datetime.now(ET),
+                        {
+                            "leg_extreme": alert.leg_extreme,
+                            "anchor": alert.anchor,
+                            "leg_size_adr": alert.leg_size_adr,
+                            "move_rvol": alert.move_rvol,
+                            "ema9_extension_adr": alert.ema9_extension_adr,
+                        },
+                        bar_end=alert.bar_end,
+                    )
+                    store.commit()
+                    _print_capitulation_alert(alert)
+
                 track_alert = self.tracker.on_close(symbol, bar_event.close, bar_event.start)
                 if track_alert is not None:
-                    _print_track_alert(track_alert, self.tracker.trades[symbol])
+                    trade = self.tracker.trades[symbol]
+                    store.record_alert(
+                        run_id,
+                        track_alert.kind,
+                        symbol,
+                        trade.direction,
+                        track_alert.bar_start,
+                        track_alert.close,
+                        datetime.now(ET),
+                        {
+                            "entry": trade.entry,
+                            "stop": trade.stop,
+                            "peak": trade.peak,
+                            "r": trade.r,
+                            "target_1r": trade.target_1r,
+                            "account": trade.account,
+                        },
+                    )
+                    store.commit()
+                    _print_track_alert(track_alert, trade)
             except Exception:
                 # This runs inside ib_async's event dispatch, off the normal
                 # call stack -- an uncaught exception here is easy to lose

@@ -44,6 +44,27 @@ CREATE TABLE IF NOT EXISTS triggers (
 
 CREATE INDEX IF NOT EXISTS idx_triggers_run ON triggers(run_id);
 CREATE INDEX IF NOT EXISTS idx_triggers_symbol ON triggers(symbol, bar_start);
+
+-- Capitulation-in-progress alerts and sell-rule track alerts (breakeven/sell)
+-- share one table: both are real-time console notifications distinct from a
+-- setup firing (triggers) -- neither is itself a trade signal, and neither
+-- used to be persisted at all (track alerts were console-only) until this
+-- table gave both a place to land for later review.
+CREATE TABLE IF NOT EXISTS alerts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        TEXT NOT NULL REFERENCES runs(run_id),
+    kind          TEXT NOT NULL,        -- 'capitulation' | 'breakeven' | 'sell'
+    symbol        TEXT NOT NULL,
+    direction     TEXT NOT NULL,
+    bar_start     TEXT NOT NULL,
+    bar_end       TEXT,                 -- NULL for track alerts (no bar_end concept there)
+    price         REAL NOT NULL,        -- close at detection
+    detection_ts  TEXT NOT NULL,
+    extras_json   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_run ON alerts(run_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol, bar_start);
 """
 
 # Views are derived, so they are dropped and rebuilt on every connect rather than
@@ -111,9 +132,10 @@ SELECT
     -- itself took to build (anchor bar to extreme bar -- a slow multi-hour
     -- drift is a much weaker "sharp move" than a fast one of the same size,
     -- not yet filtered on but recorded for future tuning), and
-    -- retrace_pct/retrace_minutes/move_rvol are the three filters that
-    -- actually gated the fire (25-50% retracement, >=6 minutes since the
-    -- extreme, RVOL frozen at the extreme bar).
+    -- retrace_pct/retrace_minutes/move_rvol/leg_duration_minutes are among
+    -- the filters that actually gate the fire (10-50% retracement or an
+    -- EMA9 reclaim -- see retrace_via -- >= the confirm wait since the
+    -- extreme, RVOL frozen at the extreme bar, >= the leg-duration floor).
     json_extract(t.extras_json, '$.anchor')                   AS anchor,
     json_extract(t.extras_json, '$.leg_extreme')               AS leg_extreme,
     json_extract(t.extras_json, '$.leg_size_adr')              AS leg_size_adr,
@@ -121,7 +143,24 @@ SELECT
     json_extract(t.extras_json, '$.leg_duration_minutes')      AS leg_duration_minutes,
     json_extract(t.extras_json, '$.retrace_pct')               AS retrace_pct,
     json_extract(t.extras_json, '$.retrace_minutes')           AS retrace_minutes,
+    -- 'pct' (cleared the retrace floor) or 'ema9_reclaim' (retrace was still
+    -- short of the floor, but price crossed back through the 9EMA).
+    json_extract(t.extras_json, '$.retrace_via')               AS retrace_via,
     json_extract(t.extras_json, '$.move_rvol')                 AS move_rvol,
+    -- ema9_at_extreme/ema9_extension_adr: the 9EMA reading frozen at the
+    -- leg's extreme, and how far (in ADR units) the extreme finished from
+    -- it -- the capitulation "extended from the 9EMA" filter. accel_price/
+    -- accel_vol: the leg's last few bars' average range/volume against the
+    -- rest of the leg's -- diagnostic only, not yet filtered on.
+    json_extract(t.extras_json, '$.ema9_at_extreme')           AS ema9_at_extreme,
+    json_extract(t.extras_json, '$.ema9_extension_adr')        AS ema9_extension_adr,
+    json_extract(t.extras_json, '$.accel_price')                AS accel_price,
+    json_extract(t.extras_json, '$.accel_vol')                  AS accel_vol,
+    -- The retired U&R (REV-L)/O&F (REV-S) breach+reclaim condition against
+    -- PDL/PDH -- one of these two keys is present depending on direction,
+    -- coalesced the same way bars_below/bars_above already are above.
+    COALESCE(json_extract(t.extras_json, '$.meets_ur_condition'),
+             json_extract(t.extras_json, '$.meets_of_condition')) AS meets_legacy_condition,
     -- detection_ts equals bar_end exactly in Replay, so showing both is noise.
     -- The difference is the only part that carries information, and it is what
     -- Live will populate: how long after the bar closed the trigger was seen.
@@ -181,6 +220,47 @@ BEGIN
         notes = NEW.notes
     WHERE id = OLD.id;
 END;
+
+-- Capitulation and track alerts, one row shape for both -- see the `alerts`
+-- table comment. Capitulation-only and track-only columns simply read NULL
+-- for the other kind's rows, same COALESCE-free "just extract what's there"
+-- approach trigger_detail uses for U&R/O&F's mirrored key names.
+DROP VIEW IF EXISTS alert_detail;
+CREATE VIEW alert_detail AS
+SELECT
+    a.id,
+    a.run_id,
+    substr(a.bar_start, 1, 10) AS session,
+    substr(a.bar_start, 12, 8) AS alert_time,
+    a.kind,
+    a.symbol,
+    a.direction,
+    a.price,
+    a.bar_end,
+    -- Capitulation-only fields
+    json_extract(a.extras_json, '$.leg_extreme')         AS leg_extreme,
+    json_extract(a.extras_json, '$.anchor')              AS anchor,
+    json_extract(a.extras_json, '$.leg_size_adr')        AS leg_size_adr,
+    json_extract(a.extras_json, '$.move_rvol')           AS move_rvol,
+    json_extract(a.extras_json, '$.ema9_extension_adr')  AS ema9_extension_adr,
+    -- Track-alert-only fields (breakeven/sell)
+    json_extract(a.extras_json, '$.entry')               AS entry,
+    json_extract(a.extras_json, '$.stop')                AS stop,
+    json_extract(a.extras_json, '$.peak')                AS peak,
+    json_extract(a.extras_json, '$.r')                   AS r,
+    json_extract(a.extras_json, '$.target_1r')           AS target_1r,
+    json_extract(a.extras_json, '$.account')             AS account,
+    round((julianday(a.detection_ts)
+           - julianday(COALESCE(a.bar_end, a.bar_start))) * 86400, 1) AS latency_sec
+FROM alerts a;
+
+-- Same latest-run-per-session-per-mode partitioning latest_triggers uses,
+-- via the same latest_run_per_session view defined above.
+DROP VIEW IF EXISTS latest_alerts;
+CREATE VIEW latest_alerts AS
+SELECT * FROM alert_detail
+WHERE run_id IN (SELECT run_id FROM latest_run_per_session)
+ORDER BY session, alert_time;
 """
 
 
@@ -253,6 +333,39 @@ class TriggerStore:
             ),
         )
 
+    def record_alert(
+        self,
+        run_id: str,
+        kind: str,
+        symbol: str,
+        direction: str,
+        bar_start: datetime,
+        price: float,
+        detection_ts: datetime,
+        extras: dict,
+        bar_end: datetime | None = None,
+    ) -> None:
+        """Record a capitulation-in-progress alert or a sell-rule track
+        alert (breakeven/sell) -- see the `alerts` table comment for why
+        both share this one method/table. Not a Trigger: takes plain fields
+        rather than a single typed object since CapitulationAlert and
+        TrackAlert don't share a common shape."""
+        self.conn.execute(
+            "INSERT INTO alerts (run_id, kind, symbol, direction, bar_start, bar_end,"
+            " price, detection_ts, extras_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                kind,
+                symbol,
+                direction,
+                bar_start.isoformat(),
+                bar_end.isoformat() if bar_end else None,
+                price,
+                detection_ts.isoformat(),
+                json.dumps(extras, default=str),
+            ),
+        )
+
     def purge_runs(self, keep: str | None = None) -> int:
         """Delete stored runs in place, leaving the database file itself alone.
 
@@ -266,10 +379,12 @@ class TriggerStore:
                 "SELECT count(*) FROM runs WHERE run_id != ?", (keep,)
             ).fetchone()[0]
             self.conn.execute("DELETE FROM triggers WHERE run_id != ?", (keep,))
+            self.conn.execute("DELETE FROM alerts WHERE run_id != ?", (keep,))
             self.conn.execute("DELETE FROM runs WHERE run_id != ?", (keep,))
         else:
             n = self.conn.execute("SELECT count(*) FROM runs").fetchone()[0]
             self.conn.execute("DELETE FROM triggers")
+            self.conn.execute("DELETE FROM alerts")
             self.conn.execute("DELETE FROM runs")
         self.conn.commit()
         return n

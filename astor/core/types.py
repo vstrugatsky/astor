@@ -104,3 +104,23 @@ class Trigger:
     level_name: str
     level_value: float
     extras: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class CapitulationAlert:
+    """A Reversal leg still extending (no retrace yet) that already clears
+    the same leg-quality bar the eventual trigger will require -- a heads-up
+    to prepare size/entry before the reversal confirms, not a trade signal
+    itself. See astor.core.setups._ReversalBase.pop_capitulation_alert.
+    """
+
+    symbol: str
+    direction: str
+    bar_start: datetime
+    bar_end: datetime
+    price: float
+    leg_extreme: float
+    anchor: float
+    leg_size_adr: float
+    move_rvol: float | None
+    ema9_extension_adr: float | None

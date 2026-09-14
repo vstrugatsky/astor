@@ -1,71 +1,27 @@
 """Setup state machines.
 
-The shape of each setup is fixed; the thresholds are not.
+Reversal (REV-L/REV-S, "right side of a V") is the only setup left here.
+U&R and O&F (breach-a-level-then-reclaim-it) were retired after review found
+almost none of their real triggers were actionable; the trader's own read is
+that a reversal is only worth trading when the leg that precedes it shows
+capitulation characteristics -- sharp, on real volume, extended from the
+9EMA, and built quickly -- which U&R/O&F's flat excursion/reclaim-of-a-level
+framing never captured. Their old breach+reclaim condition survives as a
+diagnostic on every Reversal trigger (`meets_ur_condition`/
+`meets_of_condition`, computed against PDL/PDH), for a possible future grade
+bump -- not a filter.
 
-Each setup applies filters at trigger time, all expressed as a flat percent
-of the level price (PDL/PDH):
+The shape of the setup is fixed; the thresholds are not, and several of them
+(the 9EMA-extension floor, the acceleration ratios) are new enough that they
+are recorded on every trigger whether or not they end up gating anything --
+the same treatment avwap/rvol got when they were first added, so a threshold
+can be picked from replay history instead of guessed once and left alone.
 
-  excursion  how far past the level price actually went. Rejects the bar-scale
-             chop that dominated the first replay -- 2 bars, a cent beyond.
-  reclaim    how convincingly price came back. Rejects a close that limps a
-             cent past the level and means nothing.
-  combined   excursion + reclaim together. Catches a move that clears both
-             floors individually but is still small overall -- two barely-
-             there halves that individually pass but never added up to a real
-             move.
-
-These filters used to run in ADR units, or ADR-OR-percent once a flat-percent
-fallback was added to catch high-ADR names that ADR alone under-caught (a
-single ADR coefficient filters volatile names hardest, backwards from the
-intent -- excursion size in ADR units correlated negatively with ADR itself
-watchlist-wide). Analysis of replayed triggers found the ADR side added little:
-setup strength correlated with the flat percent-of-level move, not the
-ADR-scaled one. ADR filtering was dropped in favor of percent-only, with the
-combined floor added to catch weak-but-technically-passing pairs that the
-individual floors let through.
-
-excursion_adr and reclaim_adr are still recorded on the trigger as pure
-diagnostics -- for hindsight, since a name that clears its percent filter
-today may or may not have cleared an ADR-scaled one too -- but neither
-decides the outcome anymore.
-
-avwap and rvol are recorded the same way: pure diagnostics, not filtered on.
-Both are context a future setup will likely want as an actual condition
-(price vs. AVWAP, an RVOL floor), but no setup does yet, so for now they are
-just visible on every trigger for hindsight. They come from Scanner's running
-per-symbol state (astor.core.indicators), not from anything a Setup computes
-itself -- a Setup only ever reads them, same relationship it already has
-with DailyLevels.
-
-Trade-decision context (avwap_pct, level_stop_pct, the two stop/position-size
-pairs, the session extreme) is the same kind of thing: computed from state
-the Setup already has access to (DailyLevels, SessionIndicators, its own
-local overshoot/undercut), never filtered on, just there for whoever reads
-the trigger. Two stops are offered because they answer different questions:
-PDH/PDL is the technical level the setup is anchored to, while the session's
-actual high/low is where price really got to -- for a big excursion those
-diverge a lot, and a trader sizing off the level alone could be sizing for a
-tighter stop than the move already proved it could reach.
-
-avwap_pct is signed (positive = above, negative = below) since that's a
-meaningfully directional comparison. level_stop_pct and session_extreme_pct
-are unsigned: a stop's distance is a positive number a trader thinks in, not
-something whose sign should carry the long/short direction -- and a clean
-positive distance is also what padding a stop by some percent (likely coming
-later) will want to add to.
-
-A bar that breaches the level always arms the setup. The filters are applied
-when it would fire, against the *accumulated* excursion, so an undercut that
-deepens over several bars is judged on its full extent rather than its first
-bar. Failing a filter leaves the setup armed rather than resetting it: the
-breach is still real, we are simply still waiting for a reclaim worth reporting.
-
-Excursion currently has no ceiling. TSLA on 2026-08-14 fired O&F at 0.834x ADR
-/ 2.82% excursion -- by the trader's read, that excursion is large enough that
-the move was already extended before the fail bar closed, and any real setup
-there is AVWAP Loss, not O&F. A floor-only excursion filter cannot distinguish
-"a fresh test of the level" from "a stale, already-extended move" -- that is
-future work, not yet implemented here.
+A bar that breaches the level always arms the setup. Filters are applied
+when it would fire, against the *accumulated* state, so a move that keeps
+building is judged on its full extent rather than its first bar. Failing a
+filter leaves the setup armed rather than resetting it: the move is still
+real, we are simply still waiting for a fire worth reporting.
 """
 
 from __future__ import annotations
@@ -73,9 +29,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import ClassVar
 
-from astor.core.grading import rvol_threshold
 from astor.core.indicators import SessionIndicators, compute_rvol
-from astor.core.types import BarEvent, DailyLevels, Trigger, VolumeCurve
+from astor.core.types import BarEvent, CapitulationAlert, DailyLevels, Trigger, VolumeCurve
 
 
 def _pct_of_level(amount: float, level_value: float) -> float | None:
@@ -96,18 +51,12 @@ def _abs_pct_of_level(amount: float, level_value: float) -> float | None:
     return abs(pct) if pct is not None else None
 
 
-def _min_pct_passes(
-    amount: float, level_value: float, min_pct: float
-) -> tuple[bool, float | None]:
-    """Whether a dollar amount (excursion or reclaim distance) clears a flat
-    percent-of-level floor. min_pct <= 0 disables the check."""
-    pct = _pct_of_level(amount, level_value)
-    passes = min_pct <= 0 or (pct is not None and pct >= min_pct)
-    return passes, pct
-
-
 def _pctstr(x: float | None) -> str:
     return f"{x:.2f}%" if x is not None else "n/a"
+
+
+def _mean(xs: list[float]) -> float | None:
+    return sum(xs) / len(xs) if xs else None
 
 
 def _trace(trace: list[dict] | None, bar: BarEvent, text: str) -> None:
@@ -138,6 +87,28 @@ def _position_size(
     return shares, round(shares * entry, 2)
 
 
+# Reversal's own RVOL floor -- deliberately separate from grading.rvol_threshold
+# (shared by real-time grading; U&R/O&F used to share it too before they were
+# retired). Same ADV-tiered shape, higher thresholds: the trader's read is
+# that a capitulation-quality leg needs to stand out more than a routine
+# level breach did.
+_REV_RVOL_TIERS = ((5_000_000_000, 1.5), (500_000_000, 1.75))
+_REV_RVOL_DEFAULT = 2.0
+
+
+def rev_rvol_threshold(adv: float) -> float:
+    """The RVOL floor a Reversal leg's move must clear, highest-liquidity
+    tier first. Shared between the final retrace filter and the earlier
+    capitulation-in-progress check -- both are asking the same "was there
+    real volume behind this move" question, just at different points in the
+    leg's life.
+    """
+    for floor, threshold in _REV_RVOL_TIERS:
+        if adv > floor:
+            return threshold
+    return _REV_RVOL_DEFAULT
+
+
 class Setup:
     """One setup tracked for one symbol. Instances are stateful."""
 
@@ -154,339 +125,21 @@ class Setup:
     ) -> Trigger | None:
         raise NotImplementedError
 
-
-class UndercutRally(Setup):
-    """Long. Price drops below the previous day's low, then reclaims it.
-
-    ARMED --(bar.low < PDL)--> UNDERCUT --(bar.close > PDL, filters pass)--> fire
-    """
-
-    name = "U&R"
-    direction = "long"
-
-    def __init__(
-        self,
-        allow_same_bar_reclaim: bool = False,
-        min_excursion_pct: float = 0.0,
-        min_reclaim_pct: float = 0.0,
-        min_combined_pct: float = 0.0,
-        max_loss_dollars: float = 100.0,
-    ):
-        self.allow_same_bar_reclaim = allow_same_bar_reclaim
-        self.min_excursion_pct = min_excursion_pct
-        self.min_reclaim_pct = min_reclaim_pct
-        self.min_combined_pct = min_combined_pct
-        self.max_loss_dollars = max_loss_dollars
-        self._undercut_low: float | None = None
-        self._undercut_start = None
-        self._bars_below = 0  # bars whose low actually broke the level
-        self._bars_armed = 0  # bars since the breach, however price behaved
-
-    def on_bar(
-        self,
-        bar: BarEvent,
-        levels: DailyLevels,
-        indicators: SessionIndicators | None = None,
-        curve: VolumeCurve | None = None,
-        trace: list[dict] | None = None,
-    ) -> Trigger | None:
-        pdl = levels.pdl
-
-        if self._undercut_low is None:
-            if bar.low >= pdl:
-                return None
-            self._undercut_low = bar.low
-            self._undercut_start = bar.start
-            self._bars_below = 1
-            self._bars_armed = 1
-            _trace(trace, bar, f"breach: low {bar.low:.2f} < PDL {pdl:.2f} -- armed")
-            if not (self.allow_same_bar_reclaim and bar.close > pdl):
-                return None
-        else:
-            self._undercut_low = min(self._undercut_low, bar.low)
-            self._bars_armed += 1
-            # Only bars that actually broke the level count as time spent below
-            # it. Counting every armed bar conflates "price held under the level
-            # for 39 minutes" with "the setup has been waiting 52 minutes".
-            if bar.low < pdl:
-                self._bars_below += 1
-            if bar.close <= pdl:
-                return None
-
-        excursion = pdl - self._undercut_low
-        reclaim = bar.close - pdl
-        adr = levels.adr
-
-        excursion_ok, excursion_pct = _min_pct_passes(
-            excursion, pdl, self.min_excursion_pct
-        )
-        if not excursion_ok:
-            _trace(
-                trace, bar,
-                f"reclaim candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
-                f"< min {self.min_excursion_pct}% -- too shallow, stay armed",
-            )
-            return None  # stay armed: too shallow
-        reclaim_ok, reclaim_pct = _min_pct_passes(reclaim, pdl, self.min_reclaim_pct)
-        if not reclaim_ok:
-            _trace(
-                trace, bar,
-                f"reclaim candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} OK, "
-                f"reclaim {_pctstr(reclaim_pct)} < min {self.min_reclaim_pct}% -- too limp, stay armed",
-            )
-            return None  # stay armed: wait for a more convincing reclaim
-        combined_pct = (
-            round(excursion_pct + reclaim_pct, 4)
-            if excursion_pct is not None and reclaim_pct is not None
-            else None
-        )
-        if self.min_combined_pct > 0 and (
-            combined_pct is None or combined_pct < self.min_combined_pct
-        ):
-            _trace(
-                trace, bar,
-                f"reclaim candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
-                f"reclaim {_pctstr(reclaim_pct)} combined {_pctstr(combined_pct)} "
-                f"< min {self.min_combined_pct}% -- stay armed",
-            )
-            return None  # stay armed: each half is fine, the whole move isn't
-
-        _trace(
-            trace, bar,
-            f"FIRE @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
-            f"reclaim {_pctstr(reclaim_pct)} combined {_pctstr(combined_pct)}",
-        )
-
-        avwap = indicators.avwap if indicators else None
-        avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
-        level_stop_pct = _abs_pct_of_level(bar.close - pdl, pdl)
-        level_shares, level_dollars = _position_size(bar.close, pdl, self.max_loss_dollars)
-        session_open = indicators.session_open if indicators else None
-        session_high = indicators.session_high if indicators else None
-        session_low = indicators.session_low if indicators else None
-        session_extreme_pct = (
-            _abs_pct_of_level(bar.close - session_low, session_low) if session_low else None
-        )
-        session_shares, session_dollars = (
-            _position_size(bar.close, session_low, self.max_loss_dollars)
-            if session_low
-            else (None, None)
-        )
-
-        trigger = Trigger(
-            symbol=bar.symbol,
-            setup=self.name,
-            direction=self.direction,
-            trigger_price=bar.close,
-            bar_start=bar.start,
-            bar_end=bar.end,
-            level_name="PDL",
-            level_value=pdl,
-            extras={
-                "undercut_low": self._undercut_low,
-                "undercut_start": self._undercut_start.isoformat(),
-                "bars_below": self._bars_below,
-                "bars_armed": self._bars_armed,
-                "adr_pct": levels.adr_pct,
-                "excursion_adr": round(excursion / adr, 4) if adr > 0 else None,
-                "excursion_pct": excursion_pct,
-                "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,
-                "reclaim_pct": reclaim_pct,
-                "combined_pct": combined_pct,
-                "avwap": avwap,
-                "avwap_pct": avwap_pct,
-                "rvol": compute_rvol(indicators.cum_volume, bar.start, curve)
-                if indicators and curve
-                else None,
-                "max_loss_dollars": self.max_loss_dollars,
-                "level_stop_pct": level_stop_pct,
-                "level_stop_shares": level_shares,
-                "level_stop_dollars": level_dollars,
-                "session_open": session_open,
-                "session_high": session_high,
-                "session_low": session_low,
-                "session_extreme": session_low,
-                "session_extreme_pct": session_extreme_pct,
-                "session_stop_shares": session_shares,
-                "session_stop_dollars": session_dollars,
-            },
-        )
-        self._undercut_low = None
-        self._undercut_start = None
-        self._bars_below = 0
-        self._bars_armed = 0
-        return trigger
-
-
-class OvershootFail(Setup):
-    """Short. Price trades above the previous day's high, then loses it.
-
-    ARMED --(bar.high > PDH)--> OVERSHOT --(bar.close < PDH, filters pass)--> fire
-    """
-
-    name = "O&F"
-    direction = "short"
-
-    def __init__(
-        self,
-        allow_same_bar_fail: bool = False,
-        min_excursion_pct: float = 0.0,
-        min_reclaim_pct: float = 0.0,
-        min_combined_pct: float = 0.0,
-        max_loss_dollars: float = 100.0,
-    ):
-        self.allow_same_bar_fail = allow_same_bar_fail
-        self.min_excursion_pct = min_excursion_pct
-        self.min_reclaim_pct = min_reclaim_pct
-        self.min_combined_pct = min_combined_pct
-        self.max_loss_dollars = max_loss_dollars
-        self._overshoot_high: float | None = None
-        self._overshoot_start = None
-        self._bars_above = 0  # bars whose high actually broke the level
-        self._bars_armed = 0  # bars since the breach, however price behaved
-
-    def on_bar(
-        self,
-        bar: BarEvent,
-        levels: DailyLevels,
-        indicators: SessionIndicators | None = None,
-        curve: VolumeCurve | None = None,
-        trace: list[dict] | None = None,
-    ) -> Trigger | None:
-        pdh = levels.pdh
-
-        if self._overshoot_high is None:
-            if bar.high <= pdh:
-                return None
-            self._overshoot_high = bar.high
-            self._overshoot_start = bar.start
-            self._bars_above = 1
-            self._bars_armed = 1
-            _trace(trace, bar, f"breach: high {bar.high:.2f} > PDH {pdh:.2f} -- armed")
-            if not (self.allow_same_bar_fail and bar.close < pdh):
-                return None
-        else:
-            self._overshoot_high = max(self._overshoot_high, bar.high)
-            self._bars_armed += 1
-            if bar.high > pdh:
-                self._bars_above += 1
-            if bar.close >= pdh:
-                return None
-
-        excursion = self._overshoot_high - pdh
-        reclaim = pdh - bar.close
-        adr = levels.adr
-
-        excursion_ok, excursion_pct = _min_pct_passes(
-            excursion, pdh, self.min_excursion_pct
-        )
-        if not excursion_ok:
-            _trace(
-                trace, bar,
-                f"fail candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
-                f"< min {self.min_excursion_pct}% -- too shallow, stay armed",
-            )
-            return None  # stay armed: too shallow
-        reclaim_ok, reclaim_pct = _min_pct_passes(reclaim, pdh, self.min_reclaim_pct)
-        if not reclaim_ok:
-            _trace(
-                trace, bar,
-                f"fail candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} OK, "
-                f"reclaim {_pctstr(reclaim_pct)} < min {self.min_reclaim_pct}% -- too limp, stay armed",
-            )
-            return None  # stay armed: wait for a more convincing fail
-        combined_pct = (
-            round(excursion_pct + reclaim_pct, 4)
-            if excursion_pct is not None and reclaim_pct is not None
-            else None
-        )
-        if self.min_combined_pct > 0 and (
-            combined_pct is None or combined_pct < self.min_combined_pct
-        ):
-            _trace(
-                trace, bar,
-                f"fail candidate @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
-                f"reclaim {_pctstr(reclaim_pct)} combined {_pctstr(combined_pct)} "
-                f"< min {self.min_combined_pct}% -- stay armed",
-            )
-            return None  # stay armed: each half is fine, the whole move isn't
-
-        _trace(
-            trace, bar,
-            f"FIRE @ {bar.close:.2f}: excursion {_pctstr(excursion_pct)} "
-            f"reclaim {_pctstr(reclaim_pct)} combined {_pctstr(combined_pct)}",
-        )
-
-        avwap = indicators.avwap if indicators else None
-        avwap_pct = _pct_of_level(bar.close - avwap, avwap) if avwap else None
-        level_stop_pct = _abs_pct_of_level(bar.close - pdh, pdh)
-        level_shares, level_dollars = _position_size(bar.close, pdh, self.max_loss_dollars)
-        session_open = indicators.session_open if indicators else None
-        session_high = indicators.session_high if indicators else None
-        session_low = indicators.session_low if indicators else None
-        session_extreme_pct = (
-            _abs_pct_of_level(bar.close - session_high, session_high) if session_high else None
-        )
-        session_shares, session_dollars = (
-            _position_size(bar.close, session_high, self.max_loss_dollars)
-            if session_high
-            else (None, None)
-        )
-
-        trigger = Trigger(
-            symbol=bar.symbol,
-            setup=self.name,
-            direction=self.direction,
-            trigger_price=bar.close,
-            bar_start=bar.start,
-            bar_end=bar.end,
-            level_name="PDH",
-            level_value=pdh,
-            extras={
-                "overshoot_high": self._overshoot_high,
-                "overshoot_start": self._overshoot_start.isoformat(),
-                "bars_above": self._bars_above,
-                "bars_armed": self._bars_armed,
-                "adr_pct": levels.adr_pct,
-                "excursion_adr": round(excursion / adr, 4) if adr > 0 else None,
-                "excursion_pct": excursion_pct,
-                "reclaim_adr": round(reclaim / adr, 4) if adr > 0 else None,
-                "reclaim_pct": reclaim_pct,
-                "combined_pct": combined_pct,
-                "avwap": avwap,
-                "avwap_pct": avwap_pct,
-                "rvol": compute_rvol(indicators.cum_volume, bar.start, curve)
-                if indicators and curve
-                else None,
-                "max_loss_dollars": self.max_loss_dollars,
-                "level_stop_pct": level_stop_pct,
-                "level_stop_shares": level_shares,
-                "level_stop_dollars": level_dollars,
-                "session_open": session_open,
-                "session_high": session_high,
-                "session_low": session_low,
-                "session_extreme": session_high,
-                "session_extreme_pct": session_extreme_pct,
-                "session_stop_shares": session_shares,
-                "session_stop_dollars": session_dollars,
-            },
-        )
-        self._overshoot_high = None
-        self._overshoot_start = None
-        self._bars_above = 0
-        self._bars_armed = 0
-        return trigger
+    def pop_capitulation_alert(self) -> CapitulationAlert | None:
+        """A leg-in-progress heads-up, distinct from a Trigger -- see
+        _ReversalBase. No-op default so Scanner can call this on every
+        setup uniformly without caring which ones implement it."""
+        return None
 
 
 class _ReversalBase(Setup):
     """Shared shape for ReversalLong/ReversalShort ("right side of V"): a
-    sharp directional move on real volume, followed by a retracement that
-    lands in a middle band -- not so shallow it never really reversed, not
-    so deep the whole move already round-tripped -- held long enough to
-    look like more than a dead-cat bounce.
+    sharp directional move on real volume, extended from the 9EMA, built
+    quickly -- followed by a retracement (or an EMA9 reclaim) held long
+    enough to look like more than a dead-cat bounce.
 
-    Unlike U&R/O&F, this is not anchored to a static level (PDL/PDH) or even
-    a fixed session_open. Both ends of the leg are running values off
+    This is not anchored to a static level (PDL/PDH) or even a fixed
+    session_open. Both ends of the leg are running values off
     SessionIndicators, continuously updated by Scanner before this ever sees
     the bar: `extreme` is the running extreme in the setup's own direction
     (session_low for REV-L, session_high for REV-S) and `anchor` is the
@@ -502,66 +155,78 @@ class _ReversalBase(Setup):
     Whenever *either* boundary moves, the leg resets completely: a fresh
     clock, and (per the trader's call) any prior retracement progress is
     void -- the leg's shape just changed, so a partial bounce measured
-    against the old shape means nothing anymore.
+    against the old shape means nothing anymore. `_leg_bars` (used for the
+    acceleration diagnostic, see ReversalLong/ReversalShort's direction
+    hooks and the fire path below) follows the same rule: reset to just the
+    current bar on a fresh anchor, extended (not reset) while only the
+    extreme keeps deepening, and left untouched once neither boundary moves
+    -- which freezes it at exactly "every bar of this push, anchor to
+    extreme" the moment a retrace candidate bar arrives.
 
-    Timing (when extreme/anchor were set, and the cumulative volume at that
-    moment) is read fresh from SessionIndicators at fire time -- via
-    `_extreme_at`/`_extreme_cum_volume_at`/`_anchor_at` -- rather than
-    tracked locally against `bar`. A Setup added to Live mid-session starts
-    with no local history (by design -- it must not re-detect a trigger
-    from before it was tracked), so a local "the current bar is when this
-    extreme was set" would be wrong for whichever boundary had already
-    stabilized before the symbol joined; SessionIndicators stays continuous
-    through backfill regardless, so it always has the true timestamp. The
-    RVOL freeze point only follows `extreme`, not `anchor` -- that's still
-    specifically "the moment the push ended and the retracement began,"
-    regardless of where the anchor sits. `leg_duration_minutes` (anchor's
-    true timestamp to extreme's) is computed the same way, at fire time --
-    how long the whole push actually took, a slow multi-hour drift being a
-    much weaker "sharp move" than a fast one even at the same price size.
+    Timing (when extreme/anchor were set, and the cumulative volume and 9EMA
+    at that moment) is read fresh from SessionIndicators at fire time -- via
+    `_extreme_at`/`_extreme_cum_volume_at`/`_extreme_ema9_at`/`_anchor_at` --
+    rather than tracked locally against `bar`. A Setup added to Live
+    mid-session starts with no local history (by design -- it must not
+    re-detect a trigger from before it was tracked), so a local "the current
+    bar is when this extreme was set" would be wrong for whichever boundary
+    had already stabilized before the symbol joined; SessionIndicators stays
+    continuous through backfill regardless, so it always has the true
+    timestamp. The RVOL/9EMA freeze point only follows `extreme`, not
+    `anchor` -- that's still specifically "the moment the push ended," and by
+    fire time more volume has accumulated (and price has drifted back toward
+    the EMA) during the retrace itself, which would misstate how unusual the
+    *original* move actually was. `leg_duration_minutes` (anchor's true
+    timestamp to extreme's) is computed the same way, at fire time -- how
+    long the whole push actually took, a slow multi-hour drift being a much
+    weaker "sharp move" than a fast one even at the same price size, and now
+    also a floor (`min_leg_minutes`) rather than just a diagnostic.
 
     The overnight gap and `prev_close` play no part here, by the trader's
     own call -- a gap-inclusive version of this idea is a distinct setup
     (Gap Reversal, not yet built), not a variant of this one.
 
-    RVOL is evaluated frozen at the extreme bar, not at fire time: by fire
-    time more volume has accumulated during the retracement itself, which
-    would understate or overstate how unusual the *original move* actually
-    was depending on how that later volume behaved. `move_rvol` is that
-    frozen figure; `rvol` (the same diagnostic name U&R/O&F use, and what
-    Scanner's real-time grading reads) is the ordinary current-bar value.
-
     A leg fires at most once: after firing, only a move in either boundary
     away from what was fired on can arm it again. And per the trader's
     call, a leg that already gave back more than max_retrace_pct is dead
-    for good -- the right side of the V is gone -- until a new extreme or
-    anchor starts a new leg from scratch.
+    for good -- the right side of the V is gone, regardless of whether price
+    has also reclaimed the 9EMA by then -- until a new extreme or anchor
+    starts a new leg from scratch.
 
     "EXT" is used as level_name (there's no PDH/PDL here, so no 3-letter
     level code makes sense beyond "the extreme"); level_value is the leg's
-    own extreme, playing the same stop-anchor role PDL/PDH plays for U&R/O&F.
-    session_extreme/session_extreme_pct/session_stop_* are left unset
-    (unlike U&R/O&F): there is no second, distinct "technical vs. actual"
-    stop to show here since the level *is* the session extreme already --
-    a redundant second line would misleadingly imply otherwise.
+    own extreme, playing the same stop-anchor role PDL/PDH plays for the
+    retired U&R/O&F. session_extreme/session_extreme_pct/session_stop_* are
+    left unset (unlike U&R/O&F): there is no second, distinct "technical vs.
+    actual" stop to show here since the level *is* the session extreme
+    already -- a redundant second line would misleadingly imply otherwise.
     """
 
     name: ClassVar[str]
     direction: ClassVar[str]
     level_name: ClassVar[str] = "EXT"
+    # Dynamic extras key for the retired setup's condition -- "meets_ur_condition"
+    # for REV-L (U&R was long), "meets_of_condition" for REV-S (O&F was short).
+    legacy_name: ClassVar[str]
 
     def __init__(
         self,
-        min_leg_adr: float = 0.5,
-        min_retrace_pct: float = 25.0,
+        min_leg_adr: float = 1.0,
+        min_retrace_pct: float = 10.0,
         max_retrace_pct: float = 50.0,
-        min_confirm_minutes: float = 6.0,
+        min_confirm_minutes: float = 0.0,
+        min_leg_minutes: float = 4.0,
+        min_ema9_extension_adr: float = 0.05,
+        accel_window: int = 3,
         max_loss_dollars: float = 100.0,
     ):
         self.min_leg_adr = min_leg_adr
         self.min_retrace_pct = min_retrace_pct
         self.max_retrace_pct = max_retrace_pct
         self.min_confirm_minutes = min_confirm_minutes
+        self.min_leg_minutes = min_leg_minutes
+        self.min_ema9_extension_adr = min_ema9_extension_adr
+        self.accel_window = accel_window
         self.max_loss_dollars = max_loss_dollars
         # Both running values -- see the class docstring. anchor is the
         # running extreme in the OPPOSITE direction from extreme. Only the
@@ -571,6 +236,15 @@ class _ReversalBase(Setup):
         self._retrace_dead = False
         self._fired_extreme: float | None = None
         self._fired_anchor: float | None = None
+        # Every bar of the current push, anchor to extreme -- see the class
+        # docstring's note on _leg_bars. Used only for the accel_price/
+        # accel_vol diagnostics.
+        self._leg_bars: list[BarEvent] = []
+        # The last _extreme value a capitulation alert was already fired
+        # for, so a leg that keeps deepening bar-by-bar doesn't re-alert
+        # every single bar -- only once per distinct (deeper) extreme.
+        self._capitulation_alerted_extreme: float | None = None
+        self._pending_capitulation_alert: CapitulationAlert | None = None
 
     # -- direction-specific hooks, overridden by Long/Short below -----------
 
@@ -588,6 +262,24 @@ class _ReversalBase(Setup):
 
     def _extreme_cum_volume_at(self, indicators: SessionIndicators) -> float:
         """Cumulative volume as of `_extreme_at`."""
+        raise NotImplementedError
+
+    def _extreme_ema9_at(self, indicators: SessionIndicators) -> float | None:
+        """The 9EMA reading frozen at `_extreme_at` -- ema9_at_low for
+        REV-L, ema9_at_high for REV-S."""
+        raise NotImplementedError
+
+    def _ema9_extension(self, extreme: float, ema9_at_extreme: float) -> float:
+        """How far the leg's extreme finished from the frozen 9EMA, in the
+        capitulation direction -- positive means further extended (below
+        the EMA for REV-L, above it for REV-S)."""
+        raise NotImplementedError
+
+    def _ema9_reclaimed_now(self, close: float, ema9_now: float) -> bool:
+        """Whether the *current* bar's close has reclaimed the 9EMA on the
+        favorable side -- above it for REV-L, below it for REV-S. Uses the
+        live ema9, not the frozen one: this is "has price come back by now,"
+        not "how extended was the original move"."""
         raise NotImplementedError
 
     def _session_anchor(self, indicators: SessionIndicators) -> float:
@@ -608,6 +300,12 @@ class _ReversalBase(Setup):
     def _retrace_from(self, close: float, extreme: float) -> float:
         """Distance price has moved back toward (or past) the anchor,
         starting from the extreme -- positive once retracement begins."""
+        raise NotImplementedError
+
+    def _legacy_condition(self, levels: DailyLevels, extreme: float, close: float) -> bool:
+        """Whether this leg also satisfies the retired U&R (REV-L) / O&F
+        (REV-S) breach+reclaim condition against PDL/PDH -- recorded under
+        `legacy_name`, not filtered on."""
         raise NotImplementedError
 
     # -- shared state machine ------------------------------------------------
@@ -632,11 +330,70 @@ class _ReversalBase(Setup):
         anchor_moved = self._anchor is None or self._more_extreme_anchor(
             session_anchor, self._anchor
         ) != self._anchor
+        # Captured before self._extreme/self._anchor are updated below: was
+        # the leg, as it stood coming into this bar, already dead (retraced
+        # past max_retrace_pct) or already fired-and-waiting-for-a-new-leg?
+        # A deeper extreme arriving right after either of those is a fresh
+        # push starting from scratch, not a continuation of the old one --
+        # _leg_bars needs to reset there too, not just on a new anchor. Real
+        # case that motivated this: a leg dies past the retrace ceiling,
+        # price consolidates for half an hour with the anchor untouched,
+        # then a genuinely new, much faster push sets a deeper extreme --
+        # without this, that new push's accel_price/accel_vol got compared
+        # against one stale leftover bar from the earlier, unrelated, dead
+        # push instead of its own bars. Deliberately NOT gated on
+        # push_active (below) -- accel_price/accel_vol are meant to cover
+        # the same anchor-to-extreme span leg_duration_minutes reports, not
+        # a narrower window. Real case that showed this: SEDG 2026-09-10's
+        # REV-S leg spent 09:37-10:55 (78 bars) with its anchor (session
+        # low) still setting fresh lows of its own while its extreme
+        # (session high) sat on a stale level from before that whole
+        # down-then-up move even started -- by the trader's own read, that
+        # stale high is REV-L's territory (the leg down), not relevant to
+        # scoping REV-S's leg up, so those bars still belong in this leg's
+        # accel sample even though push_active (below) is false for all of
+        # them.
+        rearming = self._retrace_dead or (
+            self._extreme == self._fired_extreme and self._anchor == self._fired_anchor
+        )
 
         if extreme_moved:
             self._extreme = session_extreme
         if anchor_moved:
             self._anchor = session_anchor
+
+        if anchor_moved or (extreme_moved and rearming):
+            self._leg_bars = [bar]
+        elif not rearming:
+            # Append every bar of a currently-alive leg, not just the ones
+            # that individually set a fresh extreme -- a real push often
+            # pauses for a few bars between new highs/lows without dying
+            # (retrace still under max_retrace_pct), and those pause bars
+            # are still part of its history. Appending only on extreme_moved
+            # silently dropped them, which starved accel_price/accel_vol of
+            # data on exactly the legs worth measuring: real cases had only
+            # 3 (or fewer) of ~40+ actual bars individually set a new high,
+            # so "recent" and "earlier" ended up drawn from a handful of
+            # cherry-picked bars rather than the leg's real pace.
+            self._leg_bars.append(bar)
+        # else: the leg is dead or already-fired-and-unchanged -- inert,
+        # nothing worth adding.
+
+        extreme_at = self._extreme_at(indicators)
+        anchor_at = self._anchor_at(indicators)
+        # Whether a genuine push -- a move away from the anchor to a fresh
+        # extreme -- exists yet, i.e. the extreme's own timestamp is more
+        # recent than the anchor's. This gates only whether retrace/death is
+        # evaluated below (see the "not push_active" check further down),
+        # never _leg_bars -- see the comment above for why those are scoped
+        # differently. While the anchor is still catching up past an older,
+        # unrelated extreme (SEDG again: the same 78 bars above), "retrace
+        # since the extreme" measures nothing real -- price never actually
+        # reached that extreme this time around, so a close sitting near the
+        # anchor reads as a huge retrace by pure arithmetic (extreme far
+        # away, anchor-to-extreme gap still small), not because anything
+        # rallied and failed.
+        push_active = extreme_at > anchor_at
 
         if extreme_moved or anchor_moved:
             # Either boundary just moved (or this is the first bar) -- the
@@ -650,6 +407,14 @@ class _ReversalBase(Setup):
             else:
                 what = f"anchor moved to {self._anchor:.2f} (extreme {self._extreme:.2f})"
             _trace(trace, bar, f"{what} -- leg={leg_size_now:.2f}")
+            if push_active:
+                self._maybe_flag_capitulation(bar, levels, indicators, curve)
+            return None
+
+        if not push_active:
+            # Anchor hasn't been overtaken by a fresh extreme yet -- see
+            # push_active above. Stay armed silently; there is nothing here
+            # to trace or judge, since no real push exists to evaluate yet.
             return None
 
         if self._retrace_dead or (
@@ -672,7 +437,15 @@ class _ReversalBase(Setup):
                 f"leg dead until a new, deeper extreme",
             )
             return None
-        if retrace_pct < self.min_retrace_pct:
+
+        ema9_now = indicators.ema9
+        reclaimed = ema9_now is not None and self._ema9_reclaimed_now(bar.close, ema9_now)
+        if retrace_pct < self.min_retrace_pct and not reclaimed:
+            _trace(
+                trace, bar,
+                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% < min "
+                f"{self.min_retrace_pct}% and EMA9 ({ema9_now}) not reclaimed -- stay armed",
+            )
             return None
 
         extreme_at = self._extreme_at(indicators)
@@ -685,12 +458,24 @@ class _ReversalBase(Setup):
             )
             return None
 
+        anchor_at = self._anchor_at(indicators)
+        leg_duration_minutes = abs((extreme_at - anchor_at).total_seconds()) / 60.0
+        if leg_duration_minutes < self.min_leg_minutes:
+            _trace(
+                trace, bar,
+                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
+                f"{elapsed_minutes:.0f}m OK, but leg built in {leg_duration_minutes:.1f}m "
+                f"< min {self.min_leg_minutes}m -- too fast to be a real leg",
+            )
+            return None
+
         adr = levels.adr
         if adr <= 0 or leg_size < self.min_leg_adr * adr:
             _trace(
                 trace, bar,
                 f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
-                f"{elapsed_minutes:.0f}m OK, but leg {leg_size:.2f} < required "
+                f"{elapsed_minutes:.0f}m built {leg_duration_minutes:.1f}m OK, but leg "
+                f"{leg_size:.2f} < required "
                 f"{self.min_leg_adr * adr if adr > 0 else float('nan'):.2f} "
                 f"({self.min_leg_adr}x ADR ${adr:.2f}) -- leg too small",
             )
@@ -701,23 +486,67 @@ class _ReversalBase(Setup):
             if curve
             else None
         )
-        if move_rvol is None or move_rvol < rvol_threshold(levels.adv):
+        if move_rvol is None or move_rvol < rev_rvol_threshold(levels.adv):
             _trace(
                 trace, bar,
                 f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
                 f"{elapsed_minutes:.0f}m leg {leg_size:.2f} OK, but move_rvol "
-                f"{move_rvol} < required {rvol_threshold(levels.adv)} -- too thin",
+                f"{move_rvol} < required {rev_rvol_threshold(levels.adv)} -- too thin",
             )
             return None  # not enough volume behind the move
 
-        anchor_at = self._anchor_at(indicators)
-        leg_duration_minutes = abs((extreme_at - anchor_at).total_seconds()) / 60.0
+        ema9_at_extreme = self._extreme_ema9_at(indicators)
+        ema9_extension_adr = (
+            round(self._ema9_extension(self._extreme, ema9_at_extreme) / adr, 4)
+            if ema9_at_extreme is not None
+            else None
+        )
+        if self.min_ema9_extension_adr > 0 and (
+            ema9_extension_adr is None or ema9_extension_adr < self.min_ema9_extension_adr
+        ):
+            _trace(
+                trace, bar,
+                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
+                f"{elapsed_minutes:.0f}m leg {leg_size:.2f} move_rvol {move_rvol} OK, but "
+                f"ema9 extension {ema9_extension_adr} < min {self.min_ema9_extension_adr} "
+                f"ADR -- not extended enough",
+            )
+            return None
+
+        # _leg_bars keeps accumulating past the extreme (a retrace-candidate
+        # bar can't be told apart from a mid-push pause in real time, so both
+        # get appended -- see the accumulation comment above); filtering by
+        # the already-known extreme_at here cleanly excludes any retrace
+        # bars regardless of how many came before this one fired, leaving
+        # exactly the push itself.
+        push_bars = [b for b in self._leg_bars if b.start <= extreme_at]
+        recent = push_bars[-self.accel_window :]
+        earlier = push_bars[: -self.accel_window] or push_bars
+        recent_range, earlier_range = _mean([b.high - b.low for b in recent]), _mean(
+            [b.high - b.low for b in earlier]
+        )
+        accel_price = (
+            round(recent_range / earlier_range, 4)
+            if recent_range is not None and earlier_range
+            else None
+        )
+        recent_vol, earlier_vol = _mean([b.volume for b in recent]), _mean(
+            [b.volume for b in earlier]
+        )
+        accel_vol = (
+            round(recent_vol / earlier_vol, 4)
+            if recent_vol is not None and earlier_vol
+            else None
+        )
+
+        legacy_condition = self._legacy_condition(levels, self._extreme, bar.close)
 
         _trace(
             trace, bar,
-            f"FIRE @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
-            f"{elapsed_minutes:.0f}m leg {leg_size:.2f} (built over {leg_duration_minutes:.0f}m) "
-            f"move_rvol {move_rvol}",
+            f"FIRE @ {bar.close:.2f}: retrace {retrace_pct:.1f}%"
+            f"{' (via EMA9 reclaim)' if reclaimed and retrace_pct < self.min_retrace_pct else ''} "
+            f"elapsed {elapsed_minutes:.0f}m leg {leg_size:.2f} (built over "
+            f"{leg_duration_minutes:.0f}m) move_rvol {move_rvol} ema9_ext {ema9_extension_adr}",
         )
 
         avwap = indicators.avwap
@@ -751,7 +580,13 @@ class _ReversalBase(Setup):
                 "leg_duration_minutes": round(leg_duration_minutes, 1),
                 "retrace_pct": round(retrace_pct, 4),
                 "retrace_minutes": round(elapsed_minutes, 1),
+                "retrace_via": "ema9_reclaim" if reclaimed and retrace_pct < self.min_retrace_pct else "pct",
                 "move_rvol": move_rvol,
+                "ema9_at_extreme": ema9_at_extreme,
+                "ema9_extension_adr": ema9_extension_adr,
+                "accel_price": accel_price,
+                "accel_vol": accel_vol,
+                self.legacy_name: legacy_condition,
                 "adr_pct": levels.adr_pct,
                 "avwap": avwap,
                 "avwap_pct": avwap_pct,
@@ -773,13 +608,85 @@ class _ReversalBase(Setup):
         self._fired_anchor = self._anchor
         return trigger
 
+    # -- capitulation-in-progress alert --------------------------------------
+
+    def _maybe_flag_capitulation(
+        self,
+        bar: BarEvent,
+        levels: DailyLevels,
+        indicators: SessionIndicators,
+        curve: VolumeCurve | None,
+    ) -> None:
+        """Same leg-quality bar the eventual trigger requires -- size,
+        duration, volume, 9EMA extension -- checked while the leg is still
+        extending (extreme still moving), so the trader gets a heads-up
+        before any retrace even starts. Deliberately not gated on retrace
+        or the confirm wait; those are about the reversal being confirmed,
+        not about whether the move itself already looks like capitulation.
+        """
+        assert self._anchor is not None and self._extreme is not None
+        if self._extreme == self._capitulation_alerted_extreme:
+            return
+
+        leg_size = abs(self._anchor - self._extreme)
+        adr = levels.adr
+        if leg_size <= 0 or adr <= 0 or leg_size < self.min_leg_adr * adr:
+            return
+
+        extreme_at = self._extreme_at(indicators)
+        anchor_at = self._anchor_at(indicators)
+        leg_duration_minutes = abs((extreme_at - anchor_at).total_seconds()) / 60.0
+        if leg_duration_minutes < self.min_leg_minutes:
+            return
+
+        move_rvol = (
+            compute_rvol(self._extreme_cum_volume_at(indicators), extreme_at, curve)
+            if curve
+            else None
+        )
+        if move_rvol is None or move_rvol < rev_rvol_threshold(levels.adv):
+            return
+
+        ema9_at_extreme = self._extreme_ema9_at(indicators)
+        ema9_extension_adr = (
+            self._ema9_extension(self._extreme, ema9_at_extreme) / adr
+            if ema9_at_extreme is not None
+            else None
+        )
+        if self.min_ema9_extension_adr > 0 and (
+            ema9_extension_adr is None or ema9_extension_adr < self.min_ema9_extension_adr
+        ):
+            return
+
+        self._capitulation_alerted_extreme = self._extreme
+        self._pending_capitulation_alert = CapitulationAlert(
+            symbol=bar.symbol,
+            direction=self.direction,
+            bar_start=bar.start,
+            bar_end=bar.end,
+            price=bar.close,
+            leg_extreme=self._extreme,
+            anchor=self._anchor,
+            leg_size_adr=round(leg_size / adr, 4),
+            move_rvol=move_rvol,
+            ema9_extension_adr=(
+                round(ema9_extension_adr, 4) if ema9_extension_adr is not None else None
+            ),
+        )
+
+    def pop_capitulation_alert(self) -> CapitulationAlert | None:
+        alert, self._pending_capitulation_alert = self._pending_capitulation_alert, None
+        return alert
+
 
 class ReversalLong(_ReversalBase):
-    """Long. A sharp move down, on volume, then a 25-50% retracement back up
-    held for at least min_confirm_minutes -- the right side of a V."""
+    """Long. A sharp move down, on volume, extended from the 9EMA, then a
+    retracement back up (or an EMA9 reclaim) held for at least
+    min_confirm_minutes -- the right side of a V."""
 
     name = "REV-L"
     direction = "long"
+    legacy_name = "meets_ur_condition"
 
     def _session_extreme(self, indicators: SessionIndicators) -> float:
         assert indicators.session_low is not None
@@ -796,6 +703,15 @@ class ReversalLong(_ReversalBase):
         assert indicators.cum_volume_at_low is not None
         return indicators.cum_volume_at_low
 
+    def _extreme_ema9_at(self, indicators: SessionIndicators) -> float | None:
+        return indicators.ema9_at_low
+
+    def _ema9_extension(self, extreme: float, ema9_at_extreme: float) -> float:
+        return ema9_at_extreme - extreme
+
+    def _ema9_reclaimed_now(self, close: float, ema9_now: float) -> bool:
+        return close > ema9_now
+
     def _session_anchor(self, indicators: SessionIndicators) -> float:
         assert indicators.session_high is not None
         return indicators.session_high
@@ -810,14 +726,18 @@ class ReversalLong(_ReversalBase):
     def _retrace_from(self, close: float, extreme: float) -> float:
         return close - extreme
 
+    def _legacy_condition(self, levels: DailyLevels, extreme: float, close: float) -> bool:
+        return extreme < levels.pdl and close > levels.pdl
+
 
 class ReversalShort(_ReversalBase):
-    """Short. A sharp move up, on volume, then a 25-50% retracement back
-    down held for at least min_confirm_minutes -- the right side of a
-    mirrored (^-shaped) V."""
+    """Short. A sharp move up, on volume, extended from the 9EMA, then a
+    retracement back down (or an EMA9 reclaim) held for at least
+    min_confirm_minutes -- the right side of a mirrored (^-shaped) V."""
 
     name = "REV-S"
     direction = "short"
+    legacy_name = "meets_of_condition"
 
     def _session_extreme(self, indicators: SessionIndicators) -> float:
         assert indicators.session_high is not None
@@ -834,6 +754,15 @@ class ReversalShort(_ReversalBase):
         assert indicators.cum_volume_at_high is not None
         return indicators.cum_volume_at_high
 
+    def _extreme_ema9_at(self, indicators: SessionIndicators) -> float | None:
+        return indicators.ema9_at_high
+
+    def _ema9_extension(self, extreme: float, ema9_at_extreme: float) -> float:
+        return extreme - ema9_at_extreme
+
+    def _ema9_reclaimed_now(self, close: float, ema9_now: float) -> bool:
+        return close < ema9_now
+
     def _session_anchor(self, indicators: SessionIndicators) -> float:
         assert indicators.session_low is not None
         return indicators.session_low
@@ -848,6 +777,9 @@ class ReversalShort(_ReversalBase):
     def _retrace_from(self, close: float, extreme: float) -> float:
         return extreme - close
 
+    def _legacy_condition(self, levels: DailyLevels, extreme: float, close: float) -> bool:
+        return extreme > levels.pdh and close < levels.pdh
 
-ALL_SETUPS: list[type[Setup]] = [UndercutRally, OvershootFail, ReversalLong, ReversalShort]
+
+ALL_SETUPS: list[type[Setup]] = [ReversalLong, ReversalShort]
 SETUPS_BY_NAME = {s.name: s for s in ALL_SETUPS}

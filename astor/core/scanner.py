@@ -17,7 +17,7 @@ from dataclasses import replace
 from astor.core.grading import grade_trigger
 from astor.core.indicators import SessionIndicators
 from astor.core.setups import ALL_SETUPS, Setup
-from astor.core.types import BarEvent, DailyLevels, Trigger, VolumeCurve
+from astor.core.types import BarEvent, CapitulationAlert, DailyLevels, Trigger, VolumeCurve
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,12 @@ class Scanner:
         self.curves: dict[str, VolumeCurve] = {}
 
         self.triggers: list[Trigger] = []
+        # Full-run history, mirrors self.triggers -- pop_capitulation_alerts()
+        # drains a separate per-on_bar-call buffer for callers that want just
+        # what this call produced (Replay/Live), same relationship on_bar's
+        # return value has to self.triggers.
+        self.capitulation_alerts: list[CapitulationAlert] = []
+        self._pending_capitulation_alerts: list[CapitulationAlert] = []
         self.bars_seen = 0
         self.bars_evaluated = 0
         self.skipped_zero_volume = 0
@@ -104,9 +110,20 @@ class Scanner:
                     trigger, extras={**trigger.extras, "auto_grade": auto_grade}
                 )
                 fired.append(trigger)
+            alert = setup.pop_capitulation_alert()
+            if alert is not None:
+                self._pending_capitulation_alerts.append(alert)
 
         self.triggers.extend(fired)
+        self.capitulation_alerts.extend(self._pending_capitulation_alerts)
         return fired
+
+    def pop_capitulation_alerts(self) -> list[CapitulationAlert]:
+        """Capitulation alerts produced by the most recent on_bar() call --
+        drained, not peeked, so a caller (Replay/Live) that calls this once
+        per on_bar() never double-handles one."""
+        alerts, self._pending_capitulation_alerts = self._pending_capitulation_alerts, []
+        return alerts
 
     def backfill_bar(self, bar: BarEvent) -> None:
         """Feed one bar that happened before this symbol joined the live
