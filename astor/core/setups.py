@@ -262,10 +262,13 @@ class _ReversalBase(Setup):
         # useful as a stop reference), but "how long did this push take"
         # shouldn't count the dead, unrelated stretch before the revival.
         self._push_started_at: datetime | None = None
-        # The last _extreme value a capitulation alert was already fired
-        # for, so a leg that keeps deepening bar-by-bar doesn't re-alert
-        # every single bar -- only once per distinct (deeper) extreme.
-        self._capitulation_alerted_extreme: float | None = None
+        # The push_started_at a capitulation alert was already fired for --
+        # one alert per push, not per deepening extreme (a fast leg can set
+        # a new extreme almost every bar; re-alerting on each of those is
+        # noise, not a fresh heads-up). Re-arms only when push_started_at
+        # itself changes: a genuinely new leg (new anchor) or a revival
+        # after a real death -- see _push_started_at's own comment.
+        self._capitulation_alerted_push_started_at: datetime | None = None
         self._pending_capitulation_alert: CapitulationAlert | None = None
 
     # -- direction-specific hooks, overridden by Long/Short below -----------
@@ -406,8 +409,15 @@ class _ReversalBase(Setup):
         if anchor_moved:
             self._anchor = session_anchor
 
-        if anchor_moved or (extreme_moved and leg_was_dead):
-            if extreme_moved and leg_was_dead and not anchor_moved and self._dead_bars:
+        if anchor_moved:
+            # A genuinely new leg -- push_started_at is the true anchor's
+            # own timestamp.
+            self._leg_bars = [bar]
+            self._push_started_at = self._anchor_at(indicators)
+            self._dead_extreme = None
+            self._dead_bars = []
+        elif extreme_moved and leg_was_dead:
+            if self._dead_bars:
                 # The revival's push very likely began earlier than this
                 # bar -- right where the dead leg's own retracement turned
                 # around (self._dead_bars, tracked below), not wherever the
@@ -421,8 +431,18 @@ class _ReversalBase(Setup):
                 self._leg_bars = self._dead_bars + [bar]
                 self._push_started_at = self._dead_bars[0].start
             else:
+                # No observable bars of the turn before the break itself --
+                # the revival happened in a single bar (dead retracement's
+                # own local extreme was still moving right up to the bar
+                # before this one). push_started_at is THIS bar's own
+                # timestamp, not the stale, pre-death anchor_at: that anchor
+                # timestamp belongs to a leg that already died, and using it
+                # here would silently resurrect it -- both as a much-too-
+                # long leg_duration_minutes and, for the capitulation alert,
+                # as a false "already alerted for this push" match against
+                # the dead leg's own earlier alert.
                 self._leg_bars = [bar]
-                self._push_started_at = self._anchor_at(indicators)
+                self._push_started_at = bar.start
             self._dead_extreme = None
             self._dead_bars = []
         elif not leg_was_dead:
@@ -780,9 +800,18 @@ class _ReversalBase(Setup):
         before any retrace even starts. Deliberately not gated on retrace
         or the confirm wait; those are about the reversal being confirmed,
         not about whether the move itself already looks like capitulation.
+
+        One alert per push (see push_started_at above), not per deepening
+        extreme -- a fast leg can set a new extreme on almost every bar,
+        and re-alerting on each of those is noise, not a fresh heads-up.
+        Re-arms only on a genuinely new leg (new anchor) or a revival after
+        a real death, same as the trigger's own leg_duration_minutes.
         """
         assert self._anchor is not None and self._extreme is not None
-        if self._extreme == self._capitulation_alerted_extreme:
+        extreme_at = self._extreme_at(indicators)
+        anchor_at = self._anchor_at(indicators)
+        push_started_at = self._push_started_at if self._push_started_at is not None else anchor_at
+        if push_started_at == self._capitulation_alerted_push_started_at:
             return
 
         leg_size = abs(self._anchor - self._extreme)
@@ -790,9 +819,6 @@ class _ReversalBase(Setup):
         if leg_size <= 0 or adr <= 0 or leg_size < self.min_leg_adr * adr:
             return
 
-        extreme_at = self._extreme_at(indicators)
-        anchor_at = self._anchor_at(indicators)
-        push_started_at = self._push_started_at if self._push_started_at is not None else anchor_at
         leg_duration_minutes = abs((extreme_at - push_started_at).total_seconds()) / 60.0
         if leg_duration_minutes < self.min_leg_minutes:
             return
@@ -827,7 +853,7 @@ class _ReversalBase(Setup):
         ):
             return
 
-        self._capitulation_alerted_extreme = self._extreme
+        self._capitulation_alerted_push_started_at = push_started_at
         self._pending_capitulation_alert = CapitulationAlert(
             symbol=bar.symbol,
             direction=self.direction,
