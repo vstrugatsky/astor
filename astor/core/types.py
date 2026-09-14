@@ -124,3 +124,5 @@ class CapitulationAlert:
     leg_size_adr: float
     move_rvol: float | None
     ema9_extension_adr: float | None
+    accel_price: float | None
+    accel_vol: float | None

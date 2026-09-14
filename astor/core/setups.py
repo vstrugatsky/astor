@@ -216,7 +216,9 @@ class _ReversalBase(Setup):
         max_retrace_pct: float = 50.0,
         min_confirm_minutes: float = 0.0,
         min_leg_minutes: float = 4.0,
-        min_ema9_extension_adr: float = 0.05,
+        min_ema9_extension_adr: float = 0.15,
+        min_accel_price: float = 1.2,
+        min_accel_vol: float = 1.0,
         accel_window: int = 3,
         max_loss_dollars: float = 100.0,
     ):
@@ -226,6 +228,8 @@ class _ReversalBase(Setup):
         self.min_confirm_minutes = min_confirm_minutes
         self.min_leg_minutes = min_leg_minutes
         self.min_ema9_extension_adr = min_ema9_extension_adr
+        self.min_accel_price = min_accel_price
+        self.min_accel_vol = min_accel_vol
         self.accel_window = accel_window
         self.max_loss_dollars = max_loss_dollars
         # Both running values -- see the class docstring. anchor is the
@@ -600,61 +604,29 @@ class _ReversalBase(Setup):
             )
             return None
 
-        # _leg_bars keeps accumulating past the extreme (a retrace-candidate
-        # bar can't be told apart from a mid-push pause in real time, so both
-        # get appended -- see the accumulation comment above); filtering by
-        # the already-known extreme_at here cleanly excludes any retrace
-        # bars regardless of how many came before this one fired, leaving
-        # exactly the push itself.
-        push_bars = [b for b in self._leg_bars if b.start <= extreme_at]
-        recent = push_bars[-self.accel_window :]
-        earlier = push_bars[: -self.accel_window]
-
-        # accel_price: net close-to-close displacement per bar, recent vs.
-        # earlier -- not average bar range. Real case that motivated this:
-        # DELL 2026-09-02's REV-L leg opened with several equally-wide,
-        # choppy bars (the initial sharp drop), which made the leg's
-        # *average bar range* a poor baseline -- the last 3 bars' genuine
-        # ~$9 net move looked unremarkable (0.96) next to that already-wide
-        # opening, even though net progress had clearly sped up. Rate-based
-        # and close-to-close (matching the EMA9/retrace convention) cancels
-        # out wick noise and rewards actual directional speed: needs at
-        # least 2 earlier bars to form even one earlier "step"; below that,
-        # same neutral fallback as too-few-bars ever was.
-        #
-        # The recent window's endpoint is extreme_close, not recent[-1]'s
-        # own close: recent[-1] *is* the extreme bar (push_bars always ends
-        # there), so if it was itself a reversal candle, its raw close would
-        # understate the move the exact same way it did for ema9_extension_adr
-        # above -- extreme_close already picks the representative close
-        # (its own if a genuine continuation, the bar before it otherwise),
-        # so reusing it here keeps both diagnostics consistent. Real case:
-        # FSLY 2026-09-09 REV-S 10:06 -- the recent window closed choppy and
-        # nearly flat (10:05 gave back most of its own spike), reading
-        # accel_price 0.27, while the actual push (via extreme_close, the
-        # close before that reversal) was still accelerating at 1.42.
-        if len(earlier) >= 2:
-            recent_end = extreme_close if extreme_close is not None else recent[-1].close
-            recent_move = abs(recent_end - earlier[-1].close)
-            earlier_move = abs(earlier[-1].close - earlier[0].close)
-            earlier_rate = earlier_move / (len(earlier) - 1)
-            recent_rate = recent_move / self.accel_window
-            accel_price = round(recent_rate / earlier_rate, 4) if earlier_rate > 0 else None
-        else:
-            accel_price = 1.0
-
-        # accel_vol has no directional analog (volume doesn't net out), so
-        # it stays an average-per-bar comparison, same "not enough bars"
-        # fallback as before.
-        earlier_for_vol = earlier or push_bars
-        recent_vol, earlier_vol = _mean([b.volume for b in recent]), _mean(
-            [b.volume for b in earlier_for_vol]
-        )
-        accel_vol = (
-            round(recent_vol / earlier_vol, 4)
-            if recent_vol is not None and earlier_vol
-            else None
-        )
+        accel_price, accel_vol = self._compute_accel(extreme_at, extreme_close)
+        if self.min_accel_price > 0 and (
+            accel_price is None or accel_price < self.min_accel_price
+        ):
+            _trace(
+                trace, bar,
+                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
+                f"{elapsed_minutes:.0f}m leg {leg_size:.2f} move_rvol {move_rvol} ema9_ext "
+                f"{ema9_extension_adr} OK, but accel_price {accel_price} < min "
+                f"{self.min_accel_price} -- not accelerating into the extreme",
+            )
+            return None
+        if self.min_accel_vol > 0 and (
+            accel_vol is None or accel_vol < self.min_accel_vol
+        ):
+            _trace(
+                trace, bar,
+                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
+                f"{elapsed_minutes:.0f}m leg {leg_size:.2f} move_rvol {move_rvol} ema9_ext "
+                f"{ema9_extension_adr} accel_price {accel_price} OK, but accel_vol "
+                f"{accel_vol} < min {self.min_accel_vol} -- volume not building",
+            )
+            return None
 
         legacy_condition = self._legacy_condition(levels, self._extreme, bar.close)
 
@@ -727,6 +699,72 @@ class _ReversalBase(Setup):
         self._fired_anchor = self._anchor
         return trigger
 
+    def _compute_accel(
+        self, extreme_at: datetime, extreme_close: float | None
+    ) -> tuple[float | None, float | None]:
+        """accel_price/accel_vol -- shared by the fire path and the
+        capitulation-in-progress alert so both gate on (and report) the
+        same numbers, computed the same way.
+
+        _leg_bars keeps accumulating past the extreme (a retrace-candidate
+        bar can't be told apart from a mid-push pause in real time, so both
+        get appended -- see on_bar's accumulation comment); filtering by the
+        already-known extreme_at here cleanly excludes any retrace bars
+        regardless of how many came before, leaving exactly the push itself.
+
+        accel_price: net close-to-close displacement per bar, recent vs.
+        earlier -- not average bar range. Real case that motivated this:
+        DELL 2026-09-02's REV-L leg opened with several equally-wide,
+        choppy bars (the initial sharp drop), which made the leg's
+        *average bar range* a poor baseline -- the last 3 bars' genuine
+        ~$9 net move looked unremarkable (0.96) next to that already-wide
+        opening, even though net progress had clearly sped up. Rate-based
+        and close-to-close (matching the EMA9/retrace convention) cancels
+        out wick noise and rewards actual directional speed: needs at
+        least 2 earlier bars to form even one earlier "step"; below that,
+        same neutral fallback as too-few-bars ever was.
+
+        The recent window's endpoint is extreme_close, not recent[-1]'s own
+        close: recent[-1] *is* the extreme bar (push_bars always ends
+        there), so if it was itself a reversal candle, its raw close would
+        understate the move the exact same way it did for ema9_extension_adr
+        -- extreme_close already picks the representative close (its own if
+        a genuine continuation, the bar before it otherwise), so reusing it
+        here keeps both diagnostics consistent. Real case: FSLY 2026-09-09
+        REV-S 10:06 -- the recent window closed choppy and nearly flat
+        (10:05 gave back most of its own spike), reading accel_price 0.27,
+        while the actual push (via extreme_close, the close before that
+        reversal) was still accelerating at 1.42.
+
+        accel_vol has no directional analog (volume doesn't net out), so
+        it stays an average-per-bar comparison, same "not enough bars"
+        fallback as before.
+        """
+        push_bars = [b for b in self._leg_bars if b.start <= extreme_at]
+        recent = push_bars[-self.accel_window :]
+        earlier = push_bars[: -self.accel_window]
+
+        if len(earlier) >= 2:
+            recent_end = extreme_close if extreme_close is not None else recent[-1].close
+            recent_move = abs(recent_end - earlier[-1].close)
+            earlier_move = abs(earlier[-1].close - earlier[0].close)
+            earlier_rate = earlier_move / (len(earlier) - 1)
+            recent_rate = recent_move / self.accel_window
+            accel_price = round(recent_rate / earlier_rate, 4) if earlier_rate > 0 else None
+        else:
+            accel_price = 1.0
+
+        earlier_for_vol = earlier or push_bars
+        recent_vol, earlier_vol = _mean([b.volume for b in recent]), _mean(
+            [b.volume for b in earlier_for_vol]
+        )
+        accel_vol = (
+            round(recent_vol / earlier_vol, 4)
+            if recent_vol is not None and earlier_vol
+            else None
+        )
+        return accel_price, accel_vol
+
     # -- capitulation-in-progress alert --------------------------------------
 
     def _maybe_flag_capitulation(
@@ -779,6 +817,16 @@ class _ReversalBase(Setup):
         ):
             return
 
+        accel_price, accel_vol = self._compute_accel(extreme_at, extreme_close)
+        if self.min_accel_price > 0 and (
+            accel_price is None or accel_price < self.min_accel_price
+        ):
+            return
+        if self.min_accel_vol > 0 and (
+            accel_vol is None or accel_vol < self.min_accel_vol
+        ):
+            return
+
         self._capitulation_alerted_extreme = self._extreme
         self._pending_capitulation_alert = CapitulationAlert(
             symbol=bar.symbol,
@@ -793,6 +841,8 @@ class _ReversalBase(Setup):
             ema9_extension_adr=(
                 round(ema9_extension_adr, 4) if ema9_extension_adr is not None else None
             ),
+            accel_price=accel_price,
+            accel_vol=accel_vol,
         )
 
     def pop_capitulation_alert(self) -> CapitulationAlert | None:

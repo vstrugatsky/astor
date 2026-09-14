@@ -90,6 +90,8 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
         "min_confirm_minutes": args.min_confirm_minutes,
         "min_leg_minutes": args.min_leg_minutes,
         "min_ema9_extension_adr": args.min_ema9_extension_adr,
+        "min_accel_price": args.min_accel_price,
+        "min_accel_vol": args.min_accel_vol,
         "accel_window": args.accel_window,
         "max_loss_dollars": args.max_loss,
     }
@@ -136,6 +138,8 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         "min_confirm_minutes": args.min_confirm_minutes,
         "min_leg_minutes": args.min_leg_minutes,
         "min_ema9_extension_adr": args.min_ema9_extension_adr,
+        "min_accel_price": args.min_accel_price,
+        "min_accel_vol": args.min_accel_vol,
         "accel_window": args.accel_window,
         "max_loss": args.max_loss,
     }
@@ -192,6 +196,8 @@ async def cmd_replay(args: argparse.Namespace) -> int:
                 "leg_size_adr": a.leg_size_adr,
                 "move_rvol": a.move_rvol,
                 "ema9_extension_adr": a.ema9_extension_adr,
+                "accel_price": a.accel_price,
+                "accel_vol": a.accel_vol,
             },
             bar_end=a.bar_end,
         )
@@ -219,6 +225,7 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
     print(
         f"Filters (REV-L/S)   : leg >= {args.min_leg_adr}x ADR built over "
         f">= {args.min_leg_minutes}min, ema9 ext >= {args.min_ema9_extension_adr} ADR, "
+        f"accel_price >= {args.min_accel_price}, accel_vol >= {args.min_accel_vol}, "
         f"retrace {args.min_retrace_pct}%-{args.max_retrace_pct}% of leg (or EMA9 reclaim), "
         f"held >= {args.min_confirm_minutes}min since the extreme"
     )
@@ -530,6 +537,8 @@ async def cmd_live(args: argparse.Namespace) -> int:
                 "min_confirm_minutes": args.min_confirm_minutes,
                 "min_leg_minutes": args.min_leg_minutes,
                 "min_ema9_extension_adr": args.min_ema9_extension_adr,
+                "min_accel_price": args.min_accel_price,
+                "min_accel_vol": args.min_accel_vol,
                 "accel_window": args.accel_window,
                 "max_loss": args.max_loss,
             },
@@ -724,9 +733,25 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--min-ema9-extension-adr",
         type=float,
-        default=0.05,
+        default=0.15,
         help="Minimum distance the leg's extreme finished from the frozen "
         "9EMA (1-min), in ADR units, for both the final trigger and the "
+        "capitulation alert (0 = off).",
+    )
+    r.add_argument(
+        "--min-accel-price",
+        type=float,
+        default=1.2,
+        help="Minimum accel_price (net close-to-close speed, last "
+        "accel-window bars vs. the rest of the leg's) for both the final "
+        "trigger and the capitulation alert (0 = off).",
+    )
+    r.add_argument(
+        "--min-accel-vol",
+        type=float,
+        default=1.0,
+        help="Minimum accel_vol (average volume, last accel-window bars vs. "
+        "the rest of the leg's) for both the final trigger and the "
         "capitulation alert (0 = off).",
     )
     r.add_argument(
@@ -735,8 +760,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="Bars used for the accel_price/accel_vol diagnostics: the last "
         "N bars' net close-to-close speed (accel_price) and average volume "
-        "(accel_vol) against the rest of the leg's. Diagnostic only -- not "
-        "yet filtered on.",
+        "(accel_vol) against the rest of the leg's.",
     )
     r.add_argument(
         "--min-retrace-pct",
@@ -808,17 +832,30 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument(
         "--min-ema9-extension-adr",
         type=float,
-        default=0.05,
+        default=0.15,
         help="Minimum distance the leg's extreme finished from the frozen "
         "9EMA (1-min), in ADR units, for both the final trigger and the "
+        "capitulation alert (0 = off).",
+    )
+    lv.add_argument(
+        "--min-accel-price",
+        type=float,
+        default=1.2,
+        help="Minimum accel_price for both the final trigger and the "
+        "capitulation alert (0 = off).",
+    )
+    lv.add_argument(
+        "--min-accel-vol",
+        type=float,
+        default=1.0,
+        help="Minimum accel_vol for both the final trigger and the "
         "capitulation alert (0 = off).",
     )
     lv.add_argument(
         "--accel-window",
         type=int,
         default=3,
-        help="Bars used for the accel_price/accel_vol diagnostics. "
-        "Diagnostic only -- not yet filtered on.",
+        help="Bars used for the accel_price/accel_vol diagnostics.",
     )
     lv.add_argument(
         "--min-retrace-pct",
@@ -877,7 +914,9 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--adr-sessions", type=int, default=14)
     ex.add_argument("--min-leg-adr", type=float, default=1.0)
     ex.add_argument("--min-leg-minutes", type=float, default=4.0)
-    ex.add_argument("--min-ema9-extension-adr", type=float, default=0.05)
+    ex.add_argument("--min-ema9-extension-adr", type=float, default=0.15)
+    ex.add_argument("--min-accel-price", type=float, default=1.2)
+    ex.add_argument("--min-accel-vol", type=float, default=1.0)
     ex.add_argument("--accel-window", type=int, default=3)
     ex.add_argument("--min-retrace-pct", type=float, default=10.0)
     ex.add_argument("--max-retrace-pct", type=float, default=50.0)

@@ -168,10 +168,13 @@ def _print_track_alert(alert: TrackAlert, trade: TrackedTrade) -> None:
 def _format_capitulation_alert(a: CapitulationAlert) -> str:
     move_rvol = a.move_rvol if a.move_rvol is not None else "n/a"
     ema9_ext = f"{a.ema9_extension_adr:.2f}" if a.ema9_extension_adr is not None else "n/a"
+    accel_price = f"{a.accel_price:.2f}" if a.accel_price is not None else "n/a"
+    accel_vol = f"{a.accel_vol:.2f}" if a.accel_vol is not None else "n/a"
     return (
         f"[{a.bar_start:%H:%M:%S} ET] CAPITULATION {a.symbol:<6} {a.direction:<5} "
         f"@ {a.price:.2f}   leg {a.leg_size_adr:.2f}x ADR   move_rvol {move_rvol}"
-        f"   ema9_ext {ema9_ext} ADR   extreme {a.leg_extreme:.2f} (anchor {a.anchor:.2f})"
+        f"   ema9_ext {ema9_ext} ADR   accel_price {accel_price}   accel_vol {accel_vol}"
+        f"   extreme {a.leg_extreme:.2f} (anchor {a.anchor:.2f})"
     )
 
 
@@ -517,6 +520,8 @@ class LiveDriver:
                             "leg_size_adr": alert.leg_size_adr,
                             "move_rvol": alert.move_rvol,
                             "ema9_extension_adr": alert.ema9_extension_adr,
+                            "accel_price": alert.accel_price,
+                            "accel_vol": alert.accel_vol,
                         },
                         bar_end=alert.bar_end,
                     )

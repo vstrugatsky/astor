@@ -84,12 +84,18 @@ def _canonical_long_bars() -> list[BarEvent]:
     exactly the 4-minute floor), then a bar 5 retrace to 94.0 (20% of the
     leg, comfortably in the 10-50% band) with a wide-open default volume
     curve so move_rvol trivially clears the 2.0x floor for this ADV tier.
+    Bar 1's close (97.5, a small hop from bar 0's 97.8) is deliberately
+    close to bar 0's, not bar 4's own pace -- accel_price only reads
+    earlier=[bar0, bar1] and recent_end=extreme_close (bar 4), so a small
+    early hop next to the leg's real (much bigger) net move over the last
+    3 bars clears the 1.2 accel_price floor; bars 2-3's own closes are
+    otherwise unconstrained (accel_price never reads them directly).
     Reused across every generic (non-Reversal-specific) test that just
     needs *a* trigger to fire.
     """
     return [
         bar(0, 98.0, 98.0, 97.5, 97.8, 50_000, symbol="REV"),
-        bar(1, 97.8, 97.9, 96.0, 96.3, 50_000, symbol="REV"),
+        bar(1, 97.8, 97.9, 96.0, 97.5, 50_000, symbol="REV"),
         bar(2, 96.3, 96.4, 95.0, 95.3, 50_000, symbol="REV"),
         bar(3, 95.3, 95.4, 94.0, 94.3, 50_000, symbol="REV"),
         bar(4, 94.3, 94.4, 93.0, 93.3, 50_000, symbol="REV"),  # extreme, minute 4
@@ -100,10 +106,12 @@ def _canonical_long_bars() -> list[BarEvent]:
 def _canonical_short_bars() -> list[BarEvent]:
     """Mirror of _canonical_long_bars for REV-S: anchor pinned at bar 0's
     low (102.0), leg extends to 107.7 at minute 4 (leg=5.7), retrace to
-    106.5 at minute 5 (21% of the leg)."""
+    106.5 at minute 5 (21% of the leg). Bar 1's close (102.5, a small hop
+    from bar 0's 102.2) mirrors _canonical_long_bars' own accel_price
+    setup -- see its docstring."""
     return [
         bar(0, 102.0, 102.0, 102.0, 102.2, 50_000, symbol="REV"),
-        bar(1, 102.2, 104.0, 102.1, 103.8, 50_000, symbol="REV"),
+        bar(1, 102.2, 104.0, 102.1, 102.5, 50_000, symbol="REV"),
         bar(2, 103.8, 105.5, 103.5, 105.2, 50_000, symbol="REV"),
         bar(3, 105.2, 106.7, 105.0, 106.4, 50_000, symbol="REV"),
         bar(4, 106.4, 107.7, 106.2, 107.4, 50_000, symbol="REV"),  # extreme, minute 4
@@ -120,11 +128,14 @@ def _generous_curve(symbol: str = "REV", n: int = 60) -> VolumeCurve:
     )
 
 
-def _rev_scanner(setup_cls, symbol: str = "REV", curve: VolumeCurve | None = None) -> Scanner:
+def _rev_scanner(
+    setup_cls, symbol: str = "REV", curve: VolumeCurve | None = None, setup_kwargs: dict | None = None
+) -> Scanner:
     levels = DailyLevels(
         symbol, date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
     )
-    scanner = Scanner({symbol: levels}, [setup_cls])
+    kwargs = {setup_cls.name: setup_kwargs} if setup_kwargs else None
+    scanner = Scanner({symbol: levels}, [setup_cls], kwargs)
     scanner.curves[symbol] = curve or _generous_curve(symbol)
     return scanner
 
@@ -1195,9 +1206,9 @@ def test_reversal_long_basic() -> None:
     check("retrace_via pct, not an EMA9 reclaim", t.extras["retrace_via"], "pct")
     check("leg_duration_minutes -- anchor (bar 0) to extreme (bar 4)", t.extras["leg_duration_minutes"], 4.0)
     check("move_rvol", t.extras["move_rvol"], 250_000.0)
-    check("ema9_extension_adr", t.extras["ema9_extension_adr"], 0.6416)
-    check("accel_price recorded (diagnostic only)", t.extras["accel_price"], 0.6667)
-    check("accel_vol recorded (diagnostic only)", t.extras["accel_vol"], 1.0)
+    check("ema9_extension_adr", t.extras["ema9_extension_adr"], 0.6723)
+    check("accel_price now filtered on too (>= min_accel_price)", t.extras["accel_price"], 4.6667)
+    check("accel_vol now filtered on too (>= min_accel_vol)", t.extras["accel_vol"], 1.0)
     check("reclaim_pct aliases level_stop_pct", t.extras["reclaim_pct"], t.extras["level_stop_pct"])
 
 
@@ -1279,7 +1290,13 @@ def test_reversal_requires_min_leg_minutes() -> None:
     levels = DailyLevels(
         "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
     )
-    loose_sc = Scanner({"REV": levels}, [ReversalLong], {"REV-L": {"min_leg_minutes": 0.0}})
+    # min_accel_price/min_accel_vol loosened too -- this 3-bar leg has too
+    # few bars to form an "earlier" accel window (falls back to the neutral
+    # 1.0), unrelated to the min_leg_minutes floor this test isolates.
+    loose_sc = Scanner(
+        {"REV": levels}, [ReversalLong],
+        {"REV-L": {"min_leg_minutes": 0.0, "min_accel_price": 0.0, "min_accel_vol": 0.0}},
+    )
     loose_sc.curves["REV"] = _generous_curve()
     triggers = _feed(loose_sc, fast_bars)
     check("same leg fires once the floor is loosened", len(triggers), 1)
@@ -1365,8 +1382,13 @@ def test_reversal_leg_bars_reset_on_rearm_after_dead_leg() -> None:
     the fix, _leg_bars only reset on a new anchor, so the dead leg's last
     _leg_bars entry (here, a single huge-volume bar) survived into the
     revived leg's "earlier" bucket and produced a misleadingly low ratio.
+
+    min_accel_price is loosened here -- this fixture is about leg_bars/
+    accel_vol content specifically (the small, steadily-rising volumes on
+    leg2 are what accel_vol's own assertion below exercises), not about
+    whether leg2 also happens to clear the unrelated accel_price floor.
     """
-    sc = _rev_scanner(ReversalLong)
+    sc = _rev_scanner(ReversalLong, setup_kwargs={"min_accel_price": 0.0})
     bars = [
         # leg1: huge, distinctive volume so any leakage into leg2 is obvious.
         bar(0, 98.0, 98.0, 97.5, 97.8, 500_000, symbol="REV"),
@@ -1414,7 +1436,11 @@ def test_reversal_leg_bars_reset_on_rearm_after_dead_leg() -> None:
 def _cdna_style_bars() -> list[BarEvent]:
     """REV-S leg: pre-leg low at bar 2 (9:32), peak at bar 6 (9:36). Under
     the new looser defaults this now fires at bar 7 (a 15% retrace already
-    clears the 10% floor), not bar 12 as it did under the old 25% floor."""
+    clears the 10% floor), not bar 12 as it did under the old 25% floor.
+    Not built to clear accel_price/accel_vol/ema9_extension_adr -- tests
+    using this fixture are about anchor-shift/timing correctness and pass
+    setup_kwargs zeroing those, same pattern as _rev_scanner's other
+    isolation tests."""
     return [
         bar(0, 100.0, 100.0, 99.0, 99.5, 1000, symbol="REV"),  # session open 100.0
         bar(1, 99.5, 99.5, 97.0, 97.5, 1000, symbol="REV"),  # anchor moves to 97.0
@@ -1436,7 +1462,10 @@ def test_reversal_short_anchor_shifts_to_pre_leg_low() -> None:
     # The CDNA case that motivated this: price dips right after the open,
     # *before* the real up-leg (the one REV-S actually tracks) begins. The
     # anchor must be that pre-leg low (96.0), not session_open (100.0).
-    sc = _rev_scanner(ReversalShort)
+    sc = _rev_scanner(
+        ReversalShort,
+        setup_kwargs={"min_accel_price": 0.0, "min_accel_vol": 0.0, "min_ema9_extension_adr": 0.0},
+    )
     triggers = _feed(sc, _cdna_style_bars())
     check("exactly one trigger", len(triggers), 1)
     t = triggers[0]
@@ -1459,11 +1488,12 @@ def test_reversal_leg_timing_correct_for_symbol_added_mid_session() -> None:
     # the symbol supposedly joined) and "live" (3-12, after) must produce
     # an identical trigger to the fully-live version.
     bars = _cdna_style_bars()
+    loose_kwargs = {"min_accel_price": 0.0, "min_accel_vol": 0.0, "min_ema9_extension_adr": 0.0}
 
-    baseline_sc = _rev_scanner(ReversalShort)
+    baseline_sc = _rev_scanner(ReversalShort, setup_kwargs=loose_kwargs)
     baseline = _feed(baseline_sc, bars)[0]
 
-    sc = _rev_scanner(ReversalShort)
+    sc = _rev_scanner(ReversalShort, setup_kwargs=loose_kwargs)
     for b in bars[:3]:  # backfilled -- establishes the pre-leg low, bars 0-2
         sc.backfill_bar(b)
     triggers = []
@@ -1493,8 +1523,13 @@ def test_reversal_long_anchor_shifts_to_pre_leg_high() -> None:
     # Mirror of the above: price ticks up right after the open, before the
     # real down-leg begins. The anchor must be that pre-leg high (104.0),
     # not session_open (100.0). Fires at bar 7 (12% retrace) under the new
-    # 10% floor, not bar 12 as it did under the old 25% floor.
-    sc = _rev_scanner(ReversalLong)
+    # 10% floor, not bar 12 as it did under the old 25% floor. Not built to
+    # clear accel_price/accel_vol/ema9_extension_adr -- this test is about
+    # anchor-shift correctness, so those are zeroed.
+    sc = _rev_scanner(
+        ReversalLong,
+        setup_kwargs={"min_accel_price": 0.0, "min_accel_vol": 0.0, "min_ema9_extension_adr": 0.0},
+    )
     bars = [
         bar(0, 100.0, 101.0, 100.0, 100.5, 1000, symbol="REV"),  # session open 100.0
         bar(1, 100.5, 103.0, 100.2, 102.8, 1000, symbol="REV"),  # anchor moves to 103.0
@@ -1550,7 +1585,14 @@ def test_reversal_retrace_via_ema9_reclaim_below_pct_floor() -> None:
     levels = DailyLevels(
         "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
     )
-    sc = Scanner({"REV": levels}, [ReversalLong], {"REV-L": {"min_ema9_extension_adr": 0.0}})
+    # accel_price/accel_vol zeroed too -- this leg's whole point is a slow,
+    # flat, non-accelerating build (bars 5-29 are identical, letting ema9
+    # converge), so it fails those by design, unrelated to the reclaim
+    # behavior being isolated here.
+    sc = Scanner(
+        {"REV": levels}, [ReversalLong],
+        {"REV-L": {"min_ema9_extension_adr": 0.0, "min_accel_price": 0.0, "min_accel_vol": 0.0}},
+    )
     sc.curves["REV"] = _generous_curve()
     triggers = _feed(sc, _slow_converge_bars())
     check("exactly one trigger", len(triggers), 1)
@@ -1569,6 +1611,22 @@ def test_reversal_requires_min_ema9_extension() -> None:
         _feed(sc, _slow_converge_bars()),
         [],
     )
+
+
+def test_reversal_requires_min_accel_price() -> None:
+    # _canonical_long_bars' accel_price is 4.6667 (see test_reversal_long_basic)
+    # -- comfortably above the 1.2 default, but below a threshold raised
+    # past it, isolating the accel_price floor specifically.
+    sc = _rev_scanner(ReversalLong, setup_kwargs={"min_accel_price": 10.0})
+    check("leg not accelerating enough never fires", _feed(sc, _canonical_long_bars()), [])
+
+
+def test_reversal_requires_min_accel_vol() -> None:
+    # _canonical_long_bars' accel_vol is exactly 1.0 (flat volume through
+    # the whole push) -- clears the 1.0 default (not strictly less than),
+    # but fails once the floor is raised past it.
+    sc = _rev_scanner(ReversalLong, setup_kwargs={"min_accel_vol": 1.5})
+    check("volume not building enough never fires", _feed(sc, _canonical_long_bars()), [])
 
 
 def test_reversal_ignores_retrace_against_a_stale_extreme() -> None:
@@ -1696,7 +1754,11 @@ def test_capitulation_alert_fires_once_per_deepening_extreme() -> None:
     sc = _rev_scanner(ReversalLong)
     bars = _canonical_long_bars() + [
         bar(6, 94.0, 94.2, 93.9, 94.1, 5_000, symbol="REV"),  # more retrace, no boundary move
-        bar(7, 94.1, 94.3, 91.0, 91.3, 50_000, symbol="REV"),  # deeper extreme -- alerts again
+        # deeper extreme, alerts again -- a much bigger/faster/higher-volume
+        # move than the original leg, needed to clear accel_price/accel_vol
+        # too, not just a deeper low (91.0 alone no longer accelerates
+        # relative to the already-brisk original leg).
+        bar(7, 94.1, 94.3, 88.0, 88.5, 200_000, symbol="REV"),
     ]
     seen = []
     for b in bars:
@@ -1709,7 +1771,7 @@ def test_capitulation_alert_fires_once_per_deepening_extreme() -> None:
     )
     check("full-history list accumulates both", len(sc.capitulation_alerts), 2)
     check("first alert's leg matches the first extreme", sc.capitulation_alerts[0].leg_extreme, 93.0)
-    check("second alert's leg matches the deeper extreme", sc.capitulation_alerts[1].leg_extreme, 91.0)
+    check("second alert's leg matches the deeper extreme", sc.capitulation_alerts[1].leg_extreme, 88.0)
 
 
 def test_capitulation_alert_gated_by_leg_quality() -> None:
@@ -1738,6 +1800,13 @@ def test_capitulation_alert_gated_by_leg_quality() -> None:
         alerts.extend(sc_rvol.pop_capitulation_alerts())
     check("thin RVOL relative to average never alerts", alerts, [])
 
+    sc_accel = _rev_scanner(ReversalLong, setup_kwargs={"min_accel_price": 10.0})
+    alerts = []
+    for b in _canonical_long_bars():
+        sc_accel.on_bar(b)
+        alerts.extend(sc_accel.pop_capitulation_alerts())
+    check("leg not accelerating enough never alerts", alerts, [])
+
     fast_bars = [
         bar(0, 98.0, 98.0, 97.5, 97.8, 50_000, symbol="REV"),
         bar(1, 97.8, 97.9, 95.0, 95.3, 50_000, symbol="REV"),
@@ -1753,7 +1822,14 @@ def test_capitulation_alert_gated_by_leg_quality() -> None:
     levels = DailyLevels(
         "REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
     )
-    sc_loose = Scanner({"REV": levels}, [ReversalLong], {"REV-L": {"min_leg_minutes": 0.0}})
+    # Isolating min_leg_minutes specifically: fast_bars' 3-bar leg has too
+    # few bars to form an "earlier" accel window at all (falls back to the
+    # neutral 1.0), so min_accel_price/min_accel_vol are loosened here too
+    # -- this test is about the duration floor alone, not accel.
+    sc_loose = Scanner(
+        {"REV": levels}, [ReversalLong],
+        {"REV-L": {"min_leg_minutes": 0.0, "min_accel_price": 0.0, "min_accel_vol": 0.0}},
+    )
     sc_loose.curves["REV"] = _generous_curve()
     alerts = []
     for b in fast_bars:

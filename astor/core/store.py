@@ -163,7 +163,8 @@ SELECT
     -- close displacement per bar, last few bars vs. the rest of the leg's
     -- (not average bar range -- rewards actual directional speed, not
     -- wick noise). accel_vol: average per-bar volume, last few bars vs.
-    -- the rest. Both diagnostic only, not yet filtered on.
+    -- the rest. Both now filtered on too (min_accel_price/min_accel_vol),
+    -- same as ema9_extension_adr.
     json_extract(t.extras_json, '$.ema9_at_extreme')           AS ema9_at_extreme,
     json_extract(t.extras_json, '$.extreme_close')             AS extreme_close,
     json_extract(t.extras_json, '$.ema9_extension_adr')        AS ema9_extension_adr,
@@ -256,6 +257,8 @@ SELECT
     json_extract(a.extras_json, '$.leg_size_adr')        AS leg_size_adr,
     json_extract(a.extras_json, '$.move_rvol')           AS move_rvol,
     json_extract(a.extras_json, '$.ema9_extension_adr')  AS ema9_extension_adr,
+    json_extract(a.extras_json, '$.accel_price')         AS accel_price,
+    json_extract(a.extras_json, '$.accel_vol')           AS accel_vol,
     -- Track-alert-only fields (breakeven/sell)
     json_extract(a.extras_json, '$.entry')               AS entry,
     json_extract(a.extras_json, '$.stop')                AS stop,
