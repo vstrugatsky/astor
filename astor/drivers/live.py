@@ -92,20 +92,14 @@ def _format_trigger_line(t: Trigger) -> str:
     def sized(shares: int | None, dollars: float | None) -> str:
         return f"{shares} sh (${dollars:,.0f})" if shares is not None else "no size (risk too wide)"
 
-    headline = (
-        f"[{t.bar_start:%H:%M:%S} ET] TRIGGER {t.symbol:<6} {_setup_token(t.setup)} "
-        f"{t.direction:<5} @ {t.trigger_price:.2f}"
-    )
-    # Reversal-only: U&R/O&F triggers carry none of these, and a run of
-    # five n/a's is noise rather than information.
     leg = _format_leg_metrics(
         e.get("leg_size_adr"), e.get("move_rvol"), e.get("ema9_extension_adr"),
         e.get("accel_price"), e.get("accel_vol"),
     )
-    if leg is not None:
-        headline = f"{headline}   {leg}"
     return (
-        f"{headline}\n"
+        f"[{t.bar_start:%H:%M:%S} ET] TRIGGER {t.symbol:<6} "
+        f"{_setup_token(t.setup, t.direction)} {t.direction:<5} "
+        f"@ {t.trigger_price:.2f}   {leg}\n"
         f"    {t.level_name:<3} {magnitude(level_pct)} {toward}, stop {t.level_value:.2f}"
         f"  ->  {sized(level_shares, level_dollars)}"
     )
@@ -138,14 +132,11 @@ def _accent(text: str, color: str, width: int = 0) -> str:
     return f"{color}{_ANSI_BOLD}{text}{_ANSI_RESET}{_ANSI_BLACK}{pad}"
 
 
-def _setup_token(setup: str) -> str:
-    """Reversal is the only setup whose name is colored -- green long, red
-    short. Everything else stays black like the rest of the line."""
-    if setup == "REV-L":
-        return _accent(setup, _ANSI_GREEN, width=4)
-    if setup == "REV-S":
-        return _accent(setup, _ANSI_RED, width=4)
-    return f"{setup:<4}"
+def _setup_token(setup: str, direction: str) -> str:
+    """The one colored token on a trigger line: green long (REV-L), red
+    short (REV-S). Reversal is the only setup that still fires (see
+    ALL_SETUPS), so direction alone decides the color."""
+    return _accent(setup, _ANSI_GREEN if direction == "long" else _ANSI_RED, width=4)
 
 
 def _format_leg_metrics(
@@ -154,14 +145,11 @@ def _format_leg_metrics(
     ema9_extension_adr: float | None,
     accel_price: float | None,
     accel_vol: float | None,
-) -> str | None:
+) -> str:
     """The leg-quality numbers, in one shared format so a CAPITULATION
     heads-up and the TRIGGER that may follow it show the identical set --
-    directly comparable line to line. None when the setup carries none of
-    them (i.e. not a Reversal)."""
-    values = (leg_size_adr, move_rvol, ema9_extension_adr, accel_price, accel_vol)
-    if all(v is None for v in values):
-        return None
+    directly comparable line to line. Individual values can still be None
+    (an unmeasurable leg renders n/a for that one)."""
 
     def num(v: float | None) -> str:
         return f"{v:.2f}" if v is not None else "n/a"
