@@ -72,27 +72,19 @@ def _should_notify(trigger: Trigger) -> bool:
 
 
 def _format_trigger_line(t: Trigger) -> str:
-    """Everything Notify shows for a fired trigger: the headline, then the
-    two stop/position-size framings (technical level vs. the session's
-    actual extreme) side by side, so a wide excursion's real risk is visible
-    right next to the tighter, level-only view.
+    """Two lines, nothing more (2026-09-14 -- the fuller headline was
+    overload mid-session): the leg quality the setup fired on, in exactly
+    the shape the earlier CAPITULATION heads-up used so the two read as one
+    story about the same leg, then the stop and the size it allows.
+
+    Deliberately dropped: grade/avwap/adr/rvol, and the CDH/CDL
+    session-extreme stop framing. They're still on the Trigger (and in the
+    store) for after-hours review; this is the in-session view.
     """
     e = t.extras
-    auto_grade = e.get("auto_grade")
-    avwap_pct, adr_pct, rvol = e.get("avwap_pct"), e.get("adr_pct"), e.get("rvol")
     level_pct = e.get("reclaim_pct")  # already a clean "how far the good way" magnitude
     level_shares, level_dollars = e.get("level_stop_shares"), e.get("level_stop_dollars")
-    session_extreme = e.get("session_extreme")
-    session_pct = e.get("session_extreme_pct")
-    session_shares, session_dollars = e.get("session_stop_shares"), e.get("session_stop_dollars")
-
     toward = "below" if t.direction == "short" else "above"
-    # CDH/CDL (current-day high/low) -- same 3-letter shape as PDH/PDL so the
-    # two lines line up.
-    session_label = "CDH" if t.direction == "short" else "CDL"
-
-    def signed(v: float | None) -> str:
-        return f"{v:+.2f}%" if v is not None else "n/a"
 
     def magnitude(v: float | None) -> str:
         return f"{abs(v):.2f}%" if v is not None else "n/a"
@@ -100,20 +92,23 @@ def _format_trigger_line(t: Trigger) -> str:
     def sized(shares: int | None, dollars: float | None) -> str:
         return f"{shares} sh (${dollars:,.0f})" if shares is not None else "no size (risk too wide)"
 
-    lines = [
-        f"[{t.bar_start:%H:%M:%S} ET] TRIGGER {t.symbol:<6} {t.setup:<4} {t.direction:<5} "
-        f"grade {auto_grade if auto_grade is not None else 'n/a'}/4"
-        f"   @ {t.trigger_price:.2f}   avwap {signed(avwap_pct)}   adr {magnitude(adr_pct)}"
-        f"   rvol {rvol if rvol is not None else 'n/a'}",
+    headline = (
+        f"[{t.bar_start:%H:%M:%S} ET] TRIGGER {t.symbol:<6} {_setup_token(t.setup)} "
+        f"{t.direction:<5} @ {t.trigger_price:.2f}"
+    )
+    # Reversal-only: U&R/O&F triggers carry none of these, and a run of
+    # five n/a's is noise rather than information.
+    leg = _format_leg_metrics(
+        e.get("leg_size_adr"), e.get("move_rvol"), e.get("ema9_extension_adr"),
+        e.get("accel_price"), e.get("accel_vol"),
+    )
+    if leg is not None:
+        headline = f"{headline}   {leg}"
+    return (
+        f"{headline}\n"
         f"    {t.level_name:<3} {magnitude(level_pct)} {toward}, stop {t.level_value:.2f}"
-        f"  ->  {sized(level_shares, level_dollars)}",
-    ]
-    if session_extreme is not None:
-        lines.append(
-            f"    {session_label:<3} {magnitude(session_pct)} {toward}, stop {session_extreme:.2f}"
-            f"  ->  {sized(session_shares, session_dollars)}"
-        )
-    return "\n".join(lines)
+        f"  ->  {sized(level_shares, level_dollars)}"
+    )
 
 
 # Terminal bell -- most terminals (Terminal.app, iTerm2) sound it without any
@@ -121,65 +116,110 @@ def _format_trigger_line(t: Trigger) -> str:
 # silent or visual-only if you don't hear it.
 _BELL = "\a"
 _ANSI_BOLD = "\033[1m"
-_ANSI_GREEN = "\033[92m"
-_ANSI_RED = "\033[91m"
 _ANSI_RESET = "\033[0m"
 
-# Distinct from the setup-trigger palette above, so a trade alert (this
-# trader's own open position) is visually distinguishable at a glance from a
-# fresh setup trigger (a new candidate). Bold + plain black (30) renders as
-# "bright black"/gray in most modern terminals rather than true black, so it
-# stays visible on both light- and dark-background terminals; a literal
-# black would risk vanishing on a dark background.
+# This trader runs a white-background terminal, so every alert prints black
+# and only one token per line carries color -- the thing that says what the
+# alert *is* (REV-L/REV-S, CAPITULATION, the track event). The bright
+# variants (90-97) wash out on white; these are the standard, darker ones.
 _ANSI_BLACK = "\033[30m"
+_ANSI_GREEN = "\033[32m"
+_ANSI_RED = "\033[31m"
 _ANSI_BROWN = "\033[38;5;130m"
-# A third, distinct color for a capitulation-in-progress alert -- neither a
-# fresh trigger (TRIGGER) nor an open-position lifecycle event (TRACK), so it
-# shouldn't share either's color at a glance.
-_ANSI_YELLOW = "\033[93m"
+
+
+def _accent(text: str, color: str, width: int = 0) -> str:
+    """Color one token inside an otherwise-black line. Returns to black
+    rather than a full reset so the rest of the line keeps its explicit
+    color; padding is emitted outside the color span so no trailing blanks
+    get painted.
+    """
+    pad = " " * max(0, width - len(text))
+    return f"{color}{_ANSI_BOLD}{text}{_ANSI_RESET}{_ANSI_BLACK}{pad}"
+
+
+def _setup_token(setup: str) -> str:
+    """Reversal is the only setup whose name is colored -- green long, red
+    short. Everything else stays black like the rest of the line."""
+    if setup == "REV-L":
+        return _accent(setup, _ANSI_GREEN, width=4)
+    if setup == "REV-S":
+        return _accent(setup, _ANSI_RED, width=4)
+    return f"{setup:<4}"
+
+
+def _format_leg_metrics(
+    leg_size_adr: float | None,
+    move_rvol: float | None,
+    ema9_extension_adr: float | None,
+    accel_price: float | None,
+    accel_vol: float | None,
+) -> str | None:
+    """The leg-quality numbers, in one shared format so a CAPITULATION
+    heads-up and the TRIGGER that may follow it show the identical set --
+    directly comparable line to line. None when the setup carries none of
+    them (i.e. not a Reversal)."""
+    values = (leg_size_adr, move_rvol, ema9_extension_adr, accel_price, accel_vol)
+    if all(v is None for v in values):
+        return None
+
+    def num(v: float | None) -> str:
+        return f"{v:.2f}" if v is not None else "n/a"
+
+    leg = f"{leg_size_adr:.2f}x ADR" if leg_size_adr is not None else "n/a"
+    return (
+        f"leg {leg}   move_rvol {move_rvol if move_rvol is not None else 'n/a'}"
+        f"   ema9_ext {num(ema9_extension_adr)} ADR"
+        f"   accel_price {num(accel_price)}   accel_vol {num(accel_vol)}"
+    )
+
+
+def _print_alert(text: str) -> None:
+    """Bell + explicit black, not just a plain print -- an alert scrolling by
+    silently in a wall of other output is exactly what this is for."""
+    print(f"{_BELL}{_ANSI_BLACK}{text}{_ANSI_RESET}")
 
 
 def _print_trigger_alert(t: Trigger) -> None:
-    """Bell + bold color, not just a plain print -- a trigger scrolling by
-    silently in a wall of other output is exactly what this is for."""
-    color = _ANSI_GREEN if t.direction == "long" else _ANSI_RED
-    print(f"{_BELL}{_ANSI_BOLD}{color}{_format_trigger_line(t)}{_ANSI_RESET}")
+    _print_alert(_format_trigger_line(t))
 
 
 def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
     header = f"[{alert.bar_start:%H:%M:%S} ET] TRACK {alert.symbol:<6} {trade.direction:<5}"
     if alert.kind == "breakeven":
         return (
-            f"{header} +1R reached @ {alert.close:.2f} (target {trade.target_1r:.2f})"
+            f"{header} {_accent('+1R reached', _ANSI_BROWN)} @ {alert.close:.2f}"
+            f" (target {trade.target_1r:.2f})"
             f"  ->  move stop to breakeven ({trade.entry:.2f})"
         )
     assert trade.peak is not None
     return (
-        f"{header} SELL -- gave back 0.5R from peak {trade.peak:.2f} to {alert.close:.2f}"
+        f"{header} SELL -- {_accent('gave back 0.5R', _ANSI_BROWN)}"
+        f" from peak {trade.peak:.2f} to {alert.close:.2f}"
         f"  (entry {trade.entry:.2f}, stop {trade.stop:.2f}, R {trade.r:.2f})"
     )
 
 
 def _print_track_alert(alert: TrackAlert, trade: TrackedTrade) -> None:
-    color = _ANSI_BLACK if alert.kind == "breakeven" else _ANSI_BROWN
-    print(f"{_BELL}{_ANSI_BOLD}{color}{_format_track_alert(alert, trade)}{_ANSI_RESET}")
+    _print_alert(_format_track_alert(alert, trade))
 
 
 def _format_capitulation_alert(a: CapitulationAlert) -> str:
-    move_rvol = a.move_rvol if a.move_rvol is not None else "n/a"
-    ema9_ext = f"{a.ema9_extension_adr:.2f}" if a.ema9_extension_adr is not None else "n/a"
-    accel_price = f"{a.accel_price:.2f}" if a.accel_price is not None else "n/a"
-    accel_vol = f"{a.accel_vol:.2f}" if a.accel_vol is not None else "n/a"
+    # leg_extreme/anchor dropped from the display (2026-09-14): they're the
+    # leg's bookends, not something to act on mid-session. Still on the
+    # CapitulationAlert itself for the log/journal.
+    color = _ANSI_GREEN if a.direction == "long" else _ANSI_RED
+    leg = _format_leg_metrics(
+        a.leg_size_adr, a.move_rvol, a.ema9_extension_adr, a.accel_price, a.accel_vol
+    )
     return (
-        f"[{a.bar_start:%H:%M:%S} ET] CAPITULATION {a.symbol:<6} {a.direction:<5} "
-        f"@ {a.price:.2f}   leg {a.leg_size_adr:.2f}x ADR   move_rvol {move_rvol}"
-        f"   ema9_ext {ema9_ext} ADR   accel_price {accel_price}   accel_vol {accel_vol}"
-        f"   extreme {a.leg_extreme:.2f} (anchor {a.anchor:.2f})"
+        f"[{a.bar_start:%H:%M:%S} ET] {_accent('CAPITULATION', color)} "
+        f"{a.symbol:<6} {a.direction:<5} @ {a.price:.2f}   {leg}"
     )
 
 
 def _print_capitulation_alert(a: CapitulationAlert) -> None:
-    print(f"{_BELL}{_ANSI_BOLD}{_ANSI_YELLOW}{_format_capitulation_alert(a)}{_ANSI_RESET}")
+    _print_alert(_format_capitulation_alert(a))
 
 
 async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | None:

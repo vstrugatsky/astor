@@ -727,10 +727,65 @@ def test_format_trigger_line() -> None:
     )
     line = _format_trigger_line(t)
     check("headline present", "TRIGGER ABAT" in line, True)
-    check("grade shown", "grade 3/4" in line, True)
-    check("avwap shown signed", "avwap -3.10%" in line, True)
+    check("price shown", "@ 2.40" in line, True)
     check("level line reads as a magnitude + word, short -> below", "EXT 0.85% below" in line, True)
     check("level position size shown", "417 sh ($1,001)" in line, True)
+    # Two lines and no more -- everything else is after-hours review material.
+    check("exactly two lines", len(line.splitlines()), 2)
+    for dropped in ("grade", "avwap", "adr ", "rvol", "CDH", "CDL"):
+        check(f"{dropped!r} dropped from the in-session view", dropped in line, False)
+    # No leg-quality extras here (a U&R/O&F-shaped trigger) -- they're
+    # skipped entirely rather than printed as five n/a's.
+    check("no leg metrics without leg extras", "leg " in line, False)
+
+
+def test_format_trigger_line_shows_leg_metrics() -> None:
+    """A Reversal trigger repeats the same leg-quality numbers the earlier
+    CAPITULATION heads-up showed, so the two are comparable line to line."""
+    from astor.core.types import Trigger
+    from astor.drivers.live import _format_trigger_line
+
+    t = Trigger(
+        symbol="ABAT",
+        setup="REV-S",
+        direction="short",
+        trigger_price=2.40,
+        bar_start=OPEN,
+        bar_end=OPEN + timedelta(minutes=1),
+        level_name="EXT",
+        level_value=2.50,
+        extras={
+            "auto_grade": 3, "reclaim_pct": 0.85,
+            "level_stop_shares": 417, "level_stop_dollars": 1000.80,
+            "leg_size_adr": 1.25, "move_rvol": 2.5, "ema9_extension_adr": 0.6723,
+            "accel_price": 4.6667, "accel_vol": 1.0,
+        },
+    )
+    line = _format_trigger_line(t)
+    check("leg metrics ride on the headline, not their own line", len(line.splitlines()), 2)
+    check("leg size shown", "leg 1.25x ADR" in line, True)
+    check("move_rvol shown", "move_rvol 2.5" in line, True)
+    check("ema9 extension shown", "ema9_ext 0.67 ADR" in line, True)
+    check("accel_price shown", "accel_price 4.67" in line, True)
+    check("accel_vol shown", "accel_vol 1.00" in line, True)
+
+
+def test_format_capitulation_alert() -> None:
+    from astor.core.types import CapitulationAlert
+    from astor.drivers.live import _format_capitulation_alert
+
+    a = CapitulationAlert(
+        symbol="ABAT", direction="short", bar_start=OPEN,
+        bar_end=OPEN + timedelta(minutes=1), price=2.40,
+        leg_extreme=2.62, anchor=2.95, leg_size_adr=1.25, move_rvol=2.5,
+        ema9_extension_adr=0.6723, accel_price=4.6667, accel_vol=1.0,
+    )
+    line = _format_capitulation_alert(a)
+    check("headline present", "CAPITULATION" in line and "ABAT" in line, True)
+    check("leg metrics shown", "leg 1.25x ADR   move_rvol 2.5" in line, True)
+    # Dropped from the display -- bookends of the leg, not actionable mid-session.
+    check("extreme not shown", "extreme" in line, False)
+    check("anchor not shown", "anchor" in line, False)
 
 
 def test_should_notify() -> None:
