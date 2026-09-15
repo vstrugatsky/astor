@@ -810,7 +810,7 @@ def test_should_notify() -> None:
             extras={} if grade is None else {"auto_grade": grade},
         )
 
-    # REV-L/REV-S: notify regardless of grade, cut off at 15:00 ET.
+    # The 15:00 ET cutoff is the whole rule: grade is never consulted.
     check(
         "REV-L notifies with no grade at all, before the cutoff",
         _should_notify(trigger_at("REV-L", 11, 30, None)),
@@ -824,19 +824,6 @@ def test_should_notify() -> None:
     check(
         "REV-L does not notify at/after the 15:00 cutoff, even grade 4",
         _should_notify(trigger_at("REV-L", 15, 0, 4)),
-        False,
-    )
-
-    # Anything else (a retired or future setup name) falls back to the grade
-    # threshold -- U&R/O&F's old blanket suppression is gone along with them.
-    check(
-        "unrecognized setup falls back to grade >= threshold (3 passes)",
-        _should_notify(trigger_at("U&R", 12, 0, 3)),
-        True,
-    )
-    check(
-        "unrecognized setup falls back to grade >= threshold (2 fails)",
-        _should_notify(trigger_at("O&F", 12, 0, 2)),
         False,
     )
 

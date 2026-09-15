@@ -19,7 +19,6 @@ from pathlib import Path
 
 from ib_async import IB
 
-from astor.core.grading import NOTIFY_GRADE_THRESHOLD
 from astor.core.scanner import Scanner
 from astor.core.store import TriggerStore
 from astor.core.tracking import SellRuleTracker, TrackAlert, TrackedTrade
@@ -52,23 +51,22 @@ ACTIVATION_PACE_SECONDS = 0.75
 # most of a second per symbol out of an already-paced activation batch.
 BACKFILL_TIMEOUT = 15.0
 
-# Reversal notifications bypass auto_grade entirely (2026-09-02, "for now"
-# -- not a permanent call) and use a flat time cutoff instead. grade_trigger
-# (astor.core.grading) was tuned around U&R/O&F and doesn't fit Reversal yet:
+# Notifications bypass auto_grade entirely (2026-09-02, "for now" -- not a
+# permanent call) and use a flat time cutoff instead. grade_trigger
+# (astor.core.grading) was tuned around U&R/O&F and doesn't fit Reversal:
 # it rewards the 9:45-11:00 window, which silenced every real Reversal alert
 # after 11:00; it rewards RVOL, which every Reversal trigger already clears
 # by construction (RVOL is one of Reversal's own firing filters), so the
 # reward is meaningless there; and it rewards price beyond session_open,
 # which isn't a meaningful signal for a retracement setup. Revisit once
 # grading is redesigned per-setup rather than shared across all of them.
-REVERSAL_NOTIFY_SETUPS = {"REV-L", "REV-S"}
+# Reversal is the only setup left (ALL_SETUPS), so the cutoff is the whole
+# rule -- the grade-threshold path went with U&R/O&F.
 REVERSAL_NOTIFY_CUTOFF = time(15, 0)
 
 
 def _should_notify(trigger: Trigger) -> bool:
-    if trigger.setup in REVERSAL_NOTIFY_SETUPS:
-        return trigger.bar_start.time() < REVERSAL_NOTIFY_CUTOFF
-    return (trigger.extras.get("auto_grade") or 0) >= NOTIFY_GRADE_THRESHOLD
+    return trigger.bar_start.time() < REVERSAL_NOTIFY_CUTOFF
 
 
 def _format_trigger_line(t: Trigger) -> str:

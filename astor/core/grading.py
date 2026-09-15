@@ -4,12 +4,13 @@ Applied by Scanner right after a Setup fires (astor.core.scanner), using
 data a Setup already computed (rvol, avwap, in trigger.extras) alongside
 data Scanner already holds (levels, indicators).
 
-This never filters what gets recorded: every trigger is still stored
-regardless of grade (astor.core.store). Only Live's terminal alert
-(astor.drivers.live) is gated on it, via NOTIFY_GRADE_THRESHOLD. The result
-lives in extras["auto_grade"] -- the program's own real-time call, distinct
-from the trader's hand-entered `grade` column, so a later hand-edit never
-erases what the rules actually said in the moment.
+This never filters anything: every trigger is stored regardless of grade
+(astor.core.store), and Live's terminal alert stopped gating on it when
+U&R/O&F were retired (see astor.drivers.live._should_notify) -- the grade
+is recorded for review, nothing more. The result lives in
+extras["auto_grade"] -- the program's own real-time call, distinct from the
+trader's hand-entered `grade` column, so a later hand-edit never erases what
+the rules actually said in the moment.
 """
 
 from __future__ import annotations
@@ -30,8 +31,6 @@ EARLY_WINDOW_MINUTES = (15, 90)
 # A trigger inside the last hour before RTH_CLOSE (15:00-16:00 ET) is treated
 # as more likely a late-day chase than a fresh setup.
 LAST_HOUR_MINUTES = 60
-
-NOTIFY_GRADE_THRESHOLD = 3
 
 # The more liquid a name, the less relative volume it takes to look unusual --
 # a $5B/day name moving on 15% extra volume is as meaningful as an illiquid
