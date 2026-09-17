@@ -7,7 +7,7 @@ a Live run would have seen, ahead of any setup actually consuming them.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from astor.core.types import BarEvent, VolumeCurve
 
@@ -130,3 +130,36 @@ def compute_rvol(cum_volume: float, at: datetime, curve: VolumeCurve) -> float |
     if not avg:
         return None
     return round(cum_volume / avg, 2)
+
+
+def compute_interval_rvol(
+    volume: float, first_bar_start: datetime, last_bar_start: datetime, curve: VolumeCurve
+) -> float | None:
+    """One window's own volume against the historical average volume for that
+    same clock window -- the pace *right now*, where compute_rvol gives the
+    pace for the day so far. 2.00 means this window traded double what these
+    minutes usually do.
+
+    Derived from the same cumulative curve by differencing its endpoints, so
+    it needs no second dataset: average window volume is the average
+    cumulative volume at `last_bar_start` minus the average cumulative volume
+    at the minute *before* `first_bar_start`. None when the curve doesn't
+    cover both ends (a sparse curve, or a window outside its RTH minutes).
+    """
+    end = curve.avg_cum_volume_at(last_bar_start.timetz().replace(tzinfo=None))
+    if end is None:
+        return None
+    before = (first_bar_start - timedelta(minutes=1)).timetz().replace(tzinfo=None)
+    start = curve.avg_cum_volume_at(before)
+    if start is None:
+        # Nothing precedes the session's first window, so its average
+        # cumulative volume *is* its average window volume. A gap anywhere
+        # later is a real hole in the curve -- differencing across it would
+        # silently charge this window with the missing minutes' volume too.
+        if any(t < before for t in curve.cum_volume_by_minute):
+            return None
+        start = 0.0
+    expected = end - start
+    if expected <= 0:
+        return None
+    return round(volume / expected, 2)

@@ -1928,6 +1928,129 @@ def test_capitulation_alert_gated_by_leg_quality() -> None:
     check("same fast leg alerts once the duration floor is loosened", len(alerts), 1)
 
 
+def _profile_fixture(minutes: int = 20, avg_per_minute: float = 3500.0):
+    """A session that pushes up for 12 minutes on heavy volume, then fades,
+    against a flat historical pace of `avg_per_minute` shares."""
+    from astor.core.types import VolumeCurve
+
+    bars, curve_map, px, cum = [], {}, 10.00, 0.0
+    for i in range(minutes):
+        o = px
+        px = round(px + (0.06 if i < 12 else -0.03), 2)
+        start = OPEN + timedelta(minutes=i)
+        bars.append(
+            BarEvent("RUM", start, start + timedelta(minutes=1), o,
+                     max(o, px) + 0.02, min(o, px) - 0.02, px,
+                     4000.0 + (6000.0 if 5 <= i < 12 else 0.0))
+        )
+        cum += avg_per_minute
+        curve_map[start.timetz().replace(tzinfo=None)] = cum
+    levels = DailyLevels("RUM", date(2026, 8, 13), pdh=10.40, pdl=9.70,
+                         adr_pct=6.0, prev_close=10.00, adr_sessions=14, adv=42_000_000.0)
+    return bars, levels, VolumeCurve("RUM", 20, curve_map)
+
+
+def test_compute_interval_rvol() -> None:
+    from astor.core.indicators import compute_interval_rvol
+    from astor.core.types import VolumeCurve
+
+    # Flat 1,000-share/minute historical pace.
+    curve = VolumeCurve(
+        "RUM", 20,
+        {(OPEN + timedelta(minutes=i)).timetz().replace(tzinfo=None): 1000.0 * (i + 1)
+         for i in range(10)},
+    )
+    check(
+        "a 5-min window trading double its usual 5,000 reads 2.0",
+        compute_interval_rvol(10_000, OPEN + timedelta(minutes=5), OPEN + timedelta(minutes=9), curve),
+        2.0,
+    )
+    # The session's first window has nothing before it: the average
+    # cumulative volume at its last minute IS its expected window volume.
+    check(
+        "first window differences against zero, not against a missing key",
+        compute_interval_rvol(10_000, OPEN, OPEN + timedelta(minutes=4), curve),
+        2.0,
+    )
+    check(
+        "no curve coverage past the end -> None, not a fabricated number",
+        compute_interval_rvol(10_000, OPEN + timedelta(minutes=20), OPEN + timedelta(minutes=24), curve),
+        None,
+    )
+    # A hole in the curve right before the window would otherwise charge
+    # this window with the missing minutes' volume.
+    holed = VolumeCurve("RUM", 20, {k: v for i, (k, v) in enumerate(curve.cum_volume_by_minute.items()) if i != 4})
+    check(
+        "a gap before the window -> None rather than a silent overcount",
+        compute_interval_rvol(10_000, OPEN + timedelta(minutes=5), OPEN + timedelta(minutes=9), holed),
+        None,
+    )
+
+
+def test_build_profile_rows() -> None:
+    from astor.cli import build_profile_rows
+
+    bars, levels, curve = _profile_fixture()
+    rows, empty = build_profile_rows(bars, levels, curve, 5)
+
+    check("20 minutes at 5-min intervals -> 4 rows", len(rows), 4)
+    check("buckets anchored on the 09:30 open", [r.at.strftime("%H:%M") for r in rows],
+          ["09:30", "09:35", "09:40", "09:45"])
+    check("no gaps in a continuous session", empty, 0)
+    first = rows[0]
+    check("interval volume is the bucket's own", first.volume, 20_000.0)
+    check("cumulative volume matches at the first bucket", first.cum_volume, 20_000.0)
+    check("interval RVOL: 20k against 5 x 3.5k", first.interval_rvol, 1.14)
+    check("session RVOL agrees at the first bucket", first.rvol, 1.14)
+    # 09:35-09:39 runs 10k/min against the same 3.5k pace.
+    check("interval RVOL tracks the burst", rows[1].interval_rvol, 2.86)
+    check("session RVOL lags it, as a cumulative measure should", rows[1].rvol, 2.00)
+    check("close is the bucket's last close", first.close, 10.30)
+    # Today's own range, high/low - 1: 10.76 high, 10.00 low at this point.
+    check("session range is this day's own, not an average",
+          round(rows[-1].session_range_pct, 2), 7.62)
+    check("interval range is that bucket's own", round(rows[0].interval_range_pct, 2), 3.41)
+    check("move from the session open", round(first.from_open_pct, 2), 3.0)
+
+
+def test_build_profile_rows_window_does_not_rebase_the_session() -> None:
+    """--start/--end trim which rows print; RVOL and the session-to-date
+    columns still accumulate from the open."""
+    from astor.cli import build_profile_rows
+
+    bars, levels, curve = _profile_fixture()
+    full, _ = build_profile_rows(bars, levels, curve, 5)
+    windowed, _ = build_profile_rows(bars, levels, curve, 5, time(9, 40), time(9, 50))
+
+    check("window trims the rows", [r.at.strftime("%H:%M") for r in windowed], ["09:40", "09:45"])
+    by_time = {r.at: r for r in full}
+    for r in windowed:
+        check(f"{r.at:%H:%M} RVOL unchanged by windowing", r.rvol, by_time[r.at].rvol)
+        check(f"{r.at:%H:%M} cumulative volume unchanged", r.cum_volume, by_time[r.at].cum_volume)
+
+
+def test_build_profile_rows_skips_zero_volume_and_counts_gaps() -> None:
+    """Zero-volume padding is dropped exactly as Scanner drops it, so a
+    minute nothing traded in neither moves the extremes nor counts as a
+    traded interval -- the resulting hole is reported instead."""
+    from astor.cli import build_profile_rows
+
+    bars, levels, curve = _profile_fixture()
+    # Blank out 09:35-09:39 entirely (zero volume, and a price spike that
+    # must not reach session_high).
+    padded = [
+        BarEvent(b.symbol, b.start, b.end, b.open, 99.0, b.low, b.close, 0.0)
+        if time(9, 35) <= b.start.time() < time(9, 40) else b
+        for b in bars
+    ]
+    rows, empty = build_profile_rows(padded, levels, curve, 5)
+    check("the dead interval produces no row", [r.at.strftime("%H:%M") for r in rows],
+          ["09:30", "09:40", "09:45"])
+    check("and is reported rather than silently closed up", empty, 1)
+    check("the 99.00 zero-volume high never reached the session extremes",
+          rows[-1].session_range_pct < 20.0, True)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

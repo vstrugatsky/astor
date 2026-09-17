@@ -17,6 +17,9 @@
 
     uv run python -m astor.cli explain --date 2026-08-28 --ticker NTNX --setup REV-S
         (bar-by-bar reasons why that setup did or did not fire)
+
+    uv run python -m astor.cli profile --date 2026-09-14 --ticker RUM --interval 5
+        (how RVOL and the day's own range built through that session)
 """
 
 from __future__ import annotations
@@ -26,11 +29,13 @@ import asyncio
 import logging
 import sqlite3
 import uuid
-from datetime import date, datetime, time
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from ib_async import IB
 
+from astor.core.indicators import SessionIndicators, compute_interval_rvol, compute_rvol
 from astor.core.scanner import Scanner
 from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME, rev_rvol_threshold
 from astor.core.store import TriggerStore
@@ -359,6 +364,236 @@ async def cmd_explain(args: argparse.Namespace) -> int:
             )
     else:
         print("\nNo trigger fired.")
+    return 0
+
+
+RTH_OPEN = time(9, 30)
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileRow:
+    """One interval of a session, from two angles: what happened *in* the
+    interval, and where the day stood at the end of it."""
+
+    at: datetime  # the interval's first minute -- the label it prints under
+    bars: int
+    close: float
+    # Within the interval.
+    volume: float
+    interval_rvol: float | None
+    interval_range_pct: float | None
+    # Session to date, as of this interval's last bar.
+    cum_volume: float
+    rvol: float | None
+    session_range_pct: float | None
+    from_open_pct: float | None
+
+
+def _range_pct(high: float | None, low: float | None) -> float | None:
+    """A range as a percent of its own low -- (High/Low - 1) x 100, the same
+    arithmetic ADR% is built from, but for one day (or one interval) alone
+    with no averaging across sessions. What a trader means by "this name has
+    done 7% today".
+    """
+    if high is None or low is None or low <= 0:
+        return None
+    return (high / low - 1.0) * 100.0
+
+
+def build_profile_rows(
+    bars: list,
+    levels,
+    curve,
+    interval_minutes: int,
+    start: time | None = None,
+    end: time | None = None,
+) -> tuple[list[ProfileRow], int]:
+    """Bucket a session's 1-min bars into `interval_minutes` windows.
+
+    Returns (rows, empty_intervals). Buckets are anchored to the 09:30 open,
+    not to the first bar, so a 5-min run always reads 09:30/09:35/09:40
+    however late the symbol's first print lands.
+
+    RVOL and the session-to-date columns are always accumulated from the
+    open -- `start`/`end` trim which rows *print*, never what they are
+    computed from, so windowing a run can't quietly rebase the day's pace.
+
+    Zero-volume bars are dropped exactly as Scanner does (astor.core.scanner
+    ._gate): IBKR pads thin tickers with them, and a minute nothing traded in
+    must not move AVWAP, the extremes, or the volume this RVOL divides.
+    """
+    indicators = SessionIndicators(levels.symbol)
+    buckets: dict[datetime, list] = {}
+    rows: list[ProfileRow] = []
+
+    for b in bars:
+        if b.volume <= 0:
+            continue
+        anchor = b.start.replace(hour=RTH_OPEN.hour, minute=RTH_OPEN.minute, second=0, microsecond=0)
+        idx = int((b.start - anchor).total_seconds() // 60) // interval_minutes
+        buckets.setdefault(anchor + timedelta(minutes=idx * interval_minutes), []).append(b)
+
+    for at in sorted(buckets):
+        group = buckets[at]
+        for b in group:
+            indicators.update(b)
+        last = group[-1]
+        volume = sum(b.volume for b in group)
+        hi, lo = max(b.high for b in group), min(b.low for b in group)
+        rows.append(
+            ProfileRow(
+                at=at,
+                bars=len(group),
+                close=last.close,
+                volume=volume,
+                interval_rvol=(
+                    compute_interval_rvol(volume, group[0].start, last.start, curve)
+                    if curve is not None
+                    else None
+                ),
+                interval_range_pct=_range_pct(hi, lo),
+                cum_volume=indicators.cum_volume,
+                rvol=(
+                    compute_rvol(indicators.cum_volume, last.start, curve)
+                    if curve is not None
+                    else None
+                ),
+                session_range_pct=_range_pct(indicators.session_high, indicators.session_low),
+                from_open_pct=(
+                    (last.close / indicators.session_open - 1.0) * 100.0
+                    if indicators.session_open
+                    else None
+                ),
+            )
+        )
+
+    in_window = [
+        r
+        for r in rows
+        if (start is None or r.at.time() >= start) and (end is None or r.at.time() < end)
+    ]
+    # Buckets between the first and last printed row that saw no trades at
+    # all -- for a thin name that gap is itself the finding, so it gets
+    # counted rather than silently closed up.
+    empty = 0
+    if in_window:
+        span = (in_window[-1].at - in_window[0].at).total_seconds() / 60
+        empty = int(span // interval_minutes) + 1 - len(in_window)
+    return in_window, empty
+
+
+def _human_volume(v: float) -> str:
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.0f}k"
+    return f"{v:.0f}"
+
+
+def print_profile(rows: list[ProfileRow], empty: int, levels, curve, args) -> None:
+    def n(v: float | None, suffix: str = "", nd: int = 2) -> str:
+        return f"{v:.{nd}f}{suffix}" if v is not None else "n/a"
+
+    def signed(v: float | None) -> str:
+        return f"{v:+.2f}%" if v is not None else "n/a"
+
+    # 7 (TIME) + the two column groups below -- kept in one place so the
+    # rules, the group header and the columns can't drift apart.
+    interval_w, session_w = 8 + 9 + 8 + 8, 11 + 8 + 8 + 12
+    rule = "=" * (7 + interval_w + session_w)
+    print("\n" + rule)
+    print(f"PROFILE {levels.symbol} {args.date}   {args.interval}-min intervals")
+    print(rule)
+    print(
+        f"prev close {levels.prev_close:.2f}   PDH {levels.pdh:.2f}   PDL {levels.pdl:.2f}   "
+        f"ADR({levels.adr_sessions}) {levels.adr_pct:.2f}% (${levels.adr:.2f})   "
+        f"ADV ${levels.adv:,.0f}"
+    )
+    print(
+        f"RVOL curve: {curve.sessions} prior sessions"
+        if curve is not None
+        else "RVOL curve: none -- RVOL columns will read n/a"
+    )
+    print(
+        "\nRANGE% is this day's own high/low - 1, no averaging across sessions: "
+        "the session-to-date\ncolumn is today's ADR% as it stands. The ADR() "
+        "above is the prior-session average, for scale."
+    )
+    print(
+        "\n"
+        + (
+            " " * 7
+            + "--- in the interval ---".center(interval_w)
+            + "--- session to date ---".center(session_w)
+        ).rstrip()
+    )
+    print(
+        f"{'TIME':<7}{'CLOSE':>8}{'VOL':>9}{'iRVOL':>8}{'RANGE%':>8}"
+        f"{'CUMVOL':>11}{'RVOL':>8}{'RANGE%':>8}{'FROM OPEN':>12}"
+    )
+    for r in rows:
+        print(
+            f"{r.at:%H:%M}  {r.close:>8.2f}{_human_volume(r.volume):>9}"
+            f"{n(r.interval_rvol):>8}{n(r.interval_range_pct, '%'):>8}"
+            f"{_human_volume(r.cum_volume):>11}{n(r.rvol):>8}"
+            f"{n(r.session_range_pct, '%'):>8}"
+            f"{signed(r.from_open_pct):>12}"
+        )
+    if not rows:
+        print("  (no bars with volume in this window)")
+        return
+    last = rows[-1]
+    print(
+        f"\nClose of window: RVOL {n(last.rvol)}   "
+        f"day range {n(last.session_range_pct, '%')} "
+        f"(prior {levels.adr_sessions}-session average {levels.adr_pct:.2f}%)   "
+        f"{len(rows)} interval(s)"
+        + (f", {empty} with no trades at all" if empty else "")
+    )
+
+
+async def cmd_profile(args: argparse.Namespace) -> int:
+    """How one symbol's session actually developed: RVOL and ADR usage,
+    interval by interval.
+
+    Built for tuning the filters rather than for trading off -- when a
+    trigger fires late, or an accel/RVOL floor lets through something it
+    shouldn't have, this is the tape those numbers were read from. It reuses
+    the same SessionIndicators/compute_rvol the live path runs on, off the
+    same cached 1-min bars, so what it prints is what the algorithm saw.
+    """
+    symbol = args.ticker.upper().replace(".", " ")
+    session = date.fromisoformat(args.date)
+    if args.interval < 1:
+        logger.error("--interval must be at least 1 minute (got %s)", args.interval)
+        return 2
+    start_t, end_t = parse_hhmm(args.start), parse_hhmm(args.end)
+
+    ib = IB()
+    logger.info("Connecting to %s:%d...", args.host, args.port)
+    await ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=15)
+    try:
+        driver = ReplayDriver(ib, session, "1 min", Path(args.cache_dir))
+        levels = await driver.fetch_levels([symbol], args.adr_sessions)
+        bars_by_symbol = await driver.fetch_bars([symbol])
+        curves = await driver.fetch_volume_curve([symbol], args.rvol_sessions)
+    finally:
+        ib.disconnect()
+
+    lv = levels.get(symbol)
+    if lv is None:
+        logger.error("No reference levels for %s on %s -- nothing to profile.", symbol, session)
+        return 1
+    bars = bars_by_symbol.get(symbol, [])
+    if not bars:
+        logger.error("No intraday bars for %s on %s.", symbol, session)
+        return 1
+
+    curve = curves.get(symbol)
+    if curve is None:
+        logger.warning("No volume curve for %s -- RVOL columns will read n/a.", symbol)
+    rows, empty = build_profile_rows(bars, lv, curve, args.interval, start_t, end_t)
+    print_profile(rows, empty, lv, curve, args)
     return 0
 
 
@@ -928,6 +1163,29 @@ def build_parser() -> argparse.ArgumentParser:
     # Distinct from replay/live/warm-cache/purge-db's client IDs.
     ex.add_argument("--client-id", type=int, default=25)
 
+    pr = sub.add_parser(
+        "profile",
+        help="Interval-by-interval RVOL and ADR usage for one symbol on one "
+        "day -- the tape the filters were read from",
+    )
+    pr.add_argument("--date", required=True, help="Market day, YYYY-MM-DD")
+    pr.add_argument("--ticker", required=True, help="Single symbol")
+    pr.add_argument(
+        "--interval",
+        type=int,
+        default=5,
+        help="Minutes per row (default: 5; 1 for minute-by-minute)",
+    )
+    pr.add_argument("--start", default="", help="First interval to print, HH:MM ET (default: open)")
+    pr.add_argument("--end", default="", help="Stop before this HH:MM ET (default: close)")
+    pr.add_argument("--adr-sessions", type=int, default=ADR_SESSIONS)
+    pr.add_argument("--rvol-sessions", type=int, default=RVOL_SESSIONS)
+    pr.add_argument("--cache-dir", default="data/bars")
+    pr.add_argument("--host", default="127.0.0.1")
+    pr.add_argument("--port", type=int, default=4001)
+    # Distinct from replay/live/warm-cache/purge-db/explain's client IDs.
+    pr.add_argument("--client-id", type=int, default=26)
+
     wc = sub.add_parser(
         "warm-cache",
         help="Pre-fetch PDH/PDL/ADR/ADV and RVOL curves for a watchlist into "
@@ -1024,6 +1282,7 @@ def main() -> None:
         "warm-cache": cmd_warm_cache,
         "purge-db": cmd_purge_db,
         "explain": cmd_explain,
+        "profile": cmd_profile,
     }[args.command]
     raise SystemExit(asyncio.run(cmd(args)))
 
