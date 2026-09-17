@@ -1664,6 +1664,42 @@ def test_reversal_requires_min_ema9_extension() -> None:
     )
 
 
+def test_trace_reports_every_filter_on_an_early_rejection() -> None:
+    """A rejection shows the whole filter panel, not just the filters it got
+    as far as measuring -- picking a threshold means seeing what the other
+    filters said on that same bar."""
+    sc = _rev_scanner(ReversalLong, setup_kwargs={"min_leg_adr": 99.0})
+    trace: dict[str, list[dict]] = {}
+    for b in _canonical_long_bars():
+        sc.on_bar(b, trace=trace)
+
+    candidates = [e["text"] for e in trace["REV-L"] if e["text"].startswith("candidate")]
+    check("the leg filter is what rejected it", "FAIL leg" in candidates[-1], True)
+    line = candidates[-1]
+    # Every filter, including the ones checked *after* the one that failed.
+    for label in (
+        "retrace", "elapsed", "built", "leg", "move_rvol", "ema9_ext",
+        "accel_price", "accel_vol",
+    ):
+        check(f"{label} present on an early rejection", f"{label} " in line, True)
+    # leg carries both framings the trader tunes on: the ADR multiple and
+    # the plain percent move.
+    check("leg shows its ADR multiple against the floor", "1.25x/99x ADR" in line, True)
+    check("leg shows its percent change", "5.10%" in line, True)
+    check("accel_vol measured despite the earlier failure", "accel_vol 1.00/1" in line, True)
+
+
+def test_trace_fire_line_carries_the_same_panel() -> None:
+    sc = _rev_scanner(ReversalLong)
+    trace: dict[str, list[dict]] = {}
+    for b in _canonical_long_bars():
+        sc.on_bar(b, trace=trace)
+    fire = [e["text"] for e in trace["REV-L"] if e["text"].startswith("FIRE")]
+    check("one fire line", len(fire), 1)
+    check("same panel as a rejection", "accel_price 4.6667/1.2" in fire[0], True)
+    check("says so plainly", fire[0].endswith("all filters pass"), True)
+
+
 def test_reversal_requires_min_accel_price() -> None:
     # _canonical_long_bars' accel_price is 4.6667 (see test_reversal_long_basic)
     # -- comfortably above the 1.2 default, but below a threshold raised

@@ -349,6 +349,10 @@ async def cmd_explain(args: argparse.Namespace) -> int:
             f"tracked a leg for {symbol} on {session}."
         )
     else:
+        print(
+            "\nEach filter reads value/threshold; leg reads "
+            "size (xADR/min xADR, percent move)."
+        )
         print(f"\n{len(lines)} decision point(s):")
         for entry in lines:
             print(f"  {entry['time']:%H:%M}  {entry['text']}")

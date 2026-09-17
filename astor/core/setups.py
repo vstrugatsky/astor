@@ -26,6 +26,7 @@ real, we are simply still waiting for a fire worth reporting.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import ClassVar
 
@@ -57,6 +58,59 @@ def _pctstr(x: float | None) -> str:
 
 def _mean(xs: list[float]) -> float | None:
     return sum(xs) / len(xs) if xs else None
+
+
+@dataclass(frozen=True, slots=True)
+class _FilterReadout:
+    """Every filter a Reversal candidate has to clear, with the threshold it
+    is being held to -- computed once per candidate bar and printed on every
+    diagnostic line that bar produces (astor.cli's `explain`).
+
+    One readout shared by all of them, rather than each rejection hand-listing
+    the filters that happened to pass before it: a filter that rejects early
+    used to hide every number after it, which is exactly what you need when
+    you're deciding whether a threshold is set right.
+    """
+
+    retrace_pct: float
+    min_retrace_pct: float
+    max_retrace_pct: float
+    elapsed_minutes: float
+    min_confirm_minutes: float
+    leg_duration_minutes: float
+    min_leg_minutes: float
+    leg_size: float
+    leg_adr: float | None
+    min_leg_adr: float
+    leg_pct: float | None
+    move_rvol: float | None
+    min_move_rvol: float
+    ema9_extension_adr: float | None
+    min_ema9_extension_adr: float
+    accel_price: float | None
+    min_accel_price: float
+    accel_vol: float | None
+    min_accel_vol: float
+
+    def line(self) -> str:
+        """Every filter as `value/threshold`, in the order they are checked."""
+
+        def v(x: float | None, nd: int = 2) -> str:
+            return f"{x:.{nd}f}" if x is not None else "n/a"
+
+        return "  ".join(
+            [
+                f"retrace {self.retrace_pct:.1f}%/{self.min_retrace_pct:g}-{self.max_retrace_pct:g}",
+                f"elapsed {self.elapsed_minutes:.0f}m/{self.min_confirm_minutes:g}m",
+                f"built {self.leg_duration_minutes:.1f}m/{self.min_leg_minutes:g}m",
+                f"leg {self.leg_size:.2f} ({v(self.leg_adr)}x/{self.min_leg_adr:g}x ADR, "
+                f"{v(self.leg_pct)}%)",
+                f"move_rvol {v(self.move_rvol)}/{self.min_move_rvol:g}",
+                f"ema9_ext {v(self.ema9_extension_adr, 4)}/{self.min_ema9_extension_adr:g}",
+                f"accel_price {v(self.accel_price, 4)}/{self.min_accel_price:g}",
+                f"accel_vol {v(self.accel_vol)}/{self.min_accel_vol:g}",
+            ]
+        )
 
 
 def _trace(trace: list[dict] | None, bar: BarEvent, text: str) -> None:
@@ -545,117 +599,111 @@ class _ReversalBase(Setup):
 
         ema9_now = indicators.ema9
         reclaimed = ema9_now is not None and self._ema9_reclaimed_now(bar.close, ema9_now)
-        if retrace_pct < self.min_retrace_pct and not reclaimed:
-            _trace(
-                trace, bar,
-                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% < min "
-                f"{self.min_retrace_pct}% and EMA9 ({ema9_now}) not reclaimed -- stay armed",
-            )
-            return None
 
         extreme_at = self._extreme_at(indicators)
-        elapsed_minutes = (bar.start - extreme_at).total_seconds() / 60.0
-        if elapsed_minutes < self.min_confirm_minutes:
-            _trace(
-                trace, bar,
-                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% in band, "
-                f"elapsed {elapsed_minutes:.0f}m < min {self.min_confirm_minutes}m -- too early",
-            )
-            return None
-
         anchor_at = self._anchor_at(indicators)
         # Duration is measured from push_started_at, not the raw anchor_at:
         # a leg that died and later revived shouldn't have the dead,
         # unrelated stretch in between counted as part of "how long this
         # push took" -- see _push_started_at's own comment in __init__.
         push_started_at = self._push_started_at if self._push_started_at is not None else anchor_at
+        elapsed_minutes = (bar.start - extreme_at).total_seconds() / 60.0
         leg_duration_minutes = abs((extreme_at - push_started_at).total_seconds()) / 60.0
-        if leg_duration_minutes < self.min_leg_minutes:
-            _trace(
-                trace, bar,
-                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
-                f"{elapsed_minutes:.0f}m OK, but leg built in {leg_duration_minutes:.1f}m "
-                f"< min {self.min_leg_minutes}m -- too fast to be a real leg",
-            )
-            return None
 
+        # Every filter's input is computed here, before the first check, so
+        # a rejection can report the whole picture instead of only what it
+        # got as far as measuring. Nothing here has side effects, and the
+        # work is a dict lookup plus a walk of the last few leg bars.
         adr = levels.adr
-        if adr <= 0 or leg_size < self.min_leg_adr * adr:
-            _trace(
-                trace, bar,
-                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
-                f"{elapsed_minutes:.0f}m built {leg_duration_minutes:.1f}m OK, but leg "
-                f"{leg_size:.2f} < required "
-                f"{self.min_leg_adr * adr if adr > 0 else float('nan'):.2f} "
-                f"({self.min_leg_adr}x ADR ${adr:.2f}) -- leg too small",
-            )
-            return None  # too small a move to be "sharp"
-
+        ema9_at_extreme = self._extreme_ema9_at(indicators)
+        extreme_close = self._extreme_close_at(indicators)
         move_rvol = (
             compute_rvol(self._extreme_cum_volume_at(indicators), extreme_at, curve)
             if curve
             else None
         )
-        if move_rvol is None or move_rvol < rev_rvol_threshold(levels.adv):
-            _trace(
-                trace, bar,
-                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
-                f"{elapsed_minutes:.0f}m leg {leg_size:.2f} OK, but move_rvol "
-                f"{move_rvol} < required {rev_rvol_threshold(levels.adv)} -- too thin",
-            )
-            return None  # not enough volume behind the move
-
-        ema9_at_extreme = self._extreme_ema9_at(indicators)
-        extreme_close = self._extreme_close_at(indicators)
+        move_rvol_floor = rev_rvol_threshold(levels.adv)
         ema9_extension_adr = (
             round(self._ema9_extension(extreme_close, ema9_at_extreme) / adr, 4)
-            if ema9_at_extreme is not None and extreme_close is not None
+            if adr > 0 and ema9_at_extreme is not None and extreme_close is not None
             else None
         )
+        accel_price, accel_vol = self._compute_accel(extreme_at, extreme_close)
+        readout = _FilterReadout(
+            retrace_pct=retrace_pct,
+            min_retrace_pct=self.min_retrace_pct,
+            max_retrace_pct=self.max_retrace_pct,
+            elapsed_minutes=elapsed_minutes,
+            min_confirm_minutes=self.min_confirm_minutes,
+            leg_duration_minutes=leg_duration_minutes,
+            min_leg_minutes=self.min_leg_minutes,
+            leg_size=leg_size,
+            leg_adr=leg_size / adr if adr > 0 else None,
+            min_leg_adr=self.min_leg_adr,
+            leg_pct=_pct_of_level(leg_size, self._anchor),
+            move_rvol=move_rvol,
+            min_move_rvol=move_rvol_floor,
+            ema9_extension_adr=ema9_extension_adr,
+            min_ema9_extension_adr=self.min_ema9_extension_adr,
+            accel_price=accel_price,
+            min_accel_price=self.min_accel_price,
+            accel_vol=accel_vol,
+            min_accel_vol=self.min_accel_vol,
+        )
+
+        def _candidate(verdict: str) -> None:
+            _trace(trace, bar, f"candidate @ {bar.close:.2f}: {readout.line()} -- {verdict}")
+
+        if retrace_pct < self.min_retrace_pct and not reclaimed:
+            ema9_str = f"{ema9_now:.2f}" if ema9_now is not None else "n/a"
+            _candidate(f"HOLD retrace: below min and EMA9 ({ema9_str}) not reclaimed -- stay armed")
+            return None
+
+        if elapsed_minutes < self.min_confirm_minutes:
+            _candidate("FAIL elapsed: too early, not held long enough since the extreme")
+            return None
+
+        if leg_duration_minutes < self.min_leg_minutes:
+            _candidate("FAIL built: too fast to be a real leg")
+            return None
+
+        if adr <= 0 or leg_size < self.min_leg_adr * adr:
+            _candidate(
+                f"FAIL leg: below {self.min_leg_adr}x ADR "
+                f"(${adr:.2f}, so {self.min_leg_adr * adr:.2f} required) -- leg too small"
+                if adr > 0
+                else "FAIL leg: no ADR for this symbol, cannot size the leg"
+            )
+            return None  # too small a move to be "sharp"
+
+        if move_rvol is None or move_rvol < move_rvol_floor:
+            _candidate("FAIL move_rvol: too thin, not enough volume behind the move")
+            return None  # not enough volume behind the move
+
         if self.min_ema9_extension_adr > 0 and (
             ema9_extension_adr is None or ema9_extension_adr < self.min_ema9_extension_adr
         ):
-            _trace(
-                trace, bar,
-                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
-                f"{elapsed_minutes:.0f}m leg {leg_size:.2f} move_rvol {move_rvol} OK, but "
-                f"ema9 extension {ema9_extension_adr} < min {self.min_ema9_extension_adr} "
-                f"ADR -- not extended enough",
-            )
+            _candidate("FAIL ema9_ext: not extended enough from the 9EMA at the extreme")
             return None
 
-        accel_price, accel_vol = self._compute_accel(extreme_at, extreme_close)
         if self.min_accel_price > 0 and (
             accel_price is None or accel_price < self.min_accel_price
         ):
-            _trace(
-                trace, bar,
-                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
-                f"{elapsed_minutes:.0f}m leg {leg_size:.2f} move_rvol {move_rvol} ema9_ext "
-                f"{ema9_extension_adr} OK, but accel_price {accel_price} < min "
-                f"{self.min_accel_price} -- not accelerating into the extreme",
-            )
+            _candidate("FAIL accel_price: not accelerating into the extreme")
             return None
+
         if self.min_accel_vol > 0 and (
             accel_vol is None or accel_vol < self.min_accel_vol
         ):
-            _trace(
-                trace, bar,
-                f"candidate @ {bar.close:.2f}: retrace {retrace_pct:.1f}% elapsed "
-                f"{elapsed_minutes:.0f}m leg {leg_size:.2f} move_rvol {move_rvol} ema9_ext "
-                f"{ema9_extension_adr} accel_price {accel_price} OK, but accel_vol "
-                f"{accel_vol} < min {self.min_accel_vol} -- volume not building",
-            )
+            _candidate("FAIL accel_vol: volume not building into the extreme")
             return None
 
         legacy_condition = self._legacy_condition(levels, self._extreme, bar.close)
 
         _trace(
             trace, bar,
-            f"FIRE @ {bar.close:.2f}: retrace {retrace_pct:.1f}%"
-            f"{' (via EMA9 reclaim)' if reclaimed and retrace_pct < self.min_retrace_pct else ''} "
-            f"elapsed {elapsed_minutes:.0f}m leg {leg_size:.2f} (built over "
-            f"{leg_duration_minutes:.0f}m) move_rvol {move_rvol} ema9_ext {ema9_extension_adr}",
+            f"FIRE @ {bar.close:.2f}: {readout.line()} -- all filters pass"
+            f"{' (retrace below min, via EMA9 reclaim)' if reclaimed and retrace_pct < self.min_retrace_pct else ''}",
         )
 
         avwap = indicators.avwap
