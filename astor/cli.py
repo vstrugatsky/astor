@@ -497,10 +497,10 @@ def print_profile(rows: list[ProfileRow], empty: int, levels, curve, args) -> No
     def signed(v: float | None) -> str:
         return f"{v:+.2f}%" if v is not None else "n/a"
 
-    # 7 (TIME) + the two column groups below -- kept in one place so the
+    # 7 (TIME) + the three column groups below -- kept in one place so the
     # rules, the group header and the columns can't drift apart.
-    interval_w, session_w = 8 + 9 + 8 + 8, 11 + 8 + 8 + 12
-    rule = "=" * (7 + interval_w + session_w)
+    interval_w, session_w, now_w = 8 + 9 + 8, 11 + 8 + 8 + 12, 11
+    rule = "=" * (7 + interval_w + session_w + now_w)
     print("\n" + rule)
     print(f"PROFILE {levels.symbol} {args.date}   {args.interval}-min intervals")
     print(rule)
@@ -519,25 +519,29 @@ def print_profile(rows: list[ProfileRow], empty: int, levels, curve, args) -> No
         "the session-to-date\ncolumn is today's ADR% as it stands. The ADR() "
         "above is the prior-session average, for scale."
     )
+    # iRVOL sits out on its own at the far right: it is the one column that
+    # reads the pace *now* rather than for the day so far, and the contrast
+    # with RVOL next to it is the whole point of showing both.
     print(
         "\n"
         + (
             " " * 7
             + "--- in the interval ---".center(interval_w)
             + "--- session to date ---".center(session_w)
+            + "--- now ---".center(now_w)
         ).rstrip()
     )
     print(
-        f"{'TIME':<7}{'CLOSE':>8}{'VOL':>9}{'iRVOL':>8}{'RANGE%':>8}"
-        f"{'CUMVOL':>11}{'RVOL':>8}{'RANGE%':>8}{'FROM OPEN':>12}"
+        f"{'TIME':<7}{'CLOSE':>8}{'VOL':>9}{'RANGE%':>8}"
+        f"{'CUMVOL':>11}{'RVOL':>8}{'RANGE%':>8}{'FROM OPEN':>12}{'iRVOL':>11}"
     )
     for r in rows:
         print(
             f"{r.at:%H:%M}  {r.close:>8.2f}{_human_volume(r.volume):>9}"
-            f"{n(r.interval_rvol):>8}{n(r.interval_range_pct, '%'):>8}"
+            f"{n(r.interval_range_pct, '%'):>8}"
             f"{_human_volume(r.cum_volume):>11}{n(r.rvol):>8}"
             f"{n(r.session_range_pct, '%'):>8}"
-            f"{signed(r.from_open_pct):>12}"
+            f"{signed(r.from_open_pct):>12}{n(r.interval_rvol):>11}"
         )
     if not rows:
         print("  (no bars with volume in this window)")
