@@ -401,7 +401,51 @@ class _ReversalBase(Setup):
         `legacy_name`, not filtered on."""
         raise NotImplementedError
 
+    def _extends_push(self, bar: BarEvent) -> bool:
+        """Whether this bar is still pushing the leg's way -- close beyond
+        open in the push's own direction (down for REV-L, up for REV-S),
+        regardless of whether it set a fresh extreme."""
+        raise NotImplementedError
+
     # -- shared state machine ------------------------------------------------
+
+    def _leg_ended_at(self, extreme_at: datetime) -> datetime:
+        """When the push stopped pushing -- the close of the last bar still
+        going the leg's way.
+
+        Two things this is deliberately not. It is not the extreme bar's
+        *start*: a leg of N one-minute bars occupies N minutes of market
+        time, and measuring start-to-start counts the gaps between bars
+        instead, one short. It is not the extreme bar either: a bar that
+        closes the push's way without taking out the extreme (2026-09-16
+        ADPT 09:34, o 28.62 c 28.65 under a 28.72 high) is still the leg
+        working, as the trader reads it off a chart -- so the run of such
+        bars immediately after the extreme counts toward how long the leg
+        took to build. The first bar that closes back against the push ends
+        it, and nothing later re-opens it.
+
+        The extreme itself is untouched by any of this -- it stays the high
+        (or low) price the leg reached, which is what retrace, accel and the
+        stop are all measured against.
+        """
+        ended_at = None
+        for b in self._leg_bars:
+            if b.start <= extreme_at:
+                ended_at = b.end
+            elif ended_at is not None and self._extends_push(b):
+                ended_at = b.end
+            else:
+                break
+        # No bar of the push itself on hand (a setup bootstrapped mid-leg):
+        # fall back to the extreme's own timestamp rather than inventing a
+        # bar length for it.
+        return ended_at if ended_at is not None else extreme_at
+
+    def _leg_duration_minutes(self, push_started_at: datetime, extreme_at: datetime) -> float:
+        """How long the leg took to build: the first push bar's open to the
+        last pushing bar's close. Shared by the trigger's own filter and the
+        capitulation-in-progress alert, so both read the same number."""
+        return abs((self._leg_ended_at(extreme_at) - push_started_at).total_seconds()) / 60.0
 
     def on_bar(
         self,
@@ -608,7 +652,7 @@ class _ReversalBase(Setup):
         # push took" -- see _push_started_at's own comment in __init__.
         push_started_at = self._push_started_at if self._push_started_at is not None else anchor_at
         elapsed_minutes = (bar.start - extreme_at).total_seconds() / 60.0
-        leg_duration_minutes = abs((extreme_at - push_started_at).total_seconds()) / 60.0
+        leg_duration_minutes = self._leg_duration_minutes(push_started_at, extreme_at)
 
         # Every filter's input is computed here, before the first check, so
         # a rejection can report the whole picture instead of only what it
@@ -867,7 +911,7 @@ class _ReversalBase(Setup):
         if leg_size <= 0 or adr <= 0 or leg_size < self.min_leg_adr * adr:
             return
 
-        leg_duration_minutes = abs((extreme_at - push_started_at).total_seconds()) / 60.0
+        leg_duration_minutes = self._leg_duration_minutes(push_started_at, extreme_at)
         if leg_duration_minutes < self.min_leg_minutes:
             return
 
@@ -974,6 +1018,9 @@ class ReversalLong(_ReversalBase):
     def _retrace_from(self, close: float, extreme: float) -> float:
         return close - extreme
 
+    def _extends_push(self, bar: BarEvent) -> bool:
+        return bar.close < bar.open  # REV-L's leg is the move down
+
     def _legacy_condition(self, levels: DailyLevels, extreme: float, close: float) -> bool:
         return extreme < levels.pdl and close > levels.pdl
 
@@ -1027,6 +1074,9 @@ class ReversalShort(_ReversalBase):
 
     def _retrace_from(self, close: float, extreme: float) -> float:
         return extreme - close
+
+    def _extends_push(self, bar: BarEvent) -> bool:
+        return bar.close > bar.open  # REV-S's leg is the move up
 
     def _legacy_condition(self, levels: DailyLevels, extreme: float, close: float) -> bool:
         return extreme > levels.pdh and close < levels.pdh

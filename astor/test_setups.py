@@ -1255,7 +1255,11 @@ def test_reversal_long_basic() -> None:
     check("leg_size_adr", t.extras["leg_size_adr"], 1.25)
     check("retrace_pct", t.extras["retrace_pct"], 20.0)
     check("retrace_via pct, not an EMA9 reclaim", t.extras["retrace_via"], "pct")
-    check("leg_duration_minutes -- anchor (bar 0) to extreme (bar 4)", t.extras["leg_duration_minutes"], 4.0)
+    check(
+        "leg_duration_minutes -- bar 0's open through the extreme bar's close, 5 bars",
+        t.extras["leg_duration_minutes"],
+        5.0,
+    )
     check("move_rvol", t.extras["move_rvol"], 250_000.0)
     check("ema9_extension_adr", t.extras["ema9_extension_adr"], 0.6723)
     check("accel_price now filtered on too (>= min_accel_price)", t.extras["accel_price"], 4.6667)
@@ -1322,7 +1326,7 @@ def test_reversal_requires_rvol_floor() -> None:
 
 
 def test_reversal_requires_min_leg_minutes() -> None:
-    """A leg that built in only 2 minutes never fires under the default
+    """A leg that built in only 3 bars never fires under the default
     4-minute floor, even though it clears every other filter -- but does
     fire once that floor is explicitly loosened."""
     fast_bars = [
@@ -1333,7 +1337,7 @@ def test_reversal_requires_min_leg_minutes() -> None:
     ]
     default_sc = _rev_scanner(ReversalLong)
     check(
-        "2-minute leg never fires under the default 4-minute floor",
+        "3-bar leg never fires under the default 4-minute floor",
         _feed(default_sc, fast_bars),
         [],
     )
@@ -1351,7 +1355,61 @@ def test_reversal_requires_min_leg_minutes() -> None:
     loose_sc.curves["REV"] = _generous_curve()
     triggers = _feed(loose_sc, fast_bars)
     check("same leg fires once the floor is loosened", len(triggers), 1)
-    check("leg_duration_minutes", triggers[0].extras["leg_duration_minutes"], 2.0)
+    check("leg_duration_minutes -- 3 bars", triggers[0].extras["leg_duration_minutes"], 3.0)
+
+
+def test_leg_duration_counts_bars_not_gaps_between_them() -> None:
+    """A leg of N one-minute bars took N minutes to build: measured from the
+    first push bar's open to the last pushing bar's close, not start-to-start
+    (which counts the gaps between bars and lands one short)."""
+    bars = [
+        bar(0, 98.0, 98.0, 97.5, 97.8, 50_000, symbol="REV"),  # anchor 98.0, push bar 1
+        bar(1, 97.8, 97.9, 96.0, 96.2, 50_000, symbol="REV"),  # push bar 2
+        bar(2, 96.2, 96.4, 95.0, 95.3, 50_000, symbol="REV"),  # push bar 3
+        bar(3, 95.3, 95.4, 93.0, 93.3, 50_000, symbol="REV"),  # push bar 4 -- extreme 93.0
+        bar(4, 93.3, 93.8, 93.1, 94.0, 10_000, symbol="REV"),  # closes back up -- leg over
+    ]
+    sc = _rev_scanner(ReversalLong, setup_kwargs={"min_accel_price": 0.0, "min_accel_vol": 0.0})
+    triggers = _feed(sc, bars)
+    check("fires", len(triggers), 1)
+    # Bar 0's open (9:30) through bar 3's close (9:34) -- 4 bars, 4 minutes.
+    check("4 push bars read 4 minutes", triggers[0].extras["leg_duration_minutes"], 4.0)
+
+
+def test_leg_duration_includes_bars_still_closing_the_push_way() -> None:
+    """A bar that closes the push's way without taking out the extreme is
+    still the leg working (2026-09-16 ADPT 09:34: o 28.62 c 28.65 under a
+    28.72 high), so the run of them right after the extreme counts toward
+    how long the leg took. The extreme itself does not move.
+    """
+    bars = [
+        bar(0, 102.0, 102.0, 102.0, 102.2, 50_000, symbol="REV"),  # anchor 102.0, push bar 1
+        bar(1, 102.2, 104.0, 102.1, 103.9, 50_000, symbol="REV"),  # push bar 2
+        bar(2, 103.9, 105.5, 103.5, 105.2, 50_000, symbol="REV"),  # push bar 3
+        bar(3, 105.2, 107.7, 105.0, 107.4, 50_000, symbol="REV"),  # push bar 4 -- extreme 107.7
+        bar(4, 107.4, 107.6, 107.3, 107.5, 8_000, symbol="REV"),   # up close under the high
+        bar(5, 107.5, 107.6, 106.4, 106.5, 10_000, symbol="REV"),  # closes down -- leg over
+    ]
+    sc = _rev_scanner(ReversalShort, setup_kwargs={"min_accel_price": 0.0, "min_accel_vol": 0.0})
+    triggers = _feed(sc, bars)
+    check("fires", len(triggers), 1)
+    t = triggers[0]
+    # Bar 0's open (9:30) through bar 4's close (9:35) -- the extreme bar plus
+    # the one continuation bar after it.
+    check("continuation bar counts toward duration", t.extras["leg_duration_minutes"], 5.0)
+    check("but the extreme is still the high the leg reached", t.extras["leg_extreme"], 107.7)
+    check("and the stop still sits on it", t.level_value, 107.7)
+
+    # One bar later the run is broken, so a further up-close cannot re-open it.
+    more = bars + [
+        bar(6, 106.5, 106.8, 106.3, 106.7, 9_000, symbol="REV"),  # up close, but after the break
+        bar(7, 106.7, 106.9, 106.0, 106.2, 9_000, symbol="REV"),
+    ]
+    sc2 = _rev_scanner(ReversalShort, setup_kwargs={"min_accel_price": 0.0, "min_accel_vol": 0.0})
+    durations = {
+        t.extras["leg_duration_minutes"] for t in _feed(sc2, more)
+    }
+    check("a later up bar never re-opens a closed leg", durations, {5.0})
 
 
 def test_reversal_min_confirm_minutes_still_works_when_set() -> None:
@@ -1421,7 +1479,11 @@ def test_reversal_retrace_past_50pct_kills_leg_until_new_extreme() -> None:
     check("anchor unchanged (not recomputed, still session_open)", t.extras["anchor"], 98.0)
     # bar 11 (the turn) to bar 15 (leg2's extreme) -- not bar 0 (the original,
     # now-irrelevant anchor timestamp).
-    check("leg_duration_minutes measured from the dead leg's own turnaround", t.extras["leg_duration_minutes"], 4.0)
+    check(
+        "leg_duration_minutes measured from the dead leg's own turnaround",
+        t.extras["leg_duration_minutes"],
+        5.0,
+    )
 
 
 def test_reversal_leg_bars_reset_on_rearm_after_dead_leg() -> None:
@@ -1524,7 +1586,7 @@ def test_reversal_short_anchor_shifts_to_pre_leg_low() -> None:
     check("level_value is the leg extreme (session high)", t.level_value, 106.0)
     check("anchor is the pre-leg low, not session_open", t.extras["anchor"], 96.0)
     check("retrace_pct off the pre-leg-low leg (10.0 wide)", t.extras["retrace_pct"], 15.0)
-    check("leg_duration_minutes (bar 2 to bar 6)", t.extras["leg_duration_minutes"], 4.0)
+    check("leg_duration_minutes (bar 2's open to bar 6's close)", t.extras["leg_duration_minutes"], 5.0)
 
 
 def test_reversal_leg_timing_correct_for_symbol_added_mid_session() -> None:
@@ -1566,8 +1628,9 @@ def test_reversal_leg_timing_correct_for_symbol_added_mid_session() -> None:
     )
     check("retrace_pct matches the fully-live run", t.extras["retrace_pct"], baseline.extras["retrace_pct"])
     check("move_rvol matches the fully-live run", t.extras["move_rvol"], baseline.extras["move_rvol"])
-    # anchor last set at bar 2 (9:32), extreme (106.0) last set at bar 6 (9:36).
-    check("leg_duration_minutes", t.extras["leg_duration_minutes"], 4.0)
+    # anchor last set at bar 2 (9:32), extreme (106.0) last set at bar 6 -- so
+    # bar 2's open (9:32) through bar 6's close (9:37) = 5 bars.
+    check("leg_duration_minutes", t.extras["leg_duration_minutes"], 5.0)
 
 
 def test_reversal_long_anchor_shifts_to_pre_leg_high() -> None:
@@ -1603,8 +1666,9 @@ def test_reversal_long_anchor_shifts_to_pre_leg_high() -> None:
     check("level_value is the leg extreme (session low)", t.level_value, 94.0)
     check("anchor is the pre-leg high, not session_open", t.extras["anchor"], 104.0)
     check("retrace_pct off the pre-leg-high leg (10.0 wide)", t.extras["retrace_pct"], 12.0)
-    # anchor last set at bar 2 (9:32), extreme (94.0) last set at bar 6 (9:36).
-    check("leg_duration_minutes", t.extras["leg_duration_minutes"], 4.0)
+    # anchor last set at bar 2 (9:32), extreme (94.0) last set at bar 6 -- so
+    # bar 2's open (9:32) through bar 6's close (9:37) = 5 bars.
+    check("leg_duration_minutes", t.extras["leg_duration_minutes"], 5.0)
 
 
 def _slow_converge_bars() -> list[BarEvent]:
@@ -1877,8 +1941,8 @@ def test_capitulation_alert_rearms_after_a_genuine_death_and_revival() -> None:
         bar(0, 98.0, 98.0, 97.5, 97.8, 500_000, symbol="REV"),
         bar(1, 97.8, 98.0, 96.0, 96.2, 500_000, symbol="REV"),
         bar(2, 96.2, 96.5, 95.0, 95.3, 500_000, symbol="REV"),
-        bar(3, 95.3, 96.0, 94.0, 94.3, 500_000, symbol="REV"),
-        bar(4, 94.3, 95.0, 93.0, 93.3, 500_000, symbol="REV"),  # leg1 extreme 93.0 -- alerts
+        bar(3, 95.3, 96.0, 94.0, 94.3, 500_000, symbol="REV"),  # leg1 extreme 94.0 -- alerts
+        bar(4, 94.3, 95.0, 93.0, 93.3, 500_000, symbol="REV"),  # leg1 deepens to 93.0
         bar(5, 93.3, 98.0, 93.5, 98.0, 500_000, symbol="REV"),  # retrace 100% -- kills leg1
         bar(6, 98.0, 98.0, 96.0, 96.5, 500_000, symbol="REV"),
         bar(7, 96.5, 96.8, 96.0, 96.6, 500_000, symbol="REV"),
@@ -1888,16 +1952,16 @@ def test_capitulation_alert_rearms_after_a_genuine_death_and_revival() -> None:
         bar(11, 96.9, 97.0, 92.0, 92.3, 5_000, symbol="REV"),
         bar(12, 92.3, 92.7, 90.5, 90.8, 10_000, symbol="REV"),
         bar(13, 90.8, 91.0, 89.0, 89.3, 20_000, symbol="REV"),
-        bar(14, 89.3, 89.6, 87.5, 87.8, 30_000, symbol="REV"),
-        bar(15, 87.8, 88.0, 86.0, 86.3, 40_000, symbol="REV"),  # leg2 extreme 86.0 -- alerts again
+        bar(14, 89.3, 89.6, 87.5, 87.8, 30_000, symbol="REV"),  # leg2 extreme 87.5 -- alerts again
+        bar(15, 87.8, 88.0, 86.0, 86.3, 40_000, symbol="REV"),  # leg2 deepens to 86.0
     ]
     alerts = []
     for b in bars:
         sc.on_bar(b)
         alerts.extend(sc.pop_capitulation_alerts())
     check("one alert for leg1, one for the revived leg2", len(alerts), 2)
-    check("first alert is leg1's extreme", alerts[0].leg_extreme, 93.0)
-    check("second alert is leg2's extreme, not a re-alert of leg1", alerts[1].leg_extreme, 86.0)
+    check("first alert is leg1's own extreme, not leg2's", alerts[0].leg_extreme, 94.0)
+    check("second alert is leg2's own extreme, not a re-alert of leg1", alerts[1].leg_extreme, 87.5)
 
 
 def test_capitulation_alert_gated_by_leg_quality() -> None:
