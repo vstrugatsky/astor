@@ -407,6 +407,13 @@ class _ReversalBase(Setup):
         regardless of whether it set a fresh extreme."""
         raise NotImplementedError
 
+    def _reverses_push(self, bar: BarEvent) -> bool:
+        """Whether this bar closed against the leg -- the direction the
+        reversal itself would go (up for REV-L, down for REV-S). Not simply
+        `not _extends_push`: a doji closes neither way, and so is neither
+        still pushing nor yet reversing."""
+        raise NotImplementedError
+
     # -- shared state machine ------------------------------------------------
 
     def _leg_ended_at(self, extreme_at: datetime) -> datetime:
@@ -638,6 +645,21 @@ class _ReversalBase(Setup):
                 trace, bar,
                 f"retrace {retrace_pct:.1f}% > max {self.max_retrace_pct}% -- "
                 f"leg dead until a new, deeper extreme",
+            )
+            return None
+
+        # Only a bar that closed *against* the leg is a candidate at all: the
+        # setup is the reversal, so entering off a bar that closed the leg's
+        # own way is entering into the push still running. Checked before any
+        # filter -- such a bar is not a candidate being rejected, it is not a
+        # candidate. Deliberately after the death check above, which is about
+        # where price got to, not what shape the bar was. A doji (close ==
+        # open) closes against nothing and is not a candidate either.
+        if not self._reverses_push(bar):
+            _trace(
+                trace, bar,
+                f"no candidate @ {bar.close:.2f}: bar did not close against the leg "
+                f"(o {bar.open:.2f} c {bar.close:.2f}) -- stay armed",
             )
             return None
 
@@ -1021,6 +1043,9 @@ class ReversalLong(_ReversalBase):
     def _extends_push(self, bar: BarEvent) -> bool:
         return bar.close < bar.open  # REV-L's leg is the move down
 
+    def _reverses_push(self, bar: BarEvent) -> bool:
+        return bar.close > bar.open  # ...so REV-L enters off an up bar
+
     def _legacy_condition(self, levels: DailyLevels, extreme: float, close: float) -> bool:
         return extreme < levels.pdl and close > levels.pdl
 
@@ -1077,6 +1102,9 @@ class ReversalShort(_ReversalBase):
 
     def _extends_push(self, bar: BarEvent) -> bool:
         return bar.close > bar.open  # REV-S's leg is the move up
+
+    def _reverses_push(self, bar: BarEvent) -> bool:
+        return bar.close < bar.open  # ...so REV-S enters off a down bar
 
     def _legacy_condition(self, levels: DailyLevels, extreme: float, close: float) -> bool:
         return extreme > levels.pdh and close < levels.pdh

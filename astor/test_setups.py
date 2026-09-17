@@ -1325,6 +1325,41 @@ def test_reversal_requires_rvol_floor() -> None:
     check("thin RVOL relative to average never fires", _feed(sc, _canonical_long_bars()), [])
 
 
+def test_candidate_requires_a_bar_closing_against_the_leg() -> None:
+    """The setup is the reversal, so only a bar that closed against the leg
+    is a candidate at all -- up for REV-L, down for REV-S. A bar closing the
+    leg's own way is the push still running, whatever its retrace reads."""
+    through_extreme = _canonical_long_bars()[:5]  # anchor 98.0, extreme 93.0 at bar 4
+
+    # Same close (94.0 -> retrace 20%, in band) as the canonical fixture's
+    # own firing bar, but this one closed down: the leg's own direction.
+    sc = _rev_scanner(ReversalLong)
+    with_the_leg = bar(5, 94.2, 94.3, 93.1, 94.0, 10_000, symbol="REV")
+    check(
+        "REV-L: a down-closing bar is not a candidate, even at a firing retrace",
+        _feed(sc, through_extreme + [with_the_leg]),
+        [],
+    )
+    doji = bar(6, 94.0, 94.4, 93.9, 94.0, 10_000, symbol="REV")
+    check("REV-L: a doji closes against nothing either", sc.on_bar(doji), [])
+    against_the_leg = bar(7, 94.0, 94.4, 93.9, 94.3, 10_000, symbol="REV")
+    check("REV-L: the up-closing bar right after does fire", len(sc.on_bar(against_the_leg)), 1)
+
+    # Mirror: REV-S's leg is the move up, so it needs a down-closing bar.
+    sc_s = _rev_scanner(ReversalShort)
+    short_through_extreme = _canonical_short_bars()[:5]  # anchor 102.0, extreme 107.7
+    check(
+        "REV-S: an up-closing bar is not a candidate",
+        _feed(sc_s, short_through_extreme + [bar(5, 106.4, 107.6, 106.3, 106.5, 10_000, symbol="REV")]),
+        [],
+    )
+    check(
+        "REV-S: the down-closing bar right after does fire",
+        len(sc_s.on_bar(bar(6, 106.8, 106.9, 106.3, 106.5, 10_000, symbol="REV"))),
+        1,
+    )
+
+
 def test_reversal_requires_min_leg_minutes() -> None:
     """A leg that built in only 3 bars never fires under the default
     4-minute floor, even though it clears every other filter -- but does
