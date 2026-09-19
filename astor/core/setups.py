@@ -146,7 +146,17 @@ def _position_size(
 # retired). Same ADV-tiered shape, higher thresholds: the trader's read is
 # that a capitulation-quality leg needs to stand out more than a routine
 # level breach did.
-_REV_RVOL_TIERS = ((5_000_000_000, 1.5), (500_000_000, 1.75))
+#
+# The ADV boundaries are 20% below the round numbers they stand for ($500M
+# and $5B), because the ADV they are compared against is computed from IBKR
+# volume (astor.drivers.replay.compute_adv), which excludes trades executed
+# outside the NBBO and so runs low against every other platform's figure for
+# the same name. The discount goes here rather than into compute_adv itself:
+# only these liquidity tiers care about the absolute dollar figure, while
+# every other consumer of IBKR volume is relative (RVOL divides IBKR volume
+# by an average of IBKR volume, so the understatement cancels out) and would
+# be made *wrong* by inflating the input.
+_REV_RVOL_TIERS = ((4_000_000_000, 1.5), (400_000_000, 1.75))
 _REV_RVOL_DEFAULT = 2.0
 
 

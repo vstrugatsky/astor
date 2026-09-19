@@ -1325,6 +1325,25 @@ def test_reversal_requires_rvol_floor() -> None:
     check("thin RVOL relative to average never fires", _feed(sc, _canonical_long_bars()), [])
 
 
+def test_rev_rvol_threshold_tiers() -> None:
+    """The more liquid the name, the less relative volume it takes to stand
+    out. Boundaries sit 20% below the round figures they stand for, because
+    the ADV they judge is IBKR volume, which excludes trades outside the
+    NBBO and so reads low.
+    """
+    from astor.core.setups import rev_rvol_threshold
+
+    check("illiquid name gets the strictest floor", rev_rvol_threshold(50_000_000.0), 2.0)
+    check("just under the $400M rung", rev_rvol_threshold(399_999_999.0), 2.0)
+    check("exactly on it stays strict (comparison is >)", rev_rvol_threshold(400_000_000.0), 2.0)
+    # Real case: F's ADV ran $427M-$511M through Sept 2026 -- under the old
+    # $500M rung it read 2.0 most days and flipped to 1.75 on others.
+    check("F, mid-range", rev_rvol_threshold(494_933_742.0), 1.75)
+    check("exactly on the $4B rung stays at 1.75", rev_rvol_threshold(4_000_000_000.0), 1.75)
+    check("past it, the most liquid tier", rev_rvol_threshold(4_000_000_001.0), 1.5)
+    check("a zero/unknown ADV is treated as illiquid", rev_rvol_threshold(0.0), 2.0)
+
+
 def test_candidate_requires_a_bar_closing_against_the_leg() -> None:
     """The setup is the reversal, so only a bar that closed against the leg
     is a candidate at all -- up for REV-L, down for REV-S. A bar closing the
