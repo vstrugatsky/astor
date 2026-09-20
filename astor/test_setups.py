@@ -1325,6 +1325,28 @@ def test_reversal_requires_rvol_floor() -> None:
     check("thin RVOL relative to average never fires", _feed(sc, _canonical_long_bars()), [])
 
 
+def test_session_is_complete_guards_the_intraday_cache() -> None:
+    """A day still being traded must never be written to the cache: IBKR
+    answers with the session so far, and a cache entry is never revisited
+    once written. Real case: INSP 2026-09-18 cached at 10:32 with 63 bars,
+    so every later replay/explain/profile of that date saw a 10:32 close.
+    """
+    from astor.drivers.replay import session_is_complete
+
+    session = date(2026, 9, 18)
+
+    def at(hh: int, mm: int, day: int = 18):
+        return datetime(2026, 9, day, hh, mm, tzinfo=ET)
+
+    check("mid-session", session_is_complete(session, at(10, 32)), False)
+    check("one minute before the close", session_is_complete(session, at(15, 59)), False)
+    # The 15:59 bar completes at 16:00 -- not a minute before.
+    check("at the close", session_is_complete(session, at(16, 0)), True)
+    check("after the close", session_is_complete(session, at(18, 30)), True)
+    check("any earlier session is done", session_is_complete(session, at(9, 31, day=19)), True)
+    check("a future session has nothing yet", session_is_complete(session, at(16, 0, day=17)), False)
+
+
 def test_rev_rvol_threshold_tiers() -> None:
     """The more liquid the name, the less relative volume it takes to stand
     out. Boundaries sit 20% below the round figures they stand for, because

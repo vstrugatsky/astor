@@ -35,6 +35,29 @@ REQUEST_TIMEOUT = 60.0
 ADR_SESSIONS = 14
 RVOL_SESSIONS = 20  # the user's own spec: "1-min bars for the last 20 days"
 
+# RTH close: the 15:59 bar completes at 16:00, so a session's 1-min bars are
+# all in hand from 16:00 ET onward and not a minute before.
+RTH_CLOSE = time(16, 0)
+
+
+def session_is_complete(session: date, now_et: datetime) -> bool:
+    """Whether every RTH bar of `session` exists yet.
+
+    Guards the intraday cache against the silent poisoning that happens when
+    any command touches a day that is still being traded: IBKR answers with
+    the session *so far*, which is correct for that moment and wrong forever
+    after, since a cache entry is never revisited once written. Real case:
+    INSP 2026-09-18 was cached at 10:32 ET with 63 bars, so every later
+    replay/explain/profile of that date saw a day that ended at 10:32.
+
+    `now_et` is passed in rather than read from the clock here, same as
+    BarCache.prune's `today`, so this stays testable without patching
+    datetime.
+    """
+    if session != now_et.date():
+        return session < now_et.date()
+    return now_et.time() >= RTH_CLOSE
+
 # A cache entry written before ADR existed lacks these, so it must be refetched
 # rather than loaded with zeroed volatility -- which would silently disable the
 # filters instead of failing visibly.
@@ -386,7 +409,16 @@ class ReplayDriver:
                     for b in bars
                     if to_et(b.date) is not None
                 ]
-                self.cache.save("intraday", sym, self.session, self.bar_size, rows)
+                if session_is_complete(self.session, datetime.now(ET)):
+                    self.cache.save("intraday", sym, self.session, self.bar_size, rows)
+                else:
+                    # Mid-session: these bars are fine to use right now, but
+                    # writing them would freeze a partial day into the cache
+                    # forever -- see session_is_complete.
+                    logger.info(
+                        "%s %s still trading -- using %d bars, not caching them",
+                        sym, self.session, len(rows),
+                    )
 
             events = []
             for r in rows:
@@ -500,7 +532,12 @@ class ReplayDriver:
                         for b in bars
                         if to_et(b.date) is not None
                     ]
-                    self.cache.save("intraday", sym, d, self.bar_size, rows)
+                    # Same guard as fetch_bars: a curve built for a *later*
+                    # session can reach back into a day that is still
+                    # trading, and that day's partial bars must not be
+                    # written as if they were the whole session.
+                    if session_is_complete(d, datetime.now(ET)):
+                        self.cache.save("intraday", sym, d, self.bar_size, rows)
                 rows_by_session[d] = rows
 
             cum_volume_by_minute, used = build_cum_volume_curve(rows_by_session)
