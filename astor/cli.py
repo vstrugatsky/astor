@@ -408,12 +408,13 @@ def _range_pct(high: float | None, low: float | None) -> float | None:
     return (high / low - 1.0) * 100.0
 
 
-def _avwap_pct(close: float, avwap: float | None) -> float | None:
-    """How far this close sits from session AVWAP, as a signed percent --
-    positive above it, negative below."""
-    if not avwap:
+def _pct_change(value: float | None, reference: float | None) -> float | None:
+    """`value` against `reference` as a signed percent -- close vs AVWAP,
+    close vs the open, the open vs the prior close. Signed throughout: which
+    side of the reference price sits on is the point of every one of them."""
+    if not reference or value is None:
         return None
-    return (close / avwap - 1.0) * 100.0
+    return (value / reference - 1.0) * 100.0
 
 
 def _per_adr(pct: float | None, adr_pct: float) -> float | None:
@@ -483,16 +484,14 @@ def build_profile_rows(
                     else None
                 ),
                 session_range_pct=_range_pct(indicators.session_high, indicators.session_low),
-                from_open_pct=(
-                    (last.close / indicators.session_open - 1.0) * 100.0
-                    if indicators.session_open
-                    else None
-                ),
-                avwap_pct=_avwap_pct(last.close, indicators.avwap),
+                from_open_pct=_pct_change(last.close, indicators.session_open),
+                avwap_pct=_pct_change(last.close, indicators.avwap),
                 # Divided by ADR% (not the dollar ADR) so both sides of the
                 # ratio are percents and it reads as a plain multiple: 0.50x
                 # means price sits half a normal day's range off AVWAP.
-                avwap_adr=_per_adr(_avwap_pct(last.close, indicators.avwap), levels.adr_pct),
+                avwap_adr=_per_adr(
+                    _pct_change(last.close, indicators.avwap), levels.adr_pct
+                ),
             )
         )
 
@@ -522,6 +521,15 @@ def _human_volume(v: float) -> str:
     return f"{v:.0f}"
 
 
+def _human_dollars(v: float) -> str:
+    """A dollar figure short enough to sit in a header line: $1.23B or
+    $24.29M. Nothing in this codebase trades in amounts where the exact
+    dollar matters -- ADV is read as a magnitude."""
+    if v >= 1_000_000_000:
+        return f"${v / 1_000_000_000:.2f}B"
+    return f"${v / 1_000_000:.2f}M"
+
+
 def print_profile(
     rows: list[ProfileRow], empty: int, session_open: float | None, levels, curve, args
 ) -> None:
@@ -538,14 +546,13 @@ def print_profile(
     print("\n" + rule)
     print(f"PROFILE {levels.symbol} {args.date}   {args.interval}-min intervals")
     print(rule)
+    open_str = f"{session_open:.2f}" if session_open is not None else "n/a"
+    gap = signed(_pct_change(session_open, levels.prev_close))
     print(
-        f"open {session_open:.2f}   " if session_open is not None else "open n/a   ",
-        end="",
-    )
-    print(
-        f"prev close {levels.prev_close:.2f}   PDH {levels.pdh:.2f}   PDL {levels.pdl:.2f}   "
+        f"open {open_str}   gap {gap}   prev close {levels.prev_close:.2f}   "
+        f"PDH {levels.pdh:.2f}   PDL {levels.pdl:.2f}   "
         f"ADR({levels.adr_sessions}) {levels.adr_pct:.2f}% (${levels.adr:.2f})   "
-        f"ADV ${levels.adv:,.0f}"
+        f"ADV {_human_dollars(levels.adv)}"
     )
     print(
         f"RVOL curve: {curve.sessions} prior sessions"

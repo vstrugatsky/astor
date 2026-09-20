@@ -1325,6 +1325,22 @@ def test_reversal_requires_rvol_floor() -> None:
     check("thin RVOL relative to average never fires", _feed(sc, _canonical_long_bars()), [])
 
 
+def test_profile_header_helpers() -> None:
+    from astor.cli import _human_dollars, _pct_change
+
+    # Gap: the open against the prior close. Real case: INSP 2026-09-18
+    # opened 72.29 against a 72.74 close.
+    check("gap is signed, down", round(_pct_change(72.29, 72.74), 2), -0.62)
+    check("gap is signed, up", round(_pct_change(75.0, 72.74), 2), 3.11)
+    check("no reference price -> n/a rather than a division", _pct_change(72.29, 0.0), None)
+
+    check("millions, two decimals", _human_dollars(24_294_254.0), "$24.29M")
+    check("billions once past the boundary", _human_dollars(1_500_000_000.0), "$1.50B")
+    check("exactly a billion reads as billions, not $1000.00M",
+          _human_dollars(1_000_000_000.0), "$1.00B")
+    check("just under stays in millions", _human_dollars(999_999_999.0), "$1000.00M")
+
+
 def test_session_is_complete_guards_the_intraday_cache() -> None:
     """A day still being traded must never be written to the cache: IBKR
     answers with the session so far, and a cache entry is never revisited
