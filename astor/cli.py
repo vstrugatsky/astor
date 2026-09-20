@@ -392,9 +392,12 @@ class ProfileRow:
     session_range_pct: float | None
     from_open_pct: float | None
     # Against session AVWAP, as of this interval's last bar. Signed: which
-    # side of AVWAP price is on is the whole point.
+    # side of AVWAP price is on is the whole point. The distance is then
+    # given twice over: against the prior-session average range, and against
+    # the range this day has actually made so far.
     avwap_pct: float | None
     avwap_adr: float | None
+    avwap_day_adr: float | None
 
 
 def _range_pct(high: float | None, low: float | None) -> float | None:
@@ -417,10 +420,12 @@ def _pct_change(value: float | None, reference: float | None) -> float | None:
     return (value / reference - 1.0) * 100.0
 
 
-def _per_adr(pct: float | None, adr_pct: float) -> float | None:
-    """A percent expressed in ADR multiples: 0.50x is half a normal day's
-    range. Both sides are percents, so the units cancel."""
-    if pct is None or adr_pct <= 0:
+def _per_adr(pct: float | None, adr_pct: float | None) -> float | None:
+    """A percent expressed in range multiples: 0.50x is half a range. Both
+    sides are percents, so the units cancel. The denominator is either the
+    prior-session average range (ADR) or the range today has made so far --
+    same arithmetic, two different yardsticks."""
+    if pct is None or not adr_pct or adr_pct <= 0:
         return None
     return pct / adr_pct
 
@@ -465,6 +470,8 @@ def build_profile_rows(
         last = group[-1]
         volume = sum(b.volume for b in group)
         hi, lo = max(b.high for b in group), min(b.low for b in group)
+        avwap_pct = _pct_change(last.close, indicators.avwap)
+        session_range_pct = _range_pct(indicators.session_high, indicators.session_low)
         rows.append(
             ProfileRow(
                 at=at,
@@ -483,15 +490,18 @@ def build_profile_rows(
                     if curve is not None
                     else None
                 ),
-                session_range_pct=_range_pct(indicators.session_high, indicators.session_low),
+                session_range_pct=session_range_pct,
                 from_open_pct=_pct_change(last.close, indicators.session_open),
-                avwap_pct=_pct_change(last.close, indicators.avwap),
+                avwap_pct=avwap_pct,
                 # Divided by ADR% (not the dollar ADR) so both sides of the
                 # ratio are percents and it reads as a plain multiple: 0.50x
                 # means price sits half a normal day's range off AVWAP.
-                avwap_adr=_per_adr(
-                    _pct_change(last.close, indicators.avwap), levels.adr_pct
-                ),
+                avwap_adr=_per_adr(avwap_pct, levels.adr_pct),
+                # The same distance against *today's* range instead of the
+                # prior-session average -- how far off AVWAP price is
+                # relative to what this day has actually delivered so far,
+                # which on a big day is a very different number.
+                avwap_day_adr=_per_adr(avwap_pct, session_range_pct),
             )
         )
 
@@ -541,7 +551,7 @@ def print_profile(
 
     # 7 (TIME) + the four column groups below -- kept in one place so the
     # rules, the group header and the columns can't drift apart.
-    interval_w, session_w, avwap_w, now_w = 8 + 9 + 8, 11 + 8 + 8 + 12, 9 + 8, 11
+    interval_w, session_w, avwap_w, now_w = 8 + 9 + 8, 11 + 8 + 8 + 12, 9 + 10 + 9, 11
     rule = "=" * (7 + interval_w + session_w + avwap_w + now_w)
     print("\n" + rule)
     print(f"PROFILE {levels.symbol} {args.date}   {args.interval}-min intervals")
@@ -563,7 +573,9 @@ def print_profile(
         "\nRANGE% is this day's own high/low - 1, no averaging across sessions: "
         "the session-to-date\ncolumn is today's ADR% as it stands. The ADR() "
         "above is the prior-session average, for scale.\navwap is the close "
-        "against session AVWAP, signed, and that same figure over ADR%."
+        f"against session AVWAP, signed, then that same figure over "
+        f"ADR({levels.adr_sessions})%\nand over today's own range so far -- "
+        "on a big day those two read very differently."
     )
     # iRVOL sits out on its own at the far right: it is the one column that
     # reads the pace *now* rather than for the day so far, and the contrast
@@ -578,10 +590,13 @@ def print_profile(
             + "--- now ---".center(now_w)
         ).rstrip()
     )
+    # The two xADR columns name their own denominator -- (14) is the
+    # prior-session average, (1) is this one day -- so neither can be
+    # mistaken for the other, and the label follows --adr-sessions.
     print(
         f"{'TIME':<7}{'CLOSE':>8}{'VOL':>9}{'RANGE%':>8}"
         f"{'CUMVOL':>11}{'RVOL':>8}{'RANGE%':>8}{'FROM OPEN':>12}"
-        f"{'%':>9}{'xADR':>8}{'iRVOL':>11}"
+        f"{'%':>9}{f'xADR({levels.adr_sessions})':>10}{'xADR(1)':>9}{'iRVOL':>11}"
     )
     for r in rows:
         print(
@@ -590,7 +605,8 @@ def print_profile(
             f"{_human_volume(r.cum_volume):>11}{n(r.rvol):>8}"
             f"{n(r.session_range_pct, '%'):>8}"
             f"{signed(r.from_open_pct):>12}"
-            f"{signed(r.avwap_pct):>9}{signed(r.avwap_adr, 'x'):>8}"
+            f"{signed(r.avwap_pct):>9}{signed(r.avwap_adr, 'x'):>10}"
+            f"{signed(r.avwap_day_adr, 'x'):>9}"
             f"{n(r.interval_rvol):>11}"
         )
     if not rows:

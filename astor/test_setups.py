@@ -2208,6 +2208,18 @@ def test_build_profile_rows() -> None:
         round(first.avwap_pct / levels.adr_pct, 4),
     )
     check("and it is signed, not a magnitude", rows[-1].avwap_pct < first.avwap_pct, True)
+    check(
+        "xADR(1) divides the same distance by today's range so far",
+        round(first.avwap_day_adr, 4),
+        round(first.avwap_pct / first.session_range_pct, 4),
+    )
+    # A 6% ADR name that has only travelled 3.41% so far reads bigger
+    # against its own day than against the prior-session average.
+    check(
+        "today's range is the tighter yardstick early on",
+        abs(first.avwap_day_adr) > abs(first.avwap_adr),
+        True,
+    )
     # Today's own range, high/low - 1: 10.76 high, 10.00 low at this point.
     check("session range is this day's own, not an average",
           round(rows[-1].session_range_pct, 2), 7.62)
