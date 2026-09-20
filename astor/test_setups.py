@@ -2167,7 +2167,7 @@ def test_build_profile_rows() -> None:
     from astor.cli import build_profile_rows
 
     bars, levels, curve = _profile_fixture()
-    rows, empty = build_profile_rows(bars, levels, curve, 5)
+    rows, empty, session_open = build_profile_rows(bars, levels, curve, 5)
 
     check("20 minutes at 5-min intervals -> 4 rows", len(rows), 4)
     check("buckets anchored on the 09:30 open", [r.at.strftime("%H:%M") for r in rows],
@@ -2182,6 +2182,16 @@ def test_build_profile_rows() -> None:
     check("interval RVOL tracks the burst", rows[1].interval_rvol, 2.86)
     check("session RVOL lags it, as a cumulative measure should", rows[1].rvol, 2.00)
     check("close is the bucket's last close", first.close, 10.30)
+    check("session open comes back for the header", session_open, 10.00)
+    # AVWAP through 09:34 is the volume-weighted typical price of bars 0-4;
+    # price ran straight up, so the close sits above it.
+    check("close is above AVWAP on a straight push up", first.avwap_pct > 0, True)
+    check(
+        "xADR is that same percent over ADR%, so the units cancel",
+        round(first.avwap_adr, 4),
+        round(first.avwap_pct / levels.adr_pct, 4),
+    )
+    check("and it is signed, not a magnitude", rows[-1].avwap_pct < first.avwap_pct, True)
     # Today's own range, high/low - 1: 10.76 high, 10.00 low at this point.
     check("session range is this day's own, not an average",
           round(rows[-1].session_range_pct, 2), 7.62)
@@ -2195,8 +2205,8 @@ def test_build_profile_rows_window_does_not_rebase_the_session() -> None:
     from astor.cli import build_profile_rows
 
     bars, levels, curve = _profile_fixture()
-    full, _ = build_profile_rows(bars, levels, curve, 5)
-    windowed, _ = build_profile_rows(bars, levels, curve, 5, time(9, 40), time(9, 50))
+    full, _, _ = build_profile_rows(bars, levels, curve, 5)
+    windowed, _, _ = build_profile_rows(bars, levels, curve, 5, time(9, 40), time(9, 50))
 
     check("window trims the rows", [r.at.strftime("%H:%M") for r in windowed], ["09:40", "09:45"])
     by_time = {r.at: r for r in full}
@@ -2219,7 +2229,7 @@ def test_build_profile_rows_skips_zero_volume_and_counts_gaps() -> None:
         if time(9, 35) <= b.start.time() < time(9, 40) else b
         for b in bars
     ]
-    rows, empty = build_profile_rows(padded, levels, curve, 5)
+    rows, empty, _ = build_profile_rows(padded, levels, curve, 5)
     check("the dead interval produces no row", [r.at.strftime("%H:%M") for r in rows],
           ["09:30", "09:40", "09:45"])
     check("and is reported rather than silently closed up", empty, 1)

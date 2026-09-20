@@ -391,6 +391,10 @@ class ProfileRow:
     rvol: float | None
     session_range_pct: float | None
     from_open_pct: float | None
+    # Against session AVWAP, as of this interval's last bar. Signed: which
+    # side of AVWAP price is on is the whole point.
+    avwap_pct: float | None
+    avwap_adr: float | None
 
 
 def _range_pct(high: float | None, low: float | None) -> float | None:
@@ -404,6 +408,22 @@ def _range_pct(high: float | None, low: float | None) -> float | None:
     return (high / low - 1.0) * 100.0
 
 
+def _avwap_pct(close: float, avwap: float | None) -> float | None:
+    """How far this close sits from session AVWAP, as a signed percent --
+    positive above it, negative below."""
+    if not avwap:
+        return None
+    return (close / avwap - 1.0) * 100.0
+
+
+def _per_adr(pct: float | None, adr_pct: float) -> float | None:
+    """A percent expressed in ADR multiples: 0.50x is half a normal day's
+    range. Both sides are percents, so the units cancel."""
+    if pct is None or adr_pct <= 0:
+        return None
+    return pct / adr_pct
+
+
 def build_profile_rows(
     bars: list,
     levels,
@@ -411,12 +431,12 @@ def build_profile_rows(
     interval_minutes: int,
     start: time | None = None,
     end: time | None = None,
-) -> tuple[list[ProfileRow], int]:
+) -> tuple[list[ProfileRow], int, float | None]:
     """Bucket a session's 1-min bars into `interval_minutes` windows.
 
-    Returns (rows, empty_intervals). Buckets are anchored to the 09:30 open,
-    not to the first bar, so a 5-min run always reads 09:30/09:35/09:40
-    however late the symbol's first print lands.
+    Returns (rows, empty_intervals, session_open). Buckets are anchored to
+    the 09:30 open, not to the first bar, so a 5-min run always reads
+    09:30/09:35/09:40 however late the symbol's first print lands.
 
     RVOL and the session-to-date columns are always accumulated from the
     open -- `start`/`end` trim which rows *print*, never what they are
@@ -468,6 +488,11 @@ def build_profile_rows(
                     if indicators.session_open
                     else None
                 ),
+                avwap_pct=_avwap_pct(last.close, indicators.avwap),
+                # Divided by ADR% (not the dollar ADR) so both sides of the
+                # ratio are percents and it reads as a plain multiple: 0.50x
+                # means price sits half a normal day's range off AVWAP.
+                avwap_adr=_per_adr(_avwap_pct(last.close, indicators.avwap), levels.adr_pct),
             )
         )
 
@@ -483,7 +508,10 @@ def build_profile_rows(
     if in_window:
         span = (in_window[-1].at - in_window[0].at).total_seconds() / 60
         empty = int(span // interval_minutes) + 1 - len(in_window)
-    return in_window, empty
+    # The session's own open, from the same SessionIndicators the columns are
+    # built on -- so it is the first bar that actually traded, not whatever
+    # zero-volume padding IBKR put in front of it.
+    return in_window, empty, indicators.session_open
 
 
 def _human_volume(v: float) -> str:
@@ -494,20 +522,26 @@ def _human_volume(v: float) -> str:
     return f"{v:.0f}"
 
 
-def print_profile(rows: list[ProfileRow], empty: int, levels, curve, args) -> None:
+def print_profile(
+    rows: list[ProfileRow], empty: int, session_open: float | None, levels, curve, args
+) -> None:
     def n(v: float | None, suffix: str = "", nd: int = 2) -> str:
         return f"{v:.{nd}f}{suffix}" if v is not None else "n/a"
 
-    def signed(v: float | None) -> str:
-        return f"{v:+.2f}%" if v is not None else "n/a"
+    def signed(v: float | None, suffix: str = "%") -> str:
+        return f"{v:+.2f}{suffix}" if v is not None else "n/a"
 
-    # 7 (TIME) + the three column groups below -- kept in one place so the
+    # 7 (TIME) + the four column groups below -- kept in one place so the
     # rules, the group header and the columns can't drift apart.
-    interval_w, session_w, now_w = 8 + 9 + 8, 11 + 8 + 8 + 12, 11
-    rule = "=" * (7 + interval_w + session_w + now_w)
+    interval_w, session_w, avwap_w, now_w = 8 + 9 + 8, 11 + 8 + 8 + 12, 9 + 8, 11
+    rule = "=" * (7 + interval_w + session_w + avwap_w + now_w)
     print("\n" + rule)
     print(f"PROFILE {levels.symbol} {args.date}   {args.interval}-min intervals")
     print(rule)
+    print(
+        f"open {session_open:.2f}   " if session_open is not None else "open n/a   ",
+        end="",
+    )
     print(
         f"prev close {levels.prev_close:.2f}   PDH {levels.pdh:.2f}   PDL {levels.pdl:.2f}   "
         f"ADR({levels.adr_sessions}) {levels.adr_pct:.2f}% (${levels.adr:.2f})   "
@@ -521,7 +555,8 @@ def print_profile(rows: list[ProfileRow], empty: int, levels, curve, args) -> No
     print(
         "\nRANGE% is this day's own high/low - 1, no averaging across sessions: "
         "the session-to-date\ncolumn is today's ADR% as it stands. The ADR() "
-        "above is the prior-session average, for scale."
+        "above is the prior-session average, for scale.\navwap is the close "
+        "against session AVWAP, signed, and that same figure over ADR%."
     )
     # iRVOL sits out on its own at the far right: it is the one column that
     # reads the pace *now* rather than for the day so far, and the contrast
@@ -532,12 +567,14 @@ def print_profile(rows: list[ProfileRow], empty: int, levels, curve, args) -> No
             " " * 7
             + "--- in the interval ---".center(interval_w)
             + "--- session to date ---".center(session_w)
+            + "--- avwap ---".center(avwap_w)
             + "--- now ---".center(now_w)
         ).rstrip()
     )
     print(
         f"{'TIME':<7}{'CLOSE':>8}{'VOL':>9}{'RANGE%':>8}"
-        f"{'CUMVOL':>11}{'RVOL':>8}{'RANGE%':>8}{'FROM OPEN':>12}{'iRVOL':>11}"
+        f"{'CUMVOL':>11}{'RVOL':>8}{'RANGE%':>8}{'FROM OPEN':>12}"
+        f"{'%':>9}{'xADR':>8}{'iRVOL':>11}"
     )
     for r in rows:
         print(
@@ -545,7 +582,9 @@ def print_profile(rows: list[ProfileRow], empty: int, levels, curve, args) -> No
             f"{n(r.interval_range_pct, '%'):>8}"
             f"{_human_volume(r.cum_volume):>11}{n(r.rvol):>8}"
             f"{n(r.session_range_pct, '%'):>8}"
-            f"{signed(r.from_open_pct):>12}{n(r.interval_rvol):>11}"
+            f"{signed(r.from_open_pct):>12}"
+            f"{signed(r.avwap_pct):>9}{signed(r.avwap_adr, 'x'):>8}"
+            f"{n(r.interval_rvol):>11}"
         )
     if not rows:
         print("  (no bars with volume in this window)")
@@ -600,8 +639,10 @@ async def cmd_profile(args: argparse.Namespace) -> int:
     curve = curves.get(symbol)
     if curve is None:
         logger.warning("No volume curve for %s -- RVOL columns will read n/a.", symbol)
-    rows, empty = build_profile_rows(bars, lv, curve, args.interval, start_t, end_t)
-    print_profile(rows, empty, lv, curve, args)
+    rows, empty, session_open = build_profile_rows(
+        bars, lv, curve, args.interval, start_t, end_t
+    )
+    print_profile(rows, empty, session_open, lv, curve, args)
     return 0
 
 
