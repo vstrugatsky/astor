@@ -557,15 +557,10 @@ def print_profile(
     def signed(v: float | None, suffix: str = "%") -> str:
         return f"{v:+.2f}{suffix}" if v is not None else "n/a"
 
-    # 7 (TIME) + the four column groups below -- kept in one place so the
+    # 7 (TIME) + the three column groups below -- kept in one place so the
     # rules, the group header and the columns can't drift apart.
-    interval_w, session_w, avwap_w, now_w = (
-        8 + 9 + 8,
-        11 + 8 + 8 + 12 + 10 + 10,
-        9 + 10 + 9,
-        11,
-    )
-    rule = "=" * (7 + interval_w + session_w + avwap_w + now_w)
+    interval_w, session_w, avwap_w = 8 + 9 + 8, 8 + 8 + 12 + 10 + 10, 9 + 10 + 9
+    rule = "=" * (7 + interval_w + session_w + avwap_w)
     print("\n" + rule)
     print(f"PROFILE {levels.symbol} {args.date}   {args.interval}-min intervals")
     print(rule)
@@ -590,9 +585,6 @@ def print_profile(
         f"ADR({levels.adr_sessions})%\nand over today's own range so far -- "
         "on a big day those two read very differently."
     )
-    # iRVOL sits out on its own at the far right: it is the one column that
-    # reads the pace *now* rather than for the day so far, and the contrast
-    # with RVOL next to it is the whole point of showing both.
     print(
         "\n"
         + (
@@ -600,7 +592,6 @@ def print_profile(
             + "--- in the interval ---".center(interval_w)
             + "--- session to date ---".center(session_w)
             + "--- avwap ---".center(avwap_w)
-            + "--- now ---".center(now_w)
         ).rstrip()
     )
     # The two xADR columns name their own denominator -- (14) is the
@@ -608,21 +599,20 @@ def print_profile(
     # mistaken for the other, and the label follows --adr-sessions.
     print(
         f"{'TIME':<7}{'CLOSE':>8}{'VOL':>9}{'RANGE%':>8}"
-        f"{'CUMVOL':>11}{'RVOL':>8}{'RANGE%':>8}{'FROM OPEN':>12}"
+        f"{'RVOL':>8}{'RANGE%':>8}{'FROM OPEN':>12}"
         f"{'FROM HIGH':>10}{'FROM LOW':>10}"
-        f"{'%':>9}{f'xADR({levels.adr_sessions})':>10}{'xADR(1)':>9}{'iRVOL':>11}"
+        f"{'%':>9}{f'xADR({levels.adr_sessions})':>10}{'xADR(1)':>9}"
     )
     for r in rows:
         print(
             f"{r.at:%H:%M}  {r.close:>8.2f}{_human_volume(r.volume):>9}"
             f"{n(r.interval_range_pct, '%'):>8}"
-            f"{_human_volume(r.cum_volume):>11}{n(r.rvol):>8}"
+            f"{n(r.rvol):>8}"
             f"{n(r.session_range_pct, '%'):>8}"
             f"{signed(r.from_open_pct):>12}"
             f"{signed(r.from_high_pct):>10}{signed(r.from_low_pct):>10}"
             f"{signed(r.avwap_pct):>9}{signed(r.avwap_adr, 'x'):>10}"
             f"{signed(r.avwap_day_adr, 'x'):>9}"
-            f"{n(r.interval_rvol):>11}"
         )
     if not rows:
         print("  (no bars with volume in this window)")
