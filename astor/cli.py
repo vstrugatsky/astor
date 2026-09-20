@@ -391,6 +391,12 @@ class ProfileRow:
     rvol: float | None
     session_range_pct: float | None
     from_open_pct: float | None
+    # Where in the day's range this close sits. The running extremes include
+    # the current bar, so from_high is never positive and from_low never
+    # negative -- a bar printing the day's high reads 0.00% on one and the
+    # full range on the other.
+    from_high_pct: float | None
+    from_low_pct: float | None
     # Against session AVWAP, as of this interval's last bar. Signed: which
     # side of AVWAP price is on is the whole point. The distance is then
     # given twice over: against the prior-session average range, and against
@@ -492,6 +498,8 @@ def build_profile_rows(
                 ),
                 session_range_pct=session_range_pct,
                 from_open_pct=_pct_change(last.close, indicators.session_open),
+                from_high_pct=_pct_change(last.close, indicators.session_high),
+                from_low_pct=_pct_change(last.close, indicators.session_low),
                 avwap_pct=avwap_pct,
                 # Divided by ADR% (not the dollar ADR) so both sides of the
                 # ratio are percents and it reads as a plain multiple: 0.50x
@@ -551,7 +559,12 @@ def print_profile(
 
     # 7 (TIME) + the four column groups below -- kept in one place so the
     # rules, the group header and the columns can't drift apart.
-    interval_w, session_w, avwap_w, now_w = 8 + 9 + 8, 11 + 8 + 8 + 12, 9 + 10 + 9, 11
+    interval_w, session_w, avwap_w, now_w = (
+        8 + 9 + 8,
+        11 + 8 + 8 + 12 + 10 + 10,
+        9 + 10 + 9,
+        11,
+    )
     rule = "=" * (7 + interval_w + session_w + avwap_w + now_w)
     print("\n" + rule)
     print(f"PROFILE {levels.symbol} {args.date}   {args.interval}-min intervals")
@@ -596,6 +609,7 @@ def print_profile(
     print(
         f"{'TIME':<7}{'CLOSE':>8}{'VOL':>9}{'RANGE%':>8}"
         f"{'CUMVOL':>11}{'RVOL':>8}{'RANGE%':>8}{'FROM OPEN':>12}"
+        f"{'FROM HIGH':>10}{'FROM LOW':>10}"
         f"{'%':>9}{f'xADR({levels.adr_sessions})':>10}{'xADR(1)':>9}{'iRVOL':>11}"
     )
     for r in rows:
@@ -605,6 +619,7 @@ def print_profile(
             f"{_human_volume(r.cum_volume):>11}{n(r.rvol):>8}"
             f"{n(r.session_range_pct, '%'):>8}"
             f"{signed(r.from_open_pct):>12}"
+            f"{signed(r.from_high_pct):>10}{signed(r.from_low_pct):>10}"
             f"{signed(r.avwap_pct):>9}{signed(r.avwap_adr, 'x'):>10}"
             f"{signed(r.avwap_day_adr, 'x'):>9}"
             f"{n(r.interval_rvol):>11}"

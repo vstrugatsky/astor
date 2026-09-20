@@ -2225,6 +2225,20 @@ def test_build_profile_rows() -> None:
           round(rows[-1].session_range_pct, 2), 7.62)
     check("interval range is that bucket's own", round(rows[0].interval_range_pct, 2), 3.41)
     check("move from the session open", round(first.from_open_pct, 2), 3.0)
+    # The running extremes include the current bar, so these two can only
+    # ever be <= 0 and >= 0 respectively.
+    check("from the day high, never positive", all(r.from_high_pct <= 0 for r in rows), True)
+    check("from the day low, never negative", all(r.from_low_pct >= 0 for r in rows), True)
+    # The last bucket closed at 10.48, against a 10.74 high and a 9.98 low.
+    check("distance below the high", round(rows[-1].from_high_pct, 2), -2.42)
+    check("distance above the low", round(rows[-1].from_low_pct, 2), 5.01)
+    # The two must span the day's range: (1+lo%)*(1+hi%) reconstructs it.
+    lo, hi = rows[-1].from_low_pct / 100, rows[-1].from_high_pct / 100
+    check(
+        "the pair brackets the day's range",
+        round(((1 + lo) / (1 + hi) - 1) * 100, 2),
+        round(rows[-1].session_range_pct, 2),
+    )
 
 
 def test_build_profile_rows_window_does_not_rebase_the_session() -> None:
