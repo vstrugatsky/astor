@@ -2370,16 +2370,30 @@ def test_build_profile_rows() -> None:
     # AVWAP through 09:34 is the volume-weighted typical price of bars 0-4;
     # price ran straight up, so the close sits above it.
     check("close is above AVWAP on a straight push up", first.avwap_pct > 0, True)
+    # Dollars over dollars, the same convention every setup filter uses --
+    # NOT the percent-over-ADR% reading, which anchors to AVWAP instead of
+    # the prior close and disagrees whenever price has moved off it.
+    # Recover AVWAP from the percent column and redo the division in dollars.
+    avwap = first.close / (1 + first.avwap_pct / 100)
     check(
-        "xADR is that same percent over ADR%, so the units cancel",
+        "xADR(14) is the dollar distance over the dollar ADR",
         round(first.avwap_adr, 4),
-        round(first.avwap_pct / levels.adr_pct, 4),
+        round((first.close - avwap) / levels.adr, 4),
+    )
+    check(
+        "...which is NOT percent-over-ADR%, since that anchors to AVWAP "
+        "rather than the prior close",
+        round(first.avwap_adr, 4) != round(first.avwap_pct / levels.adr_pct, 4),
+        True,
     )
     check("and it is signed, not a magnitude", rows[-1].avwap_pct < first.avwap_pct, True)
+    day_range = first.close / (1 + first.from_high_pct / 100) - first.close / (
+        1 + first.from_low_pct / 100
+    )
     check(
-        "xADR(1) divides the same distance by today's range so far",
+        "xADR(1) divides the same dollar distance by today's dollar range",
         round(first.avwap_day_adr, 4),
-        round(first.avwap_pct / first.session_range_pct, 4),
+        round((first.close - avwap) / day_range, 4),
     )
     # A 6% ADR name that has only travelled 3.41% so far reads bigger
     # against its own day than against the prior-session average.

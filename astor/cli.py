@@ -442,14 +442,23 @@ def _pct_change(value: float | None, reference: float | None) -> float | None:
     return (value / reference - 1.0) * 100.0
 
 
-def _per_adr(pct: float | None, adr_pct: float | None) -> float | None:
-    """A percent expressed in range multiples: 0.50x is half a range. Both
-    sides are percents, so the units cancel. The denominator is either the
-    prior-session average range (ADR) or the range today has made so far --
-    same arithmetic, two different yardsticks."""
-    if pct is None or not adr_pct or adr_pct <= 0:
+def _per_adr(distance: float | None, yardstick: float | None) -> float | None:
+    """A dollar distance in range multiples: 0.50x is half a range. The
+    yardstick is either the dollar ADR (prior-session average) or the range
+    today has made so far, both in dollars.
+
+    Dollars over dollars, deliberately, rather than percent over percent.
+    The two are not the same: a percent-of-AVWAP over ADR% implicitly
+    anchors the yardstick to AVWAP, while DailyLevels.adr is anchored to the
+    prior close on purpose -- see its docstring -- and every setup filter
+    divides by that. On 2026-09-18 FLNC, trading 5% under its prior close,
+    the two readings of the same distance differed by exactly that 5%, so
+    profile and explain disagreed about a number they were both calling
+    xADR.
+    """
+    if distance is None or not yardstick or yardstick <= 0:
         return None
-    return pct / adr_pct
+    return distance / yardstick
 
 
 def build_profile_rows(
@@ -494,6 +503,16 @@ def build_profile_rows(
         hi, lo = max(b.high for b in group), min(b.low for b in group)
         avwap_pct = _pct_change(last.close, indicators.avwap)
         session_range_pct = _range_pct(indicators.session_high, indicators.session_low)
+        # Signed dollar distance from AVWAP, and the two dollar yardsticks it
+        # gets divided by -- see _per_adr for why this is not done in percents.
+        avwap_distance = (
+            last.close - indicators.avwap if indicators.avwap is not None else None
+        )
+        day_range = (
+            indicators.session_high - indicators.session_low
+            if indicators.session_high is not None and indicators.session_low is not None
+            else None
+        )
         rows.append(
             ProfileRow(
                 at=at,
@@ -520,12 +539,12 @@ def build_profile_rows(
                 # Divided by ADR% (not the dollar ADR) so both sides of the
                 # ratio are percents and it reads as a plain multiple: 0.50x
                 # means price sits half a normal day's range off AVWAP.
-                avwap_adr=_per_adr(avwap_pct, levels.adr_pct),
+                avwap_adr=_per_adr(avwap_distance, levels.adr),
                 # The same distance against *today's* range instead of the
                 # prior-session average -- how far off AVWAP price is
                 # relative to what this day has actually delivered so far,
                 # which on a big day is a very different number.
-                avwap_day_adr=_per_adr(avwap_pct, session_range_pct),
+                avwap_day_adr=_per_adr(avwap_distance, day_range),
             )
         )
 
