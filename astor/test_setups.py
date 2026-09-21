@@ -1383,12 +1383,12 @@ def _avt_long_bars() -> list[BarEvent]:
     already recovered -- that is the rule most of these tests turn on.
     """
     return [
-        bar(0, 100.0, 100.5, 99.5, 100.0, 50_000, symbol="AVT"),
-        bar(1, 100.0, 102.0, 100.0, 102.0, 50_000, symbol="AVT"),
-        bar(2, 102.0, 104.0, 102.0, 103.8, 50_000, symbol="AVT"),   # day high 104.0
-        bar(3, 103.8, 103.9, 102.5, 102.6, 50_000, symbol="AVT"),   # pulling back, still well above
-        bar(4, 102.6, 102.6, 101.85, 102.0, 30_000, symbol="AVT"),  # touch: low 0.04 ADR off AVWAP
-        bar(5, 102.0, 103.0, 102.0, 102.9, 60_000, symbol="AVT"),   # crosses back out: the entry
+        bar(30, 100.0, 100.5, 99.5, 100.0, 50_000, symbol="AVT"),
+        bar(31, 100.0, 102.0, 100.0, 102.0, 50_000, symbol="AVT"),
+        bar(32, 102.0, 104.0, 102.0, 103.8, 50_000, symbol="AVT"),   # day high 104.0
+        bar(33, 103.8, 103.9, 102.5, 102.6, 50_000, symbol="AVT"),   # pulling back, still well above
+        bar(34, 102.6, 102.6, 101.85, 102.0, 30_000, symbol="AVT"),  # touch: low 0.04 ADR off AVWAP
+        bar(35, 102.0, 103.0, 102.0, 102.9, 60_000, symbol="AVT"),   # crosses back out: the entry
     ]
 
 
@@ -1397,7 +1397,7 @@ def test_avt_long_fires_on_the_continuation() -> None:
     triggers = _feed(sc, _avt_long_bars())
     check("one trigger", len(triggers), 1)
     t = triggers[0]
-    check("fires on the continuation bar", t.bar_start.strftime("%H:%M"), "09:35")
+    check("fires on the continuation bar", t.bar_start.strftime("%H:%M"), "10:05")
     check("setup", t.setup, "AVT-L")
     check("entry is that bar's close", t.trigger_price, 102.9)
     e = t.extras
@@ -1405,7 +1405,7 @@ def test_avt_long_fires_on_the_continuation() -> None:
     check("depth clears its floor", e["depth_adr"] >= 0.15, True)
     check("recovery clears its floor", e["recovery_adr"] >= 0.12, True)
     check("the touch it reports is the pullback's own low, not this bar's",
-          e["touch_at"].endswith("09:34:00-04:00"), True)
+          e["touch_at"].endswith("10:04:00-04:00"), True)
     check("...and that bar's price", e["touch_price"], 101.85)
 
 
@@ -1417,7 +1417,7 @@ def test_avt_requires_a_transition_not_a_state() -> None:
     bars = _avt_long_bars()
     # Same shape, except the touch bar itself already closes past the
     # recovery line -- so nothing crosses on the next bar.
-    bars[4] = bar(4, 102.6, 103.1, 101.85, 103.0, 30_000, symbol="AVT")
+    bars[4] = bar(34, 102.6, 103.1, 101.85, 103.0, 30_000, symbol="AVT")
     check("no trigger when price never crosses in", _feed(sc, bars), [])
 
 
@@ -1426,8 +1426,8 @@ def test_avt_touch_must_reach_the_band() -> None:
     bars = _avt_long_bars()
     # Pullback stops well short of AVWAP: no touch, so no trigger however
     # strong the bar that follows.
-    bars[4] = bar(4, 102.6, 102.6, 102.15, 102.18, 30_000, symbol="AVT")
-    bars[5] = bar(5, 102.40, 103.0, 102.40, 102.9, 60_000, symbol="AVT")
+    bars[4] = bar(34, 102.6, 102.6, 102.15, 102.18, 30_000, symbol="AVT")
+    bars[5] = bar(35, 102.40, 103.0, 102.40, 102.9, 60_000, symbol="AVT")
     check("a pullback that never reaches AVWAP does not arm it", _feed(sc, bars), [])
 
 
@@ -1436,7 +1436,7 @@ def test_avt_close_through_avwap_kills_the_leg() -> None:
     wrong side ends the leg until a new extreme."""
     sc = _avt_scanner(AVWAPTouchLong)
     bars = _avt_long_bars()
-    bars[4] = bar(4, 102.6, 102.6, 101.0, 101.2, 30_000, symbol="AVT")  # closes well below
+    bars[4] = bar(34, 102.6, 102.6, 101.0, 101.2, 30_000, symbol="AVT")  # closes well below
     check("no trigger after a real break of AVWAP", _feed(sc, bars), [])
 
 
@@ -1444,9 +1444,9 @@ def test_avt_recovery_must_land_within_the_bar_window() -> None:
     sc = _avt_scanner(AVWAPTouchLong, setup_kwargs={"max_bars_since_touch": 1})
     bars = _avt_long_bars()
     drift = [
-        bar(5, 102.0, 102.1, 101.75, 102.05, 20_000, symbol="AVT"),   # neither touch nor recovery
-        bar(6, 102.05, 102.1, 101.75, 102.05, 20_000, symbol="AVT"),
-        bar(7, 102.30, 103.0, 102.30, 102.9, 60_000, symbol="AVT"),   # 3 bars after the touch
+        bar(35, 102.0, 102.1, 101.75, 102.05, 20_000, symbol="AVT"),   # neither touch nor recovery
+        bar(36, 102.05, 102.1, 101.75, 102.05, 20_000, symbol="AVT"),
+        bar(37, 102.30, 103.0, 102.30, 102.9, 60_000, symbol="AVT"),   # 3 bars after the touch
     ]
     check("a stale pullback does not fire", _feed(sc, bars[:5] + drift), [])
     check("...but the same bars fire with the default 5-bar window",
@@ -1471,18 +1471,51 @@ def test_avt_stop_is_the_wider_of_the_pullback_and_the_floor() -> None:
 def test_avt_short_mirrors_long() -> None:
     sc = _avt_scanner(AVWAPTouchShort)
     bars = [
-        bar(0, 100.0, 100.5, 99.5, 100.0, 50_000, symbol="AVT"),
-        bar(1, 100.0, 100.0, 98.0, 98.0, 50_000, symbol="AVT"),
-        bar(2, 98.0, 98.0, 96.0, 96.2, 50_000, symbol="AVT"),      # day low 96.0
-        bar(3, 96.2, 97.5, 96.1, 97.4, 50_000, symbol="AVT"),      # pulling back up
-        bar(4, 97.4, 98.15, 97.4, 98.0, 30_000, symbol="AVT"),     # touch: high 0.04 ADR off AVWAP
-        bar(5, 98.0, 98.0, 97.0, 97.1, 60_000, symbol="AVT"),      # crosses back out: the entry
+        bar(30, 100.0, 100.5, 99.5, 100.0, 50_000, symbol="AVT"),
+        bar(31, 100.0, 100.0, 98.0, 98.0, 50_000, symbol="AVT"),
+        bar(32, 98.0, 98.0, 96.0, 96.2, 50_000, symbol="AVT"),      # day low 96.0
+        bar(33, 96.2, 97.5, 96.1, 97.4, 50_000, symbol="AVT"),      # pulling back up
+        bar(34, 97.4, 98.15, 97.4, 98.0, 30_000, symbol="AVT"),     # touch: high 0.04 ADR off AVWAP
+        bar(35, 98.0, 98.0, 97.0, 97.1, 60_000, symbol="AVT"),      # crosses back out: the entry
     ]
     triggers = _feed(sc, bars)
     check("one trigger", len(triggers), 1)
     check("setup", triggers[0].setup, "AVT-S")
     check("short direction", triggers[0].direction, "short")
     check("stop sits above the entry", triggers[0].level_value > triggers[0].trigger_price, True)
+
+
+def test_avt_touch_requires_the_session_to_be_going_the_trade_s_way() -> None:
+    """A continuation setup needs something to continue: the day has to be
+    up on its open for a long, down for a short."""
+    sc = _avt_scanner(AVWAPTouchLong)
+    bars = _avt_long_bars()
+    # Same shape, shifted so the whole move happens *below* the session open:
+    # the pullback still touches AVWAP, but the day is red.
+    down = [
+        bar(30, 106.0, 106.5, 105.5, 106.0, 50_000, symbol="AVT"),  # opens at 106
+        bar(31, 106.0, 106.0, 104.0, 104.0, 50_000, symbol="AVT"),
+        bar(32, 104.0, 104.0, 102.0, 102.2, 50_000, symbol="AVT"),
+        bar(33, 102.2, 103.5, 102.1, 103.4, 50_000, symbol="AVT"),
+        bar(34, 103.4, 103.5, 102.85, 103.0, 30_000, symbol="AVT"),
+        bar(35, 103.0, 104.0, 103.0, 103.9, 60_000, symbol="AVT"),
+    ]
+    check("no long trigger while the day is below its open", _feed(sc, down), [])
+    # The control: the same geometry with the day green does fire.
+    check("the with-session version fires", len(_feed(_avt_scanner(AVWAPTouchLong), bars)), 1)
+
+
+def test_avt_ignores_touches_before_the_time_floor() -> None:
+    """AVWAP sits on top of price for the first few minutes, so everything
+    'touches' it before the day has any shape."""
+    early = [bar(i - 30, b.open, b.high, b.low, b.close, int(b.volume), symbol="AVT")
+             for i, b in enumerate(_avt_long_bars(), start=30)]
+    check("the same bars at the open do not fire", _feed(_avt_scanner(AVWAPTouchLong), early), [])
+    check(
+        "...but do once the floor is moved back",
+        len(_feed(_avt_scanner(AVWAPTouchLong, setup_kwargs={"earliest_touch": time(9, 0)}), early)),
+        1,
+    )
 
 
 def test_avt_and_reversal_run_independently_on_one_symbol() -> None:

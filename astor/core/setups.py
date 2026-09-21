@@ -32,7 +32,7 @@ real, we are simply still waiting for a fire worth reporting.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 from typing import ClassVar
 
 from astor.core.grading import rvol_threshold
@@ -1141,6 +1141,8 @@ class _AVTReadout:
     touch_band_adr: float
     depth_adr: float | None
     min_depth_adr: float
+    from_open_adr: float  # signed the trade's way: is the session itself with us
+    touch_at: str | None
     recovery_adr: float
     min_recovery_adr: float
     bars_since_touch: int | None
@@ -1156,7 +1158,9 @@ class _AVTReadout:
             [
                 f"range {self.day_range_adr:.2f}x/{self.min_day_range_adr:g}x ADR",
                 f"rvol {v(self.rvol, 2)}/{self.min_rvol:g}",
-                f"touch {v(self.touch_adr)}/±{self.touch_band_adr:g}",
+                f"from open {self.from_open_adr:+.3f}",
+                f"touch {v(self.touch_adr)}/±{self.touch_band_adr:g}"
+                + (f" @{self.touch_at}" if self.touch_at else ""),
                 f"depth {v(self.depth_adr)}/{self.min_depth_adr:g}",
                 f"recovery {v(self.recovery_adr)}/{self.min_recovery_adr:g}",
                 f"bars since touch {bars}/{self.max_bars_since_touch}",
@@ -1200,6 +1204,7 @@ class _AVWAPTouchBase(Setup):
         max_bars_since_touch: int = 5,
         max_break_adr: float = 0.06,
         min_stop_pct: float = 1.0,
+        earliest_touch: time = time(9, 40),
         max_loss_dollars: float = 100.0,
     ):
         self.min_day_range_adr = min_day_range_adr
@@ -1209,6 +1214,7 @@ class _AVWAPTouchBase(Setup):
         self.max_bars_since_touch = max_bars_since_touch
         self.max_break_adr = max_break_adr
         self.min_stop_pct = min_stop_pct
+        self.earliest_touch = earliest_touch
         self.max_loss_dollars = max_loss_dollars
 
         # Two different things, both needed. `_touch_bar` is the most recent
@@ -1307,7 +1313,21 @@ class _AVWAPTouchBase(Setup):
         wick = self._pullback_wick(bar)
         wick_adr = (wick - avwap) / adr
         wick_depth_adr = abs(extreme - wick) / adr
-        if abs(wick_adr) <= self.touch_band_adr and wick_depth_adr >= self.min_depth_adr:
+        # The session itself has to be going the trade's way: this is a
+        # continuation setup, so a long wants the day up on its open and a
+        # short wants it down. Measured at the touch, which is the moment the
+        # pullback is being judged as one worth joining.
+        from_open_adr = (
+            self._beyond(bar.close, indicators.session_open) / adr
+            if indicators.session_open
+            else 0.0
+        )
+        in_band = abs(wick_adr) <= self.touch_band_adr and wick_depth_adr >= self.min_depth_adr
+        with_session = from_open_adr > 0
+        # AVWAP sits on top of price for the first few minutes of a session,
+        # so everything "touches" it before the day has shape.
+        after_floor = bar.start.time() >= self.earliest_touch
+        if in_band and with_session and after_floor:
             self._touch_bar = bar
             self._bars_since_touch = 0
             # Deepest wick of this pullback wins -- see _pullback_bar.
@@ -1315,6 +1335,19 @@ class _AVWAPTouchBase(Setup):
                 self._pullback_bar = bar
                 self._touch_adr = wick_adr
                 self._touch_depth_adr = wick_depth_adr
+        elif in_band:
+            # Would have been a touch on distance alone -- say why it wasn't,
+            # rather than leaving a silent gap where a trigger was expected.
+            why = (
+                f"before the {self.earliest_touch:%H:%M} floor"
+                if not after_floor
+                else f"session is not going the trade's way (from open {from_open_adr:+.3f} ADR)"
+            )
+            _trace(
+                trace, bar,
+                f"touch ignored @ {bar.close:.2f}: reached the band "
+                f"({wick_adr:+.3f}) but {why}",
+            )
 
         day_range_adr = (indicators.session_high - indicators.session_low) / adr
         rvol = compute_rvol(indicators.cum_volume, bar.start, curve) if curve else None
@@ -1331,6 +1364,10 @@ class _AVWAPTouchBase(Setup):
             touch_band_adr=self.touch_band_adr,
             depth_adr=self._touch_depth_adr if self._touch_bar is not None else wick_depth_adr,
             min_depth_adr=self.min_depth_adr,
+            from_open_adr=from_open_adr,
+            touch_at=(
+                f"{self._pullback_bar.start:%H:%M}" if self._pullback_bar is not None else None
+            ),
             recovery_adr=recovery,
             min_recovery_adr=self.min_recovery_adr,
             bars_since_touch=None if self._touch_bar is None else self._bars_since_touch,
@@ -1410,6 +1447,7 @@ class _AVWAPTouchBase(Setup):
                     else None
                 ),
                 "recovery_adr": round(recovery, 4),
+                "from_open_adr": round(from_open_adr, 4),
                 "bars_since_touch": self._bars_since_touch,
                 "session_open": indicators.session_open,
                 "session_high": indicators.session_high,

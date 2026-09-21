@@ -108,6 +108,7 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
         "max_bars_since_touch": args.avt_max_bars_since_touch,
         "max_break_adr": args.avt_max_break_adr,
         "min_stop_pct": args.avt_min_stop_pct,
+        "earliest_touch": parse_hhmm(args.avt_earliest_touch),
         "max_loss_dollars": args.max_loss,
     }
     return {
@@ -1059,6 +1060,13 @@ def _add_avt_args(p) -> None:
         default=0.06,
         help="A close this far the wrong side of AVWAP, in ADR, kills the leg "
         "until a new extreme -- this is a touch setup, not a breakdown (AVT).",
+    )
+    p.add_argument(
+        "--avt-earliest-touch",
+        default="09:40",
+        help="Earliest HH:MM ET a touch counts -- AVWAP sits on top of price "
+        "for the first few minutes, so everything touches it before the day "
+        "has shape (AVT).",
     )
     p.add_argument(
         "--avt-min-stop-pct",
