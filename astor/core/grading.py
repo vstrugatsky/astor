@@ -36,9 +36,14 @@ LAST_HOUR_MINUTES = 60
 # a $5B/day name moving on 15% extra volume is as meaningful as an illiquid
 # one needing 50% extra. Ordered highest ADV floor first; the first matching
 # tier wins.
+# The ADV boundaries sit 20% below the round figures they stand for ($5B and
+# $500M) because the ADV they judge is built from IBKR volume, which excludes
+# trades executed outside the NBBO and so reads low against every other
+# platform. Same discount, same reasoning as setups._REV_RVOL_TIERS -- see
+# the comment there for why it belongs in the boundary and not in compute_adv.
 _RVOL_TIERS = (
-    (5_000_000_000, 1.15),
-    (500_000_000, 1.3),
+    (4_000_000_000, 1.15),
+    (400_000_000, 1.3),
 )
 _DEFAULT_RVOL_THRESHOLD = 1.5
 
@@ -55,9 +60,11 @@ _AVWAP_EXTENSION_TIERS = (
 
 def rvol_threshold(adv: float) -> float:
     """The RVOL floor for a name of this ADV, highest-liquidity tier first.
-    Shared with astor.core.setups (Reversal), not just this module's own
-    grading -- a $5B/day name needing less relative volume to look unusual
-    is a property of the name, not of any one setup.
+    A liquid name needing less relative volume to look unusual is a property
+    of the name, not of any one setup, so this is shared: it gates AVT
+    (astor.core.setups._AVWAPTouchBase) as well as feeding this module's own
+    grading. Reversal wants a higher bar and keeps its own ladder --
+    setups.rev_rvol_threshold, same shape, same discounted ADV boundaries.
     """
     for floor, threshold in _RVOL_TIERS:
         if adv > floor:

@@ -90,14 +90,10 @@ def _format_trigger_line(t: Trigger) -> str:
     def sized(shares: int | None, dollars: float | None) -> str:
         return f"{shares} sh (${dollars:,.0f})" if shares is not None else "no size (risk too wide)"
 
-    leg = _format_leg_metrics(
-        e.get("leg_size_adr"), e.get("move_rvol"), e.get("ema9_extension_adr"),
-        e.get("accel_price"), e.get("accel_vol"),
-    )
     return (
         f"[{t.bar_start:%H:%M:%S} ET] TRIGGER {t.symbol:<6} "
         f"{_setup_token(t.setup, t.direction)} {t.direction:<5} "
-        f"@ {t.trigger_price:.2f}   {leg}\n"
+        f"@ {t.trigger_price:.2f}   {_format_metrics(t)}\n"
         f"    {t.level_name:<3} {magnitude(level_pct)} {toward}, stop {t.level_value:.2f}"
         f"  ->  {sized(level_shares, level_dollars)}"
     )
@@ -157,6 +153,36 @@ def _format_leg_metrics(
         f"leg {leg}   move_rvol {move_rvol if move_rvol is not None else 'n/a'}"
         f"   ema9_ext {num(ema9_extension_adr)} ADR"
         f"   accel_price {num(accel_price)}   accel_vol {num(accel_vol)}"
+    )
+
+
+def _format_avt_metrics(e: dict) -> str:
+    """AVT's own quality numbers -- what the pullback did, not what a leg
+    did. Same role the leg metrics play for a Reversal trigger."""
+
+    def num(v: float | None, nd: int = 3) -> str:
+        return f"{v:.{nd}f}" if v is not None else "n/a"
+
+    return (
+        f"range {num(e.get('day_range_adr'), 2)}x ADR   rvol {num(e.get('rvol'), 2)}"
+        f"   touch {num(e.get('touch_adr'))}   depth {num(e.get('depth_adr'))}"
+        f"   recovery {num(e.get('recovery_adr'))}"
+        f"   +{e.get('bars_since_touch', '?')}b"
+    )
+
+
+def _format_metrics(t: Trigger) -> str:
+    """The quality numbers for whichever setup fired. Dispatched on the
+    setup's own name rather than sniffing which extras happen to be present:
+    a Reversal trigger missing a metric should print n/a for it, not quietly
+    render as some other setup's line.
+    """
+    if t.setup.startswith("AVT-"):
+        return _format_avt_metrics(t.extras)
+    e = t.extras
+    return _format_leg_metrics(
+        e.get("leg_size_adr"), e.get("move_rvol"), e.get("ema9_extension_adr"),
+        e.get("accel_price"), e.get("accel_vol"),
     )
 
 

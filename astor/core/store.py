@@ -175,6 +175,22 @@ SELECT
     -- coalesced the same way bars_below/bars_above already are above.
     COALESCE(json_extract(t.extras_json, '$.meets_ur_condition'),
              json_extract(t.extras_json, '$.meets_of_condition')) AS meets_legacy_condition,
+    -- AVWAP touch (AVT-L/AVT-S) only. touch_adr is signed -- which side of
+    -- AVWAP the pullback wick actually reached, since the band is symmetric
+    -- and a poke through is still a touch. depth_adr is how far that wick
+    -- was from the day's extreme, recovery_adr how far past AVWAP the
+    -- trigger bar closed, and bars_since_touch how long the continuation
+    -- took (0 = the same bar did both). stop_source says which term set the
+    -- stop: the pullback extreme, or the percent-of-entry floor under it.
+    json_extract(t.extras_json, '$.day_range_adr')             AS day_range_adr,
+    json_extract(t.extras_json, '$.touch_adr')                 AS touch_adr,
+    json_extract(t.extras_json, '$.touch_at')                  AS touch_at,
+    json_extract(t.extras_json, '$.touch_price')               AS touch_price,
+    json_extract(t.extras_json, '$.depth_adr')                 AS depth_adr,
+    json_extract(t.extras_json, '$.recovery_adr')              AS recovery_adr,
+    json_extract(t.extras_json, '$.bars_since_touch')          AS bars_since_touch,
+    json_extract(t.extras_json, '$.rvol_floor')                AS rvol_floor,
+    json_extract(t.extras_json, '$.stop_source')               AS stop_source,
     -- detection_ts equals bar_end exactly in Replay, so showing both is noise.
     -- The difference is the only part that carries information, and it is what
     -- Live will populate: how long after the bar closed the trigger was seen.

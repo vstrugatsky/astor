@@ -1,6 +1,11 @@
 """Setup state machines.
 
-Reversal (REV-L/REV-S, "right side of a V") is the only setup left here.
+Two live setups, betting on opposite things about the same tape. Reversal
+(REV-L/REV-S, "right side of a V") fades a leg that has exhausted itself;
+AVWAP touch (AVT-L/AVT-S) joins one that is still running, after it pulls
+back to daily AVWAP and turns back. They share no state, and both can be
+armed on the same symbol at the same time.
+
 U&R and O&F (breach-a-level-then-reclaim-it) were retired after review found
 almost none of their real triggers were actionable; the trader's own read is
 that a reversal is only worth trading when the leg that precedes it shows
@@ -30,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import ClassVar
 
+from astor.core.grading import rvol_threshold
 from astor.core.indicators import SessionIndicators, compute_rvol
 from astor.core.types import BarEvent, CapitulationAlert, DailyLevels, Trigger, VolumeCurve
 
@@ -1120,5 +1126,351 @@ class ReversalShort(_ReversalBase):
         return extreme > levels.pdh and close < levels.pdh
 
 
-ALL_SETUPS: list[type[Setup]] = [ReversalLong, ReversalShort]
+@dataclass(frozen=True, slots=True)
+class _AVTReadout:
+    """Every filter an AVWAP-touch candidate has to clear, with its
+    threshold -- same role _FilterReadout plays for Reversal, printed on
+    every diagnostic line that bar produces (astor.cli's `explain`).
+    """
+
+    day_range_adr: float
+    min_day_range_adr: float
+    rvol: float | None
+    min_rvol: float
+    touch_adr: float | None  # signed: which side of AVWAP the wick reached
+    touch_band_adr: float
+    depth_adr: float | None
+    min_depth_adr: float
+    recovery_adr: float
+    min_recovery_adr: float
+    bars_since_touch: int | None
+    max_bars_since_touch: int
+    was_recovered: bool
+
+    def line(self) -> str:
+        def v(x: float | None, nd: int = 3) -> str:
+            return f"{x:.{nd}f}" if x is not None else "n/a"
+
+        bars = "none" if self.bars_since_touch is None else f"{self.bars_since_touch}"
+        return "  ".join(
+            [
+                f"range {self.day_range_adr:.2f}x/{self.min_day_range_adr:g}x ADR",
+                f"rvol {v(self.rvol, 2)}/{self.min_rvol:g}",
+                f"touch {v(self.touch_adr)}/±{self.touch_band_adr:g}",
+                f"depth {v(self.depth_adr)}/{self.min_depth_adr:g}",
+                f"recovery {v(self.recovery_adr)}/{self.min_recovery_adr:g}",
+                f"bars since touch {bars}/{self.max_bars_since_touch}",
+                f"already recovered {'yes' if self.was_recovered else 'no'}",
+            ]
+        )
+
+
+class _AVWAPTouchBase(Setup):
+    """AVT-L/AVT-S -- a significant move on elevated volume, a pullback that
+    touches daily AVWAP, then a quick continuation the way the move was
+    already going. The entry is that continuation; the appeal is that the
+    stop sits just the other side of AVWAP, so the risk is small relative to
+    the move already proven.
+
+    Distinct from Reversal in what it is betting on: Reversal fades an
+    exhausted leg, this one joins a live one. They share no state and can
+    both be armed on the same symbol at once.
+
+    The rule that does the most work here is the last one, and it is not
+    about distance. A pullback that merely *sits* beyond the recovery
+    threshold never qualifies -- the trigger bar has to cross into it from
+    the other side. Without that, two things fire that plainly should not:
+    price drifting flat while AVWAP descends onto it (2026-09-18 FIVN 09:42
+    -- the gap to AVWAP closed entirely from the AVWAP side, price highs
+    were flat across the six bars), and a single wick up to AVWAP from
+    price that had been parked 0.4 ADR away for twelve minutes, closing
+    back where it started (FIVN 14:52). Both clear every distance test.
+    Neither is a continuation, because nothing continued.
+    """
+
+    name: ClassVar[str]
+    direction: ClassVar[str]
+
+    def __init__(
+        self,
+        min_day_range_adr: float = 0.8,
+        touch_band_adr: float = 0.06,
+        min_depth_adr: float = 0.15,
+        min_recovery_adr: float = 0.12,
+        max_bars_since_touch: int = 5,
+        max_break_adr: float = 0.06,
+        min_stop_pct: float = 1.0,
+        max_loss_dollars: float = 100.0,
+    ):
+        self.min_day_range_adr = min_day_range_adr
+        self.touch_band_adr = touch_band_adr
+        self.min_depth_adr = min_depth_adr
+        self.min_recovery_adr = min_recovery_adr
+        self.max_bars_since_touch = max_bars_since_touch
+        self.max_break_adr = max_break_adr
+        self.min_stop_pct = min_stop_pct
+        self.max_loss_dollars = max_loss_dollars
+
+        # Two different things, both needed. `_touch_bar` is the most recent
+        # bar to reach the band -- it is what the staleness window counts
+        # from. `_pullback_bar` is the one that got *furthest* into the
+        # pullback, which is where the stop belongs and what "the touch"
+        # means when reporting one: a trader stops under the swing low, not
+        # under whichever of several in-band bars happened to be last.
+        # Measurements are kept rather than recomputed at fire time, since by
+        # then AVWAP has moved and the trigger bar's own wick is elsewhere.
+        self._touch_bar: BarEvent | None = None
+        self._pullback_bar: BarEvent | None = None
+        self._bars_since_touch = 0
+        self._touch_adr: float | None = None
+        self._touch_depth_adr: float | None = None
+        # Set when a close lands too far the wrong side of AVWAP: this is a
+        # touch setup, not an AVWAP-breakdown setup, so the leg is done until
+        # a fresh extreme starts a new one.
+        self._dead = False
+        self._prev_extreme: float | None = None
+        # Whether the previous evaluated bar already closed beyond the
+        # recovery threshold -- the transition rule above.
+        self._prev_recovered = False
+
+    # -- direction hooks -----------------------------------------------------
+
+    def _extreme(self, indicators: SessionIndicators) -> float | None:
+        """The end of the move being joined: the day's high for a long (the
+        move was up), the day's low for a short."""
+        raise NotImplementedError
+
+    def _pullback_wick(self, bar: BarEvent) -> float:
+        """The end of the bar that reaches back toward AVWAP -- the low of a
+        pullback in an up move, the high of one in a down move."""
+        raise NotImplementedError
+
+    def _beyond(self, price: float, avwap: float) -> float:
+        """How far `price` sits the trade's way of AVWAP. Negative means the
+        wrong side."""
+        raise NotImplementedError
+
+    def _stop_price(self, entry: float, stop_distance: float) -> float:
+        raise NotImplementedError
+
+    # -- the state machine ---------------------------------------------------
+
+    def on_bar(
+        self,
+        bar: BarEvent,
+        levels: DailyLevels,
+        indicators: SessionIndicators | None = None,
+        curve: VolumeCurve | None = None,
+        trace: list[dict] | None = None,
+    ) -> Trigger | None:
+        adr = levels.adr
+        if indicators is None or adr <= 0:
+            return None
+        avwap = indicators.avwap
+        extreme = self._extreme(indicators)
+        if avwap is None or extreme is None:
+            return None
+        if indicators.session_high is None or indicators.session_low is None:
+            return None
+
+        if self._touch_bar is not None:
+            self._bars_since_touch += 1
+
+        # A fresh extreme is a new move, so whatever happened to the last one
+        # -- died, fired, or simply went stale -- stops applying.
+        if self._prev_extreme is not None and extreme != self._prev_extreme:
+            self._dead = False
+            self._touch_bar = None
+            self._pullback_bar = None
+            self._bars_since_touch = 0
+        self._prev_extreme = extreme
+
+        recovery = self._beyond(bar.close, avwap) / adr
+        was_recovered = self._prev_recovered
+        self._prev_recovered = recovery >= self.min_recovery_adr
+
+        if -recovery > self.max_break_adr:
+            if not self._dead:
+                _trace(
+                    trace, bar,
+                    f"leg dead @ {bar.close:.2f}: closed {-recovery:.3f} ADR the wrong "
+                    f"side of AVWAP {avwap:.2f} (max {self.max_break_adr}) -- this is a "
+                    f"touch setup, not a breakdown; waiting for a new extreme",
+                )
+            self._dead = True
+            self._touch_bar = None
+            self._pullback_bar = None
+            return None
+        if self._dead:
+            return None
+
+        wick = self._pullback_wick(bar)
+        wick_adr = (wick - avwap) / adr
+        wick_depth_adr = abs(extreme - wick) / adr
+        if abs(wick_adr) <= self.touch_band_adr and wick_depth_adr >= self.min_depth_adr:
+            self._touch_bar = bar
+            self._bars_since_touch = 0
+            # Deepest wick of this pullback wins -- see _pullback_bar.
+            if self._pullback_bar is None or wick_depth_adr > (self._touch_depth_adr or 0.0):
+                self._pullback_bar = bar
+                self._touch_adr = wick_adr
+                self._touch_depth_adr = wick_depth_adr
+
+        day_range_adr = (indicators.session_high - indicators.session_low) / adr
+        rvol = compute_rvol(indicators.cum_volume, bar.start, curve) if curve else None
+        min_rvol = rvol_threshold(levels.adv)
+        readout = _AVTReadout(
+            day_range_adr=day_range_adr,
+            min_day_range_adr=self.min_day_range_adr,
+            rvol=rvol,
+            min_rvol=min_rvol,
+            # The qualifying touch's own measurements, not this bar's -- see
+            # _touch_adr in __init__. Falls back to this bar's while nothing
+            # has touched yet, so a near-miss still reads honestly.
+            touch_adr=self._touch_adr if self._touch_bar is not None else wick_adr,
+            touch_band_adr=self.touch_band_adr,
+            depth_adr=self._touch_depth_adr if self._touch_bar is not None else wick_depth_adr,
+            min_depth_adr=self.min_depth_adr,
+            recovery_adr=recovery,
+            min_recovery_adr=self.min_recovery_adr,
+            bars_since_touch=None if self._touch_bar is None else self._bars_since_touch,
+            max_bars_since_touch=self.max_bars_since_touch,
+            was_recovered=was_recovered,
+        )
+
+        def candidate(verdict: str) -> None:
+            _trace(trace, bar, f"candidate @ {bar.close:.2f}: {readout.line()} -- {verdict}")
+
+        if self._touch_bar is None:
+            # Nothing has reached the band since the last extreme. Silent,
+            # except for the one case worth explaining: price crossing into
+            # the recovery zone anyway, which is the shape that looks like a
+            # trigger on a chart but has no pullback behind it.
+            if recovery >= self.min_recovery_adr and not was_recovered:
+                candidate("FAIL touch: nothing reached the AVWAP band since the last extreme")
+            return None
+        if self._bars_since_touch > self.max_bars_since_touch:
+            candidate("FAIL bars since touch: the pullback is stale, waiting for a new one")
+            self._touch_bar = None
+            self._pullback_bar = None
+            return None
+        if recovery < self.min_recovery_adr:
+            candidate("HOLD recovery: has not yet cleared AVWAP by enough -- stay armed")
+            return None
+        if was_recovered:
+            candidate(
+                "FAIL already recovered: price was beyond the threshold before this bar, "
+                "so nothing continued here"
+            )
+            return None
+        if day_range_adr < self.min_day_range_adr:
+            candidate("FAIL range: the day has not moved enough to be worth joining")
+            return None
+        if rvol is None or rvol < min_rvol:
+            candidate("FAIL rvol: not enough volume behind the day")
+            return None
+
+        touch_extreme = self._pullback_wick(self._pullback_bar)
+        stop_distance = max(
+            abs(bar.close - touch_extreme), bar.close * self.min_stop_pct / 100.0
+        )
+        stop = self._stop_price(bar.close, stop_distance)
+        stop_source = (
+            "pullback" if abs(bar.close - touch_extreme) >= bar.close * self.min_stop_pct / 100.0
+            else f"{self.min_stop_pct:g}%"
+        )
+        shares, dollars = _position_size(bar.close, stop, self.max_loss_dollars)
+        candidate("FIRE -- all filters pass")
+
+        touch_at = self._pullback_bar.start
+        self._touch_bar = self._pullback_bar = None  # one trigger per pullback
+        avwap_pct = _pct_of_level(bar.close - avwap, avwap)
+        return Trigger(
+            symbol=bar.symbol,
+            setup=self.name,
+            direction=self.direction,
+            trigger_price=bar.close,
+            bar_start=bar.start,
+            bar_end=bar.end,
+            level_name="PBK" if stop_source == "pullback" else "STP",
+            level_value=round(stop, 4),
+            extras={
+                "avwap": avwap,
+                "avwap_pct": avwap_pct,
+                "adr_pct": levels.adr_pct,
+                "rvol": rvol,
+                "rvol_floor": min_rvol,
+                "day_range_adr": round(day_range_adr, 4),
+                "touch_adr": round(self._touch_adr, 4) if self._touch_adr is not None else None,
+                "touch_at": touch_at.isoformat(),
+                "touch_price": touch_extreme,
+                "depth_adr": (
+                    round(self._touch_depth_adr, 4)
+                    if self._touch_depth_adr is not None
+                    else None
+                ),
+                "recovery_adr": round(recovery, 4),
+                "bars_since_touch": self._bars_since_touch,
+                "session_open": indicators.session_open,
+                "session_high": indicators.session_high,
+                "session_low": indicators.session_low,
+                "stop_source": stop_source,
+                "max_loss_dollars": self.max_loss_dollars,
+                # Aliased under the names Notify's trigger line already reads,
+                # so the console alert needs no AVT-specific code for the
+                # stop/size framing (astor.drivers.live._format_trigger_line).
+                "reclaim_pct": _abs_pct_of_level(bar.close - stop, stop),
+                "level_stop_pct": _abs_pct_of_level(bar.close - stop, stop),
+                "level_stop_shares": shares,
+                "level_stop_dollars": dollars,
+            },
+        )
+
+
+class AVWAPTouchLong(_AVWAPTouchBase):
+    """Long. The move up is the day's high; the pullback comes down to AVWAP
+    and the entry is the push back up off it."""
+
+    name = "AVT-L"
+    direction = "long"
+
+    def _extreme(self, indicators: SessionIndicators) -> float | None:
+        return indicators.session_high
+
+    def _pullback_wick(self, bar: BarEvent) -> float:
+        return bar.low
+
+    def _beyond(self, price: float, avwap: float) -> float:
+        return price - avwap
+
+    def _stop_price(self, entry: float, stop_distance: float) -> float:
+        return entry - stop_distance
+
+
+class AVWAPTouchShort(_AVWAPTouchBase):
+    """Short. Mirror of AVWAPTouchLong: the move down is the day's low, the
+    pullback comes up to AVWAP, the entry is the drop back off it."""
+
+    name = "AVT-S"
+    direction = "short"
+
+    def _extreme(self, indicators: SessionIndicators) -> float | None:
+        return indicators.session_low
+
+    def _pullback_wick(self, bar: BarEvent) -> float:
+        return bar.high
+
+    def _beyond(self, price: float, avwap: float) -> float:
+        return avwap - price
+
+    def _stop_price(self, entry: float, stop_distance: float) -> float:
+        return entry + stop_distance
+
+
+ALL_SETUPS: list[type[Setup]] = [
+    ReversalLong,
+    ReversalShort,
+    AVWAPTouchLong,
+    AVWAPTouchShort,
+]
 SETUPS_BY_NAME = {s.name: s for s in ALL_SETUPS}

@@ -100,7 +100,22 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
         "accel_window": args.accel_window,
         "max_loss_dollars": args.max_loss,
     }
-    return {"REV-L": reversal_kwargs, "REV-S": reversal_kwargs}
+    avt_kwargs = {
+        "min_day_range_adr": args.min_avt_day_range_adr,
+        "touch_band_adr": args.avt_touch_band_adr,
+        "min_depth_adr": args.min_avt_depth_adr,
+        "min_recovery_adr": args.min_avt_recovery_adr,
+        "max_bars_since_touch": args.avt_max_bars_since_touch,
+        "max_break_adr": args.avt_max_break_adr,
+        "min_stop_pct": args.avt_min_stop_pct,
+        "max_loss_dollars": args.max_loss,
+    }
+    return {
+        "REV-L": reversal_kwargs,
+        "REV-S": reversal_kwargs,
+        "AVT-L": avt_kwargs,
+        "AVT-S": avt_kwargs,
+    }
 
 
 def _setups_and_kwargs(args: argparse.Namespace):
@@ -997,6 +1012,63 @@ async def _live_console(
             )
 
 
+def _add_avt_args(p) -> None:
+    """AVT-L/AVT-S thresholds, shared by replay/live/explain. One helper
+    rather than the flag-by-flag repetition the Reversal arguments still use
+    across the three -- seven knobs times three subparsers is where that
+    pattern stops paying.
+    """
+    p.add_argument(
+        "--min-avt-day-range-adr",
+        type=float,
+        default=0.8,
+        help="Minimum day range, in ADR(14) multiples, for the move to be "
+        "worth joining (AVT).",
+    )
+    p.add_argument(
+        "--avt-touch-band-adr",
+        type=float,
+        default=0.06,
+        help="How close the pullback wick must come to AVWAP, in ADR. "
+        "Symmetric -- either side of AVWAP counts as a touch (AVT).",
+    )
+    p.add_argument(
+        "--min-avt-depth-adr",
+        type=float,
+        default=0.15,
+        help="Minimum pullback depth from the day's extreme, in ADR (AVT).",
+    )
+    p.add_argument(
+        "--min-avt-recovery-adr",
+        type=float,
+        default=0.12,
+        help="How far past AVWAP the bar must close, in ADR, to count as the "
+        "continuation -- and it must CROSS that line, not already sit past it "
+        "(AVT).",
+    )
+    p.add_argument(
+        "--avt-max-bars-since-touch",
+        type=int,
+        default=5,
+        help="How many bars the recovery may lag the touch; 0 means one bar "
+        "did both (AVT).",
+    )
+    p.add_argument(
+        "--avt-max-break-adr",
+        type=float,
+        default=0.06,
+        help="A close this far the wrong side of AVWAP, in ADR, kills the leg "
+        "until a new extreme -- this is a touch setup, not a breakdown (AVT).",
+    )
+    p.add_argument(
+        "--avt-min-stop-pct",
+        type=float,
+        default=1.0,
+        help="Floor on the stop distance as %% of entry; the pullback extreme "
+        "sets it instead when that is wider (AVT).",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1106,6 +1178,7 @@ def build_parser() -> argparse.ArgumentParser:
         "position-size diagnostics recorded on each trigger (both a stop at "
         "PDH/PDL and a stop at the session's actual high/low are sized).",
     )
+    _add_avt_args(r)
     r.add_argument("--db", default="data/astor.db")
     r.add_argument("--cache-dir", default="data/bars")
     r.add_argument("--host", default="127.0.0.1")
@@ -1199,6 +1272,7 @@ def build_parser() -> argparse.ArgumentParser:
         "position-size diagnostics on each trigger (both a stop at PDH/PDL "
         "and a stop at the session's actual high/low are sized).",
     )
+    _add_avt_args(lv)
     lv.add_argument(
         "--max-tickers",
         type=int,
@@ -1234,6 +1308,7 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--max-retrace-pct", type=float, default=50.0)
     ex.add_argument("--min-confirm-minutes", type=float, default=0.0)
     ex.add_argument("--max-loss", type=float, default=100.0)
+    _add_avt_args(ex)
     ex.add_argument("--cache-dir", default="data/bars")
     ex.add_argument("--host", default="127.0.0.1")
     ex.add_argument("--port", type=int, default=4001)
