@@ -20,6 +20,9 @@
 
     uv run python -m astor.cli profile --date 2026-09-14 --ticker RUM --interval 5
         (how RVOL and the day's own range built through that session)
+
+    uv run python -m astor.cli positions
+        (open positions from both IBKR feeds, plus working orders)
 """
 
 from __future__ import annotations
@@ -709,6 +712,97 @@ async def cmd_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_positions(args: argparse.Namespace) -> int:
+    """What IBKR thinks you are holding, from both of its feeds at once.
+
+    IBKR reports positions two different ways, and the desktop app's
+    Portfolio view is driven by the second one:
+
+      reqPositions      -> ib.positions()   -- the account's positions
+      account updates   -> ib.portfolio()   -- the same, plus market value
+                                               and unrealized P&L
+
+    They come from separate subscriptions, so when a position vanishes from
+    the desktop Portfolio view this says whether it vanished from the data
+    or only from that window: if reqPositions still has it and the portfolio
+    feed does not, the position is fine and the app's feed is stale. A
+    restart would have "fixed" it either way, which is why it is worth
+    checking before restarting.
+
+    Read-only -- it opens a connection, asks, prints, and disconnects.
+    """
+    ib = IB()
+    logger.info("Connecting to %s:%d...", args.host, args.port)
+    await ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=15)
+    try:
+        await ib.reqPositionsAsync()
+        # No reqAccountUpdates call on purpose. ib_async subscribes to
+        # account updates on connect and IB pushes them unasked, so both
+        # feeds are already populated here -- and asking explicitly makes
+        # this hang: reqAccountUpdatesAsync never resolves against this
+        # gateway (verified 2026-09-21; the data arrives regardless, only
+        # the future is left pending). A brief settle beat instead.
+        await asyncio.sleep(1.0)
+        positions = [p for p in ib.positions() if p.position]
+        portfolio = [i for i in ib.portfolio() if i.position]
+        orders = await ib.reqAllOpenOrdersAsync()
+    finally:
+        ib.disconnect()
+
+    print("\n" + "=" * 78)
+    print(f"POSITIONS   {datetime.now(ET):%Y-%m-%d %H:%M:%S} ET")
+    print("=" * 78)
+
+    print(f"\nreqPositions ({len(positions)}):")
+    if not positions:
+        print("  (none)")
+    for p in sorted(positions, key=lambda p: (p.account, p.contract.symbol)):
+        print(
+            f"  {p.contract.symbol:<8} {p.position:>10,.0f} @ avg {p.avgCost:>10,.4f}"
+            f"   {p.account}"
+        )
+
+    print(f"\nportfolio / account updates ({len(portfolio)}):")
+    if not portfolio:
+        print("  (none)")
+    for i in sorted(portfolio, key=lambda i: (i.account, i.contract.symbol)):
+        print(
+            f"  {i.contract.symbol:<8} {i.position:>10,.0f} @ mkt {i.marketPrice:>10,.4f}"
+            f"   value {i.marketValue:>12,.2f}   unreal {i.unrealizedPNL:>10,.2f}   {i.account}"
+        )
+
+    # The whole point: do the two feeds agree?
+    by_positions = {(p.account, p.contract.symbol) for p in positions}
+    by_portfolio = {(i.account, i.contract.symbol) for i in portfolio}
+    only_positions = sorted(by_positions - by_portfolio)
+    only_portfolio = sorted(by_portfolio - by_positions)
+    print()
+    if not only_positions and not only_portfolio:
+        print(f"Both feeds agree: {len(by_positions)} open position(s).")
+    else:
+        print("MISMATCH between the two feeds:")
+        for account, sym in only_positions:
+            print(f"  {sym} ({account}): in reqPositions, missing from the portfolio feed")
+        for account, sym in only_portfolio:
+            print(f"  {sym} ({account}): in the portfolio feed, missing from reqPositions")
+
+    working = [
+        t for t in orders
+        if t.orderStatus.status not in ("Filled", "Cancelled", "Inactive", "ApiCancelled")
+    ]
+    print(f"\nWorking orders ({len(working)}):")
+    if not working:
+        print("  (none)")
+    for t in sorted(working, key=lambda t: t.contract.symbol):
+        o = t.order
+        price = o.auxPrice or o.lmtPrice or 0.0
+        print(
+            f"  {t.contract.symbol:<8} {o.action:<4} {o.totalQuantity:>8,.0f} {o.orderType:<6}"
+            f" @ {price:>10,.4f}   {t.orderStatus.status}"
+        )
+    return 0
+
+
 async def cmd_warm_cache(args: argparse.Namespace) -> int:
     """Pre-fetch PDH/PDL/ADR/ADV and the RVOL volume curve for a whole
     watchlist into BarCache (data/bars), so a symbol added mid-session in
@@ -1368,6 +1462,17 @@ def build_parser() -> argparse.ArgumentParser:
     # Distinct from replay/live/warm-cache/purge-db/explain's client IDs.
     pr.add_argument("--client-id", type=int, default=26)
 
+    po = sub.add_parser(
+        "positions",
+        help="Show open positions from both of IBKR's feeds plus working "
+        "orders -- read-only, for checking whether a position that vanished "
+        "from the desktop Portfolio view is really gone",
+    )
+    po.add_argument("--host", default="127.0.0.1")
+    po.add_argument("--port", type=int, default=4001)
+    # Distinct from every other command's client ID.
+    po.add_argument("--client-id", type=int, default=27)
+
     wc = sub.add_parser(
         "warm-cache",
         help="Pre-fetch PDH/PDL/ADR/ADV and RVOL curves for a watchlist into "
@@ -1465,6 +1570,7 @@ def main() -> None:
         "purge-db": cmd_purge_db,
         "explain": cmd_explain,
         "profile": cmd_profile,
+        "positions": cmd_positions,
     }[args.command]
     raise SystemExit(asyncio.run(cmd(args)))
 
