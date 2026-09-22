@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
-from typing import Any
+from typing import Any, ClassVar
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,8 +111,10 @@ class CapitulationAlert:
     """A Reversal leg still extending (no retrace yet) that already clears
     the same leg-quality bar the eventual trigger will require -- a heads-up
     to prepare size/entry before the reversal confirms, not a trade signal
-    itself. See astor.core.setups._ReversalBase.pop_capitulation_alert.
+    itself. See astor.core.setups._ReversalBase.pop_alert.
     """
+
+    kind: ClassVar[str] = "capitulation"
 
     symbol: str
     direction: str
@@ -126,3 +128,66 @@ class CapitulationAlert:
     ema9_extension_adr: float | None
     accel_price: float | None
     accel_vol: float | None
+
+    def store_extras(self) -> dict[str, Any]:
+        """What the alerts table records beyond the columns every alert
+        shares (astor.core.store.record_alert)."""
+        return {
+            "leg_extreme": self.leg_extreme,
+            "anchor": self.anchor,
+            "leg_size_adr": self.leg_size_adr,
+            "move_rvol": self.move_rvol,
+            "ema9_extension_adr": self.ema9_extension_adr,
+            "accel_price": self.accel_price,
+            "accel_vol": self.accel_vol,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TouchAlert:
+    """An AVWAP touch that has happened, before any continuation has -- the
+    same relationship to an AVT trigger that CapitulationAlert has to a
+    Reversal one. AVT's whole premise is that price leaves AVWAP quickly, so
+    waiting for the recovery bar to print can be too late to react; this
+    says "it is at AVWAP now, with the session and the day's range behind
+    it" and leaves the decision to the trader.
+
+    One per pullback, not per in-band bar. See
+    astor.core.setups._AVWAPTouchBase.pop_alert.
+    """
+
+    kind: ClassVar[str] = "avwap_touch"
+
+    symbol: str
+    direction: str
+    bar_start: datetime
+    bar_end: datetime
+    price: float
+    avwap: float
+    touch_adr: float       # signed: which side of AVWAP the wick reached
+    depth_adr: float
+    day_range_adr: float   # in ADR(14), the "is this day worth joining" gauge
+    from_open_adr: float
+    rvol: float | None
+    stop: float            # where the trade's stop would sit, off AVWAP
+    shares: int | None
+    dollars: float | None
+
+    def store_extras(self) -> dict[str, Any]:
+        return {
+            "avwap": self.avwap,
+            "touch_adr": self.touch_adr,
+            "depth_adr": self.depth_adr,
+            "day_range_adr": self.day_range_adr,
+            "from_open_adr": self.from_open_adr,
+            "rvol": self.rvol,
+            "stop": self.stop,
+            "level_stop_shares": self.shares,
+            "level_stop_dollars": self.dollars,
+        }
+
+
+# Either kind of setup-produced alert. Both carry `kind` and store_extras(),
+# which is all a driver needs to record one; printing is the only place that
+# cares which is which.
+SetupAlert = CapitulationAlert | TouchAlert

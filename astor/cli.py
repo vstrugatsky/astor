@@ -107,7 +107,7 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
         "min_recovery_adr": args.min_avt_recovery_adr,
         "max_bars_since_touch": args.avt_max_bars_since_touch,
         "max_break_adr": args.avt_max_break_adr,
-        "min_stop_pct": args.avt_min_stop_pct,
+        "stop_adr": args.avt_stop_adr,
         "earliest_touch": parse_hhmm(args.avt_earliest_touch),
         "max_loss_dollars": args.max_loss,
     }
@@ -202,28 +202,20 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         # latency, so Replay's value is the floor.
         store.record(run_id, t, t.bar_end)
 
-    def on_capitulation_alert(a):
+    def on_setup_alert(a):
         store.record_alert(
             run_id,
-            "capitulation",
+            a.kind,
             a.symbol,
             a.direction,
             a.bar_start,
             a.price,
             a.bar_end,
-            {
-                "leg_extreme": a.leg_extreme,
-                "anchor": a.anchor,
-                "leg_size_adr": a.leg_size_adr,
-                "move_rvol": a.move_rvol,
-                "ema9_extension_adr": a.ema9_extension_adr,
-                "accel_price": a.accel_price,
-                "accel_vol": a.accel_vol,
-            },
+            a.store_extras(),
             bar_end=a.bar_end,
         )
 
-    fed = run_replay(scanner, bars, start_t, end_t, on_trigger, on_capitulation_alert)
+    fed = run_replay(scanner, bars, start_t, end_t, on_trigger, on_setup_alert)
     store.commit()
     store.close()
 
@@ -256,8 +248,16 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
     if scanner.skipped_no_levels:
         print(f"Dropped, no levels  : {', '.join(sorted(scanner.skipped_no_levels))}")
     print(f"\nTriggers: {len(triggers)}")
-    print(f"Capitulation alerts (leg still extending, no retrace yet): "
-          f"{len(scanner.capitulation_alerts)}")
+    from collections import Counter
+    by_kind = Counter(a.kind for a in scanner.alerts)
+    print(
+        "Alerts: "
+        + (
+            ", ".join(f"{k} {n}" for k, n in sorted(by_kind.items()))
+            if by_kind
+            else "none"
+        )
+    )
 
     if triggers:
         print(
@@ -1048,23 +1048,24 @@ def _add_avt_args(p) -> None:
     p.add_argument(
         "--avt-touch-band-adr",
         type=float,
-        default=0.06,
-        help="How close the pullback wick must come to AVWAP, in ADR. "
-        "Symmetric -- either side of AVWAP counts as a touch (AVT).",
+        default=0.05,
+        help="How close the pullback wick must come to AVWAP, as a fraction of "
+        "today's range. Symmetric -- either side counts as a touch (AVT).",
     )
     p.add_argument(
         "--min-avt-depth-adr",
         type=float,
         default=0.15,
-        help="Minimum pullback depth from the day's extreme, in ADR (AVT).",
+        help="Minimum pullback depth from the day's extreme, as a fraction of "
+        "today's range (AVT).",
     )
     p.add_argument(
         "--min-avt-recovery-adr",
         type=float,
-        default=0.12,
-        help="How far past AVWAP the bar must close, in ADR, to count as the "
-        "continuation -- and it must CROSS that line, not already sit past it "
-        "(AVT).",
+        default=0.10,
+        help="How far past AVWAP the bar must close, as a fraction of today's "
+        "range, to count as the continuation -- and it must CROSS that line, "
+        "not already sit past it (AVT).",
     )
     p.add_argument(
         "--avt-max-bars-since-touch",
@@ -1077,8 +1078,9 @@ def _add_avt_args(p) -> None:
         "--avt-max-break-adr",
         type=float,
         default=0.06,
-        help="A close this far the wrong side of AVWAP, in ADR, kills the leg "
-        "until a new extreme -- this is a touch setup, not a breakdown (AVT).",
+        help="A close this far the wrong side of AVWAP, as a fraction of today's "
+        "range, kills the leg until a new extreme -- this is a touch setup, "
+        "not a breakdown (AVT).",
     )
     p.add_argument(
         "--avt-earliest-touch",
@@ -1088,11 +1090,12 @@ def _add_avt_args(p) -> None:
         "has shape (AVT).",
     )
     p.add_argument(
-        "--avt-min-stop-pct",
+        "--avt-stop-adr",
         type=float,
-        default=1.0,
-        help="Floor on the stop distance as %% of entry; the pullback extreme "
-        "sets it instead when that is wider (AVT).",
+        default=0.06,
+        help="Where the stop sits: this much of today's range the far side of "
+        "AVWAP. Same distance that kills the leg, so stop and invalidation "
+        "agree (AVT).",
     )
 
 

@@ -275,6 +275,20 @@ SELECT
     json_extract(a.extras_json, '$.ema9_extension_adr')  AS ema9_extension_adr,
     json_extract(a.extras_json, '$.accel_price')         AS accel_price,
     json_extract(a.extras_json, '$.accel_vol')           AS accel_vol,
+    -- AVWAP-touch-only fields (kind 'avwap_touch'): the pullback as it
+    -- stood when the touch was flagged, before any continuation. touch_adr
+    -- is signed -- which side of AVWAP the wick reached. All of these are
+    -- fractions of the session's own range, not of ADR(14); day_range_adr
+    -- is the exception and is in ADR(14), being the gauge of whether the
+    -- day was worth joining at all.
+    json_extract(a.extras_json, '$.avwap')               AS avwap,
+    json_extract(a.extras_json, '$.touch_adr')           AS touch_adr,
+    json_extract(a.extras_json, '$.depth_adr')           AS depth_adr,
+    json_extract(a.extras_json, '$.day_range_adr')       AS day_range_adr,
+    json_extract(a.extras_json, '$.from_open_adr')       AS from_open_adr,
+    json_extract(a.extras_json, '$.rvol')                AS rvol,
+    json_extract(a.extras_json, '$.level_stop_shares')   AS level_stop_shares,
+    json_extract(a.extras_json, '$.level_stop_dollars')  AS level_stop_dollars,
     -- Track-alert-only fields (breakeven/sell)
     json_extract(a.extras_json, '$.entry')               AS entry,
     json_extract(a.extras_json, '$.stop')                AS stop,

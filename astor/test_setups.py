@@ -152,7 +152,7 @@ def test_run_replay_end_to_end() -> None:
     triggers, alerts = [], []
     fed = run_replay(
         sc, {"REV": _canonical_long_bars()}, on_trigger=triggers.append,
-        on_capitulation_alert=alerts.append,
+        on_setup_alert=alerts.append,
     )
     check("bars fed", fed, 6)
     check("one trigger", len(triggers), 1)
@@ -738,7 +738,7 @@ def test_format_trigger_line() -> None:
         },
     )
     line = _format_trigger_line(t)
-    check("headline present", "TRIGGER ABAT" in line, True)
+    check("headline present", "TRIGGER" in line and "ABAT" in line, True)
     check("price shown", "@ 2.40" in line, True)
     check("leg size shown", "leg 1.25x ADR" in line, True)
     check("move_rvol shown", "move_rvol 2.5" in line, True)
@@ -1426,8 +1426,8 @@ def test_avt_touch_must_reach_the_band() -> None:
     bars = _avt_long_bars()
     # Pullback stops well short of AVWAP: no touch, so no trigger however
     # strong the bar that follows.
-    bars[4] = bar(34, 102.6, 102.6, 102.15, 102.18, 30_000, symbol="AVT")
-    bars[5] = bar(35, 102.40, 103.0, 102.40, 102.9, 60_000, symbol="AVT")
+    bars[4] = bar(34, 102.6, 102.7, 102.45, 102.5, 30_000, symbol="AVT")
+    bars[5] = bar(35, 102.7, 103.5, 102.7, 103.4, 60_000, symbol="AVT")
     check("a pullback that never reaches AVWAP does not arm it", _feed(sc, bars), [])
 
 
@@ -1444,28 +1444,68 @@ def test_avt_recovery_must_land_within_the_bar_window() -> None:
     sc = _avt_scanner(AVWAPTouchLong, setup_kwargs={"max_bars_since_touch": 1})
     bars = _avt_long_bars()
     drift = [
-        bar(35, 102.0, 102.1, 101.75, 102.05, 20_000, symbol="AVT"),   # neither touch nor recovery
-        bar(36, 102.05, 102.1, 101.75, 102.05, 20_000, symbol="AVT"),
-        bar(37, 102.30, 103.0, 102.30, 102.9, 60_000, symbol="AVT"),   # 3 bars after the touch
+        bar(35, 102.0, 102.1, 101.45, 101.70, 20_000, symbol="AVT"),  # neither touch nor recovery
+        bar(36, 101.7, 101.8, 101.45, 101.70, 20_000, symbol="AVT"),
+        bar(37, 102.4, 103.2, 102.4, 103.1, 60_000, symbol="AVT"),    # 3 bars after the touch
     ]
     check("a stale pullback does not fire", _feed(sc, bars[:5] + drift), [])
     check("...but the same bars fire with the default 5-bar window",
           len(_feed(_avt_scanner(AVWAPTouchLong), bars[:5] + drift)), 1)
 
 
-def test_avt_stop_is_the_wider_of_the_pullback_and_the_floor() -> None:
+def test_avt_stop_sits_the_far_side_of_avwap() -> None:
+    """The stop is a fraction of today's range beyond AVWAP, not a function
+    of the pullback's low -- the thesis is that AVWAP held, so that is where
+    being wrong is measured. It is also exactly where max_break_adr calls
+    the leg dead, so stop and invalidation agree by construction."""
     sc = _avt_scanner(AVWAPTouchLong)
     t = _feed(sc, _avt_long_bars())[0]
-    # Pullback low 101.85 against a 102.9 entry is 1.05 -- wider than the 1%
-    # floor (1.029), so the pullback sets the stop here.
-    check("stop source", t.extras["stop_source"], "pullback")
-    check("stop is the pullback extreme", t.level_value, 101.85)
+    avwap, day_range = t.extras["avwap"], 4.5  # 104.00 high, 99.50 low
+    check("stop is stop_adr of today's range below AVWAP",
+          round(t.level_value, 4), round(avwap - 0.06 * day_range, 4))
+    check("named for what it is anchored to", t.level_name, "AVW")
+    check("and it sits below the entry", t.level_value < t.trigger_price, True)
 
-    # A shallow pullback instead: the floor takes over.
-    tight = _avt_scanner(AVWAPTouchLong, setup_kwargs={"min_stop_pct": 5.0})
-    t2 = _feed(tight, _avt_long_bars())[0]
-    check("floor takes over when it is wider", t2.extras["stop_source"], "5%")
-    check("stop sits 5% below entry", round(t2.level_value, 2), round(102.9 * 0.95, 2))
+    # Widen it and the stop moves with it; nothing about the pullback changes.
+    wide = _feed(_avt_scanner(AVWAPTouchLong, setup_kwargs={"stop_adr": 0.20}), _avt_long_bars())[0]
+    check("a wider stop_adr moves the stop, not the entry",
+          (round(wide.level_value, 4), wide.trigger_price),
+          (round(avwap - 0.20 * day_range, 4), t.trigger_price))
+
+
+def test_avt_raises_a_touch_alert_before_the_continuation() -> None:
+    """The heads-up fires on the touch bar itself, one per pullback, and
+    carries the stop and size so there is nothing left to work out when the
+    continuation prints."""
+    sc = _avt_scanner(AVWAPTouchLong)
+    bars = _avt_long_bars()
+    alerts, triggers = [], []
+    for b in bars:
+        triggers.extend(sc.on_bar(b))
+        alerts.extend(sc.pop_alerts())
+
+    check("one alert", len(alerts), 1)
+    a = alerts[0]
+    check("kind", a.kind, "avwap_touch")
+    check("raised on the touch bar, before the trigger", a.bar_start, bars[4].start)
+    check("...which is a bar earlier than the trigger", triggers[0].bar_start, bars[5].start)
+    check("carries a stop", a.stop < a.price, True)
+    check("and the size that stop allows", a.shares is not None, True)
+    check("touch distance is inside the band", abs(a.touch_adr) <= 0.05, True)
+
+    # A second in-band bar in the same pullback does not re-alert.
+    check("still just the one alert", len([x for x in alerts if x.kind == "avwap_touch"]), 1)
+
+
+def test_avt_touch_alert_needs_the_same_day_quality_as_a_trigger() -> None:
+    """A touch on a day not worth joining is not worth interrupting anyone
+    for, so the alert is gated on the range and volume filters too."""
+    sc = _avt_scanner(AVWAPTouchLong, setup_kwargs={"min_day_range_adr": 99.0})
+    alerts = []
+    for b in _avt_long_bars():
+        sc.on_bar(b)
+        alerts.extend(sc.pop_alerts())
+    check("no alert when the day is too quiet to trade", alerts, [])
 
 
 def test_avt_short_mirrors_long() -> None:
@@ -2177,15 +2217,15 @@ def test_capitulation_alert_fires_once_per_leg() -> None:
     seen = []
     for b in bars:
         sc.on_bar(b)
-        seen.append(len(sc.pop_capitulation_alerts()))
+        seen.append(len(sc.pop_alerts()))
     check(
         "only one alert, at the first bar clearing every floor (minute 4) -- "
         "none at the deeper extreme (minute 7), same push",
         seen,
         [0, 0, 0, 0, 1, 0, 0, 0],
     )
-    check("full-history list has just the one", len(sc.capitulation_alerts), 1)
-    check("alert's leg matches the first extreme, not the later deeper one", sc.capitulation_alerts[0].leg_extreme, 93.0)
+    check("full-history list has just the one", len(sc.alerts), 1)
+    check("alert's leg matches the first extreme, not the later deeper one", sc.alerts[0].leg_extreme, 93.0)
 
 
 def test_capitulation_alert_rearms_after_a_genuine_death_and_revival() -> None:
@@ -2218,7 +2258,7 @@ def test_capitulation_alert_rearms_after_a_genuine_death_and_revival() -> None:
     alerts = []
     for b in bars:
         sc.on_bar(b)
-        alerts.extend(sc.pop_capitulation_alerts())
+        alerts.extend(sc.pop_alerts())
     check("one alert for leg1, one for the revived leg2", len(alerts), 2)
     check("first alert is leg1's own extreme, not leg2's", alerts[0].leg_extreme, 94.0)
     check("second alert is leg2's own extreme, not a re-alert of leg1", alerts[1].leg_extreme, 87.5)
@@ -2236,7 +2276,7 @@ def test_capitulation_alert_gated_by_leg_quality() -> None:
     alerts = []
     for b in _canonical_long_bars():
         sc_adr.on_bar(b)
-        alerts.extend(sc_adr.pop_capitulation_alerts())
+        alerts.extend(sc_adr.pop_alerts())
     check("leg too small relative to ADR never alerts", alerts, [])
 
     demanding_curve = VolumeCurve(
@@ -2247,14 +2287,14 @@ def test_capitulation_alert_gated_by_leg_quality() -> None:
     alerts = []
     for b in _canonical_long_bars():
         sc_rvol.on_bar(b)
-        alerts.extend(sc_rvol.pop_capitulation_alerts())
+        alerts.extend(sc_rvol.pop_alerts())
     check("thin RVOL relative to average never alerts", alerts, [])
 
     sc_accel = _rev_scanner(ReversalLong, setup_kwargs={"min_accel_price": 10.0})
     alerts = []
     for b in _canonical_long_bars():
         sc_accel.on_bar(b)
-        alerts.extend(sc_accel.pop_capitulation_alerts())
+        alerts.extend(sc_accel.pop_alerts())
     check("leg not accelerating enough never alerts", alerts, [])
 
     fast_bars = [
@@ -2266,7 +2306,7 @@ def test_capitulation_alert_gated_by_leg_quality() -> None:
     alerts = []
     for b in fast_bars:
         sc_fast.on_bar(b)
-        alerts.extend(sc_fast.pop_capitulation_alerts())
+        alerts.extend(sc_fast.pop_alerts())
     check("leg built too fast (< 4-minute floor) never alerts", alerts, [])
 
     levels = DailyLevels(
@@ -2284,7 +2324,7 @@ def test_capitulation_alert_gated_by_leg_quality() -> None:
     alerts = []
     for b in fast_bars:
         sc_loose.on_bar(b)
-        alerts.extend(sc_loose.pop_capitulation_alerts())
+        alerts.extend(sc_loose.pop_alerts())
     check("same fast leg alerts once the duration floor is loosened", len(alerts), 1)
 
 

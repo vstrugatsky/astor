@@ -22,7 +22,7 @@ from ib_async import IB
 from astor.core.scanner import Scanner
 from astor.core.store import TriggerStore
 from astor.core.tracking import SellRuleTracker, TrackAlert, TrackedTrade
-from astor.core.types import BarEvent, CapitulationAlert, Trigger
+from astor.core.types import BarEvent, CapitulationAlert, SetupAlert, TouchAlert, Trigger
 from astor.drivers.replay import (
     ET,
     ReplayDriver,
@@ -91,7 +91,7 @@ def _format_trigger_line(t: Trigger) -> str:
         return f"{shares} sh (${dollars:,.0f})" if shares is not None else "no size (risk too wide)"
 
     return (
-        f"[{t.bar_start:%H:%M:%S} ET] TRIGGER {t.symbol:<6} "
+        f"[{t.bar_start:%H:%M:%S} ET] TRIGGER {_symbol(t.symbol)} "
         f"{_setup_token(t.setup, t.direction)} {t.direction:<5} "
         f"@ {t.trigger_price:.2f}   {_format_metrics(t)}\n"
         f"    {t.level_name:<3} {magnitude(level_pct)} {toward}, stop {t.level_value:.2f}"
@@ -114,6 +114,14 @@ _ANSI_BLACK = "\033[30m"
 _ANSI_GREEN = "\033[32m"
 _ANSI_RED = "\033[31m"
 _ANSI_BROWN = "\033[38;5;130m"
+
+
+def _symbol(sym: str, width: int = 6) -> str:
+    """Every alert's ticker, bold. Black like the rest of the line -- the
+    color is reserved for what *kind* of alert it is -- but heavy enough to
+    be the thing the eye lands on when several alerts scroll past."""
+    pad = " " * max(0, width - len(sym))
+    return f"{_ANSI_BOLD}{sym}{_ANSI_RESET}{_ANSI_BLACK}{pad}"
 
 
 def _accent(text: str, color: str, width: int = 0) -> str:
@@ -197,7 +205,10 @@ def _print_trigger_alert(t: Trigger) -> None:
 
 
 def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
-    header = f"[{alert.bar_start:%H:%M:%S} ET] TRACK {alert.symbol:<6} {trade.direction:<5}"
+    header = (
+        f"[{alert.bar_start:%H:%M:%S} ET] {_accent('TRACKING', _ANSI_BROWN)} "
+        f"{_symbol(alert.symbol)} {trade.direction:<5}"
+    )
     if alert.kind == "breakeven":
         return (
             f"{header} {_accent('+1R reached', _ANSI_BROWN)} @ {alert.close:.2f}"
@@ -226,12 +237,37 @@ def _format_capitulation_alert(a: CapitulationAlert) -> str:
     )
     return (
         f"[{a.bar_start:%H:%M:%S} ET] {_accent('CAPITULATION', color)} "
-        f"{a.symbol:<6} {a.direction:<5} @ {a.price:.2f}   {leg}"
+        f"{_symbol(a.symbol)} {a.direction:<5} @ {a.price:.2f}   {leg}"
     )
 
 
-def _print_capitulation_alert(a: CapitulationAlert) -> None:
-    _print_alert(_format_capitulation_alert(a))
+def _format_touch_alert(a: TouchAlert) -> str:
+    """The heads-up that price is AT AVWAP, before any continuation has
+    printed. Carries the stop and the size it allows, because the whole
+    point is to be ready to act on the next bar rather than work it out
+    then."""
+    color = _ANSI_GREEN if a.direction == "long" else _ANSI_RED
+    sized = (
+        f"{a.shares} sh (${a.dollars:,.0f})" if a.shares is not None
+        else "no size (risk too wide)"
+    )
+    return (
+        f"[{a.bar_start:%H:%M:%S} ET] {_accent('AVWAP TOUCH', color)} "
+        f"{_symbol(a.symbol)} {a.direction:<5} @ {a.price:.2f}   "
+        f"avwap {a.avwap:.2f}   touch {a.touch_adr:+.3f}   depth {a.depth_adr:.3f}   "
+        f"range {a.day_range_adr:.2f}x ADR   rvol "
+        f"{a.rvol if a.rvol is not None else 'n/a'}\n"
+        f"    stop {a.stop:.2f}  ->  {sized}   (waiting on the continuation bar)"
+    )
+
+
+def _print_setup_alert(a: SetupAlert) -> None:
+    """One entry point for every setup-produced alert; the only thing that
+    differs by kind is how it reads."""
+    if isinstance(a, TouchAlert):
+        _print_alert(_format_touch_alert(a))
+    else:
+        _print_alert(_format_capitulation_alert(a))
 
 
 async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | None:
@@ -557,28 +593,20 @@ class LiveDriver:
                     if _should_notify(trigger):
                         _print_trigger_alert(trigger)
 
-                for alert in scanner.pop_capitulation_alerts():
+                for alert in scanner.pop_alerts():
                     store.record_alert(
                         run_id,
-                        "capitulation",
+                        alert.kind,
                         alert.symbol,
                         alert.direction,
                         alert.bar_start,
                         alert.price,
                         datetime.now(ET),
-                        {
-                            "leg_extreme": alert.leg_extreme,
-                            "anchor": alert.anchor,
-                            "leg_size_adr": alert.leg_size_adr,
-                            "move_rvol": alert.move_rvol,
-                            "ema9_extension_adr": alert.ema9_extension_adr,
-                            "accel_price": alert.accel_price,
-                            "accel_vol": alert.accel_vol,
-                        },
+                        alert.store_extras(),
                         bar_end=alert.bar_end,
                     )
                     store.commit()
-                    _print_capitulation_alert(alert)
+                    _print_setup_alert(alert)
 
                 track_alert = self.tracker.on_close(symbol, bar_event.close, bar_event.start)
                 if track_alert is not None:

@@ -37,7 +37,15 @@ from typing import ClassVar
 
 from astor.core.grading import rvol_threshold
 from astor.core.indicators import SessionIndicators, compute_rvol
-from astor.core.types import BarEvent, CapitulationAlert, DailyLevels, Trigger, VolumeCurve
+from astor.core.types import (
+    BarEvent,
+    CapitulationAlert,
+    DailyLevels,
+    SetupAlert,
+    TouchAlert,
+    Trigger,
+    VolumeCurve,
+)
 
 
 def _pct_of_level(amount: float, level_value: float) -> float | None:
@@ -195,10 +203,11 @@ class Setup:
     ) -> Trigger | None:
         raise NotImplementedError
 
-    def pop_capitulation_alert(self) -> CapitulationAlert | None:
-        """A leg-in-progress heads-up, distinct from a Trigger -- see
-        _ReversalBase. No-op default so Scanner can call this on every
-        setup uniformly without caring which ones implement it."""
+    def pop_alert(self) -> SetupAlert | None:
+        """An alert this setup raised on the bar just fed, distinct from a
+        Trigger: Reversal's capitulation heads-up, AVT's AVWAP touch. No-op
+        default so Scanner can call this on every setup uniformly without
+        caring which ones implement it."""
         return None
 
 
@@ -1001,7 +1010,7 @@ class _ReversalBase(Setup):
             accel_vol=accel_vol,
         )
 
-    def pop_capitulation_alert(self) -> CapitulationAlert | None:
+    def pop_alert(self) -> CapitulationAlert | None:
         alert, self._pending_capitulation_alert = self._pending_capitulation_alert, None
         return alert
 
@@ -1198,12 +1207,12 @@ class _AVWAPTouchBase(Setup):
     def __init__(
         self,
         min_day_range_adr: float = 0.8,
-        touch_band_adr: float = 0.06,
+        touch_band_adr: float = 0.05,
         min_depth_adr: float = 0.15,
-        min_recovery_adr: float = 0.12,
+        min_recovery_adr: float = 0.10,
         max_bars_since_touch: int = 5,
         max_break_adr: float = 0.06,
-        min_stop_pct: float = 1.0,
+        stop_adr: float = 0.06,
         earliest_touch: time = time(9, 40),
         max_loss_dollars: float = 100.0,
     ):
@@ -1213,18 +1222,18 @@ class _AVWAPTouchBase(Setup):
         self.min_recovery_adr = min_recovery_adr
         self.max_bars_since_touch = max_bars_since_touch
         self.max_break_adr = max_break_adr
-        self.min_stop_pct = min_stop_pct
+        self.stop_adr = stop_adr
         self.earliest_touch = earliest_touch
         self.max_loss_dollars = max_loss_dollars
 
-        # Two different things, both needed. `_touch_bar` is the most recent
-        # bar to reach the band -- it is what the staleness window counts
-        # from. `_pullback_bar` is the one that got *furthest* into the
-        # pullback, which is where the stop belongs and what "the touch"
-        # means when reporting one: a trader stops under the swing low, not
-        # under whichever of several in-band bars happened to be last.
-        # Measurements are kept rather than recomputed at fire time, since by
-        # then AVWAP has moved and the trigger bar's own wick is elsewhere.
+        # `_touch_bar` is the most recent bar to reach the band -- what the
+        # staleness window counts from. `_pullback_bar` is the one that got
+        # *furthest* into the pullback, which is what "the touch" means when
+        # reporting one. The stop no longer comes from it (it is AVWAP-
+        # anchored now, see stop_adr), but the depth it reached is still the
+        # honest description of the pullback. Measurements are kept rather
+        # than recomputed at fire time, since by then AVWAP has moved and the
+        # trigger bar's own wick is elsewhere.
         self._touch_bar: BarEvent | None = None
         self._pullback_bar: BarEvent | None = None
         self._bars_since_touch = 0
@@ -1238,6 +1247,9 @@ class _AVWAPTouchBase(Setup):
         # Whether the previous evaluated bar already closed beyond the
         # recovery threshold -- the transition rule above.
         self._prev_recovered = False
+        # One AVWAP-touch alert per pullback, not per in-band bar.
+        self._pending_alert: TouchAlert | None = None
+        self._alerted_touch = False
 
     # -- direction hooks -----------------------------------------------------
 
@@ -1256,7 +1268,14 @@ class _AVWAPTouchBase(Setup):
         wrong side."""
         raise NotImplementedError
 
-    def _stop_price(self, entry: float, stop_distance: float) -> float:
+    def _stop_from_avwap(self, avwap: float, yard: float) -> float:
+        """Where the stop sits: `stop_adr` of today's range the far side of
+        AVWAP. Anchored to AVWAP rather than to the pullback's low, because
+        the trade's thesis is that AVWAP held -- if price is back through it
+        by this much, the thesis is wrong, whatever the pullback's own low
+        happened to be. It is also exactly where max_break_adr calls the leg
+        dead, so the stop and the invalidation agree by construction.
+        """
         raise NotImplementedError
 
     # -- the state machine ---------------------------------------------------
@@ -1279,6 +1298,19 @@ class _AVWAPTouchBase(Setup):
         if indicators.session_high is None or indicators.session_low is None:
             return None
 
+        # Two yardsticks, deliberately. The day-range filter asks "has this
+        # session moved enough to be worth joining", which only means
+        # anything against the prior-session average -- ADR(14). Everything
+        # describing the pullback's shape (touch, depth, recovery, the
+        # wrong-side break, the stop) is a fraction of *this* day's move, so
+        # it scales with the range the day has actually made: ADR(1). On
+        # 2026-09-21 META ran past 2x ADR(14), and measuring its pullback
+        # against the smaller yardstick understated every part of it.
+        day_range = indicators.session_high - indicators.session_low
+        if day_range <= 0:
+            return None
+        yard = day_range
+
         if self._touch_bar is not None:
             self._bars_since_touch += 1
 
@@ -1289,9 +1321,10 @@ class _AVWAPTouchBase(Setup):
             self._touch_bar = None
             self._pullback_bar = None
             self._bars_since_touch = 0
+            self._alerted_touch = False
         self._prev_extreme = extreme
 
-        recovery = self._beyond(bar.close, avwap) / adr
+        recovery = self._beyond(bar.close, avwap) / yard
         was_recovered = self._prev_recovered
         self._prev_recovered = recovery >= self.min_recovery_adr
 
@@ -1299,26 +1332,27 @@ class _AVWAPTouchBase(Setup):
             if not self._dead:
                 _trace(
                     trace, bar,
-                    f"leg dead @ {bar.close:.2f}: closed {-recovery:.3f} ADR the wrong "
+                    f"leg dead @ {bar.close:.2f}: closed {-recovery:.3f} ADR(1) the wrong "
                     f"side of AVWAP {avwap:.2f} (max {self.max_break_adr}) -- this is a "
                     f"touch setup, not a breakdown; waiting for a new extreme",
                 )
             self._dead = True
             self._touch_bar = None
             self._pullback_bar = None
+            self._alerted_touch = False
             return None
         if self._dead:
             return None
 
         wick = self._pullback_wick(bar)
-        wick_adr = (wick - avwap) / adr
-        wick_depth_adr = abs(extreme - wick) / adr
+        wick_adr = (wick - avwap) / yard
+        wick_depth_adr = abs(extreme - wick) / yard
         # The session itself has to be going the trade's way: this is a
         # continuation setup, so a long wants the day up on its open and a
         # short wants it down. Measured at the touch, which is the moment the
         # pullback is being judged as one worth joining.
         from_open_adr = (
-            self._beyond(bar.close, indicators.session_open) / adr
+            self._beyond(bar.close, indicators.session_open) / yard
             if indicators.session_open
             else 0.0
         )
@@ -1327,7 +1361,11 @@ class _AVWAPTouchBase(Setup):
         # AVWAP sits on top of price for the first few minutes of a session,
         # so everything "touches" it before the day has shape.
         after_floor = bar.start.time() >= self.earliest_touch
+        day_range_adr = day_range / adr  # the one ADR(14) measure that stays
+        rvol = compute_rvol(indicators.cum_volume, bar.start, curve) if curve else None
+        min_rvol = rvol_threshold(levels.adv)
         if in_band and with_session and after_floor:
+            first_of_this_pullback = self._touch_bar is None
             self._touch_bar = bar
             self._bars_since_touch = 0
             # Deepest wick of this pullback wins -- see _pullback_bar.
@@ -1335,6 +1373,38 @@ class _AVWAPTouchBase(Setup):
                 self._pullback_bar = bar
                 self._touch_adr = wick_adr
                 self._touch_depth_adr = wick_depth_adr
+            # The heads-up. AVT's premise is that price leaves AVWAP fast, so
+            # waiting for the recovery bar to print can be too late to act on
+            # -- this says "it is at AVWAP now" while the trade is still
+            # there to take. Gated on the same day-quality filters the
+            # trigger uses, since a touch on a day not worth joining is not
+            # worth interrupting anyone for. One per pullback.
+            if (
+                first_of_this_pullback
+                and not self._alerted_touch
+                and day_range_adr >= self.min_day_range_adr
+                and rvol is not None
+                and rvol >= min_rvol
+            ):
+                self._alerted_touch = True
+                stop = self._stop_from_avwap(avwap, yard)
+                shares, dollars = _position_size(bar.close, stop, self.max_loss_dollars)
+                self._pending_alert = TouchAlert(
+                    symbol=bar.symbol,
+                    direction=self.direction,
+                    bar_start=bar.start,
+                    bar_end=bar.end,
+                    price=bar.close,
+                    avwap=round(avwap, 4),
+                    touch_adr=round(wick_adr, 4),
+                    depth_adr=round(wick_depth_adr, 4),
+                    day_range_adr=round(day_range_adr, 4),
+                    from_open_adr=round(from_open_adr, 4),
+                    rvol=rvol,
+                    stop=round(stop, 4),
+                    shares=shares,
+                    dollars=dollars,
+                )
         elif in_band:
             # Would have been a touch on distance alone -- say why it wasn't,
             # rather than leaving a silent gap where a trigger was expected.
@@ -1349,9 +1419,6 @@ class _AVWAPTouchBase(Setup):
                 f"({wick_adr:+.3f}) but {why}",
             )
 
-        day_range_adr = (indicators.session_high - indicators.session_low) / adr
-        rvol = compute_rvol(indicators.cum_volume, bar.start, curve) if curve else None
-        min_rvol = rvol_threshold(levels.adv)
         readout = _AVTReadout(
             day_range_adr=day_range_adr,
             min_day_range_adr=self.min_day_range_adr,
@@ -1390,6 +1457,7 @@ class _AVWAPTouchBase(Setup):
             candidate("FAIL bars since touch: the pullback is stale, waiting for a new one")
             self._touch_bar = None
             self._pullback_bar = None
+            self._alerted_touch = False
             return None
         if recovery < self.min_recovery_adr:
             candidate("HOLD recovery: has not yet cleared AVWAP by enough -- stay armed")
@@ -1408,14 +1476,7 @@ class _AVWAPTouchBase(Setup):
             return None
 
         touch_extreme = self._pullback_wick(self._pullback_bar)
-        stop_distance = max(
-            abs(bar.close - touch_extreme), bar.close * self.min_stop_pct / 100.0
-        )
-        stop = self._stop_price(bar.close, stop_distance)
-        stop_source = (
-            "pullback" if abs(bar.close - touch_extreme) >= bar.close * self.min_stop_pct / 100.0
-            else f"{self.min_stop_pct:g}%"
-        )
+        stop = self._stop_from_avwap(avwap, yard)
         shares, dollars = _position_size(bar.close, stop, self.max_loss_dollars)
         candidate("FIRE -- all filters pass")
 
@@ -1429,7 +1490,7 @@ class _AVWAPTouchBase(Setup):
             trigger_price=bar.close,
             bar_start=bar.start,
             bar_end=bar.end,
-            level_name="PBK" if stop_source == "pullback" else "STP",
+            level_name="AVW",
             level_value=round(stop, 4),
             extras={
                 "avwap": avwap,
@@ -1452,7 +1513,6 @@ class _AVWAPTouchBase(Setup):
                 "session_open": indicators.session_open,
                 "session_high": indicators.session_high,
                 "session_low": indicators.session_low,
-                "stop_source": stop_source,
                 "max_loss_dollars": self.max_loss_dollars,
                 # Aliased under the names Notify's trigger line already reads,
                 # so the console alert needs no AVT-specific code for the
@@ -1463,6 +1523,11 @@ class _AVWAPTouchBase(Setup):
                 "level_stop_dollars": dollars,
             },
         )
+
+
+    def pop_alert(self) -> TouchAlert | None:
+        alert, self._pending_alert = self._pending_alert, None
+        return alert
 
 
 class AVWAPTouchLong(_AVWAPTouchBase):
@@ -1481,8 +1546,8 @@ class AVWAPTouchLong(_AVWAPTouchBase):
     def _beyond(self, price: float, avwap: float) -> float:
         return price - avwap
 
-    def _stop_price(self, entry: float, stop_distance: float) -> float:
-        return entry - stop_distance
+    def _stop_from_avwap(self, avwap: float, yard: float) -> float:
+        return avwap - self.stop_adr * yard
 
 
 class AVWAPTouchShort(_AVWAPTouchBase):
@@ -1501,8 +1566,8 @@ class AVWAPTouchShort(_AVWAPTouchBase):
     def _beyond(self, price: float, avwap: float) -> float:
         return avwap - price
 
-    def _stop_price(self, entry: float, stop_distance: float) -> float:
-        return entry + stop_distance
+    def _stop_from_avwap(self, avwap: float, yard: float) -> float:
+        return avwap + self.stop_adr * yard
 
 
 ALL_SETUPS: list[type[Setup]] = [
