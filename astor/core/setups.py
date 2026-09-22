@@ -1247,9 +1247,14 @@ class _AVWAPTouchBase(Setup):
         # Whether the previous evaluated bar already closed beyond the
         # recovery threshold -- the transition rule above.
         self._prev_recovered = False
-        # One AVWAP-touch alert per pullback, not per in-band bar.
+        # One AVWAP-touch alert per pullback, not per in-band bar. That is
+        # `first_of_this_pullback` at the touch site -- `_touch_bar` is None
+        # between pullbacks and set within one, so it latches on its own. An
+        # extra per-leg latch used to sit here too and was strictly harmful:
+        # it never cleared when a trigger fired, so the second pullback of a
+        # leg went silent. On 2026-09-21 that cost 9 of 20 triggers their
+        # heads-up -- the exact thing this alert exists to prevent.
         self._pending_alert: TouchAlert | None = None
-        self._alerted_touch = False
 
     # -- direction hooks -----------------------------------------------------
 
@@ -1321,7 +1326,6 @@ class _AVWAPTouchBase(Setup):
             self._touch_bar = None
             self._pullback_bar = None
             self._bars_since_touch = 0
-            self._alerted_touch = False
         self._prev_extreme = extreme
 
         recovery = self._beyond(bar.close, avwap) / yard
@@ -1339,7 +1343,6 @@ class _AVWAPTouchBase(Setup):
             self._dead = True
             self._touch_bar = None
             self._pullback_bar = None
-            self._alerted_touch = False
             return None
         if self._dead:
             return None
@@ -1381,12 +1384,10 @@ class _AVWAPTouchBase(Setup):
             # worth interrupting anyone for. One per pullback.
             if (
                 first_of_this_pullback
-                and not self._alerted_touch
                 and day_range_adr >= self.min_day_range_adr
                 and rvol is not None
                 and rvol >= min_rvol
             ):
-                self._alerted_touch = True
                 stop = self._stop_from_avwap(avwap, yard)
                 shares, dollars = _position_size(bar.close, stop, self.max_loss_dollars)
                 self._pending_alert = TouchAlert(
@@ -1457,7 +1458,6 @@ class _AVWAPTouchBase(Setup):
             candidate("FAIL bars since touch: the pullback is stale, waiting for a new one")
             self._touch_bar = None
             self._pullback_bar = None
-            self._alerted_touch = False
             return None
         if recovery < self.min_recovery_adr:
             candidate("HOLD recovery: has not yet cleared AVWAP by enough -- stay armed")
