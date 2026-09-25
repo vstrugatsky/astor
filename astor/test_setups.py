@@ -2258,6 +2258,28 @@ def test_capitulation_alert_refreshes_every_bar() -> None:
           len({a.target for a in live}), 3)
 
 
+def test_capitulation_alert_is_silent_while_the_ticket_is_unchanged() -> None:
+    """The refresh only speaks when it has something different to say: a
+    bar that would print the same target and stop is not a correction."""
+    sc = _rev_scanner(ReversalLong, setup_kwargs={"min_accel_price": 0.0, "min_accel_vol": 0.0})
+    bars = [
+        bar(0, 98.0, 98.0, 97.5, 97.8, 50_000, symbol="REV"),
+        bar(1, 97.8, 97.9, 96.0, 96.2, 50_000, symbol="REV"),
+        bar(2, 96.2, 96.3, 95.0, 95.1, 50_000, symbol="REV"),
+        bar(3, 95.1, 95.2, 94.0, 94.1, 50_000, symbol="REV"),  # qualifies, alerts
+        # The extreme now sits still and price barely moves, so the ticket
+        # would read the same bar after bar.
+        bar(4, 94.1, 94.2, 94.0, 94.1, 50_000, symbol="REV"),
+        bar(5, 94.1, 94.2, 94.0, 94.1, 50_000, symbol="REV"),
+        bar(6, 94.1, 94.2, 93.0, 93.1, 50_000, symbol="REV"),  # new extreme: levels move
+    ]
+    per_bar = []
+    for b in bars:
+        sc.on_bar(b)
+        per_bar.append(len(sc.pop_alerts()))
+    check("alerts only where the ticket changed", per_bar, [0, 0, 0, 1, 0, 0, 1])
+
+
 
 def test_capitulation_alert_rearms_after_a_genuine_death_and_revival() -> None:
     """Unlike a still-climbing leg (see test_capitulation_alert_fires_once_per_leg),

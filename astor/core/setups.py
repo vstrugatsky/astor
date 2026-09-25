@@ -347,6 +347,10 @@ class _ReversalBase(Setup):
         # noise, not a fresh heads-up). Re-arms only when push_started_at
         # itself changes: a genuinely new leg (new anchor) or a revival
         self._pending_capitulation_alert: CapitulationAlert | None = None
+        # (target, stop) of the last alert actually sent for this leg, at the
+        # precision the ticket prints them. A refresh that would read
+        # identically is not a correction, so it is not sent.
+        self._alerted_levels: tuple[float, float] | None = None
 
     # -- direction-specific hooks, overridden by Long/Short below -----------
 
@@ -684,7 +688,10 @@ class _ReversalBase(Setup):
 
         if retrace_pct > self.max_retrace_pct:
             self._retrace_dead = True
-            self._pending_capitulation_alert = None  # the leg just died
+            # The leg just died: drop the pending ticket, and forget the
+            # levels so a revival alerts again even at the same prices.
+            self._pending_capitulation_alert = None
+            self._alerted_levels = None
             _trace(
                 trace, bar,
                 f"retrace {retrace_pct:.1f}% > max {self.max_retrace_pct}% -- "
@@ -811,6 +818,7 @@ class _ReversalBase(Setup):
         # The trigger is the answer the alert was waiting for; do not send
         # both for the same bar.
         self._pending_capitulation_alert = None
+        self._alerted_levels = None
 
         legacy_condition = self._legacy_condition(levels, self._extreme, bar.close)
 
@@ -1026,6 +1034,16 @@ class _ReversalBase(Setup):
         target, target_basis = retrace_target, "retrace"
         if ema9_now is not None and self._nearer_target(ema9_now, retrace_target) == ema9_now:
             target, target_basis = ema9_now, "ema9"
+        # Only a *changed* ticket is worth sending. The alert repeats every
+        # bar the capitulation is live (see on_bar), but the 9EMA can drift
+        # a fraction of a cent and the extreme can sit still for minutes --
+        # repeats that would print the same two prices are the noise the
+        # per-leg latch used to prevent, without the cost of missing the
+        # bars where the levels really do move.
+        levels_now = (round(target, 2), round(self._extreme, 2))
+        if levels_now == self._alerted_levels:
+            return
+        self._alerted_levels = levels_now
         shares, dollars = _position_size(target, self._extreme, self.max_loss_dollars)
         self._pending_capitulation_alert = CapitulationAlert(
             symbol=bar.symbol,
