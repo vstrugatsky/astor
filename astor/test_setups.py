@@ -2280,6 +2280,42 @@ def test_capitulation_alert_is_silent_while_the_ticket_is_unchanged() -> None:
     check("alerts only where the ticket changed", per_bar, [0, 0, 0, 1, 0, 0, 1])
 
 
+def test_capitulation_realert_gates_the_target_but_not_the_stop() -> None:
+    """The stop re-alerts on any move; the target has to clear
+    min_alert_move_adr first, because it carries the 9EMA and drifts on its
+    own while nothing is happening."""
+    # A leg that keeps deepening -- so the stop moves on most bars -- with
+    # some bars where price wanders and the EMA (and so the target) inches.
+    bars = [
+        bar(0, 98.0, 98.0, 97.5, 97.8, 50_000, symbol="REV"),
+        bar(1, 97.8, 97.9, 96.0, 96.2, 50_000, symbol="REV"),
+        bar(2, 96.2, 96.3, 95.0, 95.1, 50_000, symbol="REV"),
+        bar(3, 95.1, 95.2, 94.0, 94.1, 50_000, symbol="REV"),
+        bar(4, 94.1, 94.2, 94.0, 94.05, 50_000, symbol="REV"),  # stop static, EMA inches
+        bar(5, 94.05, 94.1, 94.0, 94.02, 50_000, symbol="REV"),  # same
+        bar(6, 94.02, 94.1, 93.0, 93.1, 50_000, symbol="REV"),  # new extreme: stop moves
+    ]
+
+    def run(min_move: float) -> list[int]:
+        sc = _rev_scanner(
+            ReversalLong,
+            setup_kwargs={"min_accel_price": 0.0, "min_accel_vol": 0.0,
+                          "min_alert_move_adr": min_move},
+        )
+        out = []
+        for b in bars:
+            sc.on_bar(b)
+            out.append(len(sc.pop_alerts()))
+        return out
+
+    # A floor nothing can clear: only the bars where the stop moved survive.
+    stop_only = run(99.0)
+    check("an unreachable floor leaves only stop moves", stop_only, [0, 0, 0, 1, 0, 0, 1])
+    # No floor at all: every changed ticket re-alerts, including EMA drift.
+    check("no floor lets the target's own drift through",
+          sum(run(0.0)) >= sum(stop_only), True)
+
+
 
 def test_capitulation_alert_rearms_after_a_genuine_death_and_revival() -> None:
     """Unlike a still-climbing leg (see test_capitulation_alert_fires_once_per_leg),

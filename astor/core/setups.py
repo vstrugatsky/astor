@@ -296,6 +296,7 @@ class _ReversalBase(Setup):
         min_confirm_minutes: float = 0.0,
         min_leg_minutes: float = 4.0,
         min_ema9_extension_adr: float = 0.125,
+        min_alert_move_adr: float = 0.01,
         min_accel_price: float = 1.2,
         min_accel_vol: float = 1.0,
         accel_window: int = 3,
@@ -307,6 +308,7 @@ class _ReversalBase(Setup):
         self.min_confirm_minutes = min_confirm_minutes
         self.min_leg_minutes = min_leg_minutes
         self.min_ema9_extension_adr = min_ema9_extension_adr
+        self.min_alert_move_adr = min_alert_move_adr
         self.min_accel_price = min_accel_price
         self.min_accel_vol = min_accel_vol
         self.accel_window = accel_window
@@ -1034,16 +1036,21 @@ class _ReversalBase(Setup):
         target, target_basis = retrace_target, "retrace"
         if ema9_now is not None and self._nearer_target(ema9_now, retrace_target) == ema9_now:
             target, target_basis = ema9_now, "ema9"
-        # Only a *changed* ticket is worth sending. The alert repeats every
-        # bar the capitulation is live (see on_bar), but the 9EMA can drift
-        # a fraction of a cent and the extreme can sit still for minutes --
-        # repeats that would print the same two prices are the noise the
-        # per-leg latch used to prevent, without the cost of missing the
-        # bars where the levels really do move.
-        levels_now = (round(target, 2), round(self._extreme, 2))
-        if levels_now == self._alerted_levels:
-            return
-        self._alerted_levels = levels_now
+        # Only a *changed* ticket is worth sending, and the two halves of it
+        # change for different reasons. The stop is the leg's extreme: when
+        # it moves the trade has genuinely moved, so any move at ticket
+        # precision re-alerts. The target carries the 9EMA, which drifts a
+        # cent or two on its own while nothing is happening -- so that half
+        # has to move by min_alert_move_adr before it counts. Without the
+        # split, 25 of 62 alerts on 2026-09-21 were a static stop next to a
+        # target wobbling with the EMA.
+        if self._alerted_levels is not None:
+            prev_target, prev_stop = self._alerted_levels
+            stop_moved = round(self._extreme, 2) != round(prev_stop, 2)
+            target_moved = abs(target - prev_target) > self.min_alert_move_adr * adr
+            if not (stop_moved or target_moved):
+                return
+        self._alerted_levels = (target, self._extreme)
         shares, dollars = _position_size(target, self._extreme, self.max_loss_dollars)
         self._pending_capitulation_alert = CapitulationAlert(
             symbol=bar.symbol,

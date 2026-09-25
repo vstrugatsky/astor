@@ -98,6 +98,7 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
         "min_confirm_minutes": args.min_confirm_minutes,
         "min_leg_minutes": args.min_leg_minutes,
         "min_ema9_extension_adr": args.min_ema9_extension_adr,
+        "min_alert_move_adr": args.min_alert_move_adr,
         "min_accel_price": args.min_accel_price,
         "min_accel_vol": args.min_accel_vol,
         "accel_window": args.accel_window,
@@ -1303,6 +1304,15 @@ def build_parser() -> argparse.ArgumentParser:
         "PDH/PDL and a stop at the session's actual high/low are sized).",
     )
     _add_avt_args(r)
+    r.add_argument(
+        "--min-alert-move-adr",
+        type=float,
+        default=0.01,
+        help="How far the capitulation alert's target must move, in ADR "
+        "units, to re-alert while the leg is still live. The stop re-alerts "
+        "on any move; this gates the target alone, which drifts with the "
+        "9EMA (0 = re-alert on any change).",
+    )
     r.add_argument("--db", default="data/astor.db")
     r.add_argument("--cache-dir", default="data/bars")
     r.add_argument("--host", default="127.0.0.1")
@@ -1396,6 +1406,15 @@ def build_parser() -> argparse.ArgumentParser:
         "position-size diagnostics on each trigger (both a stop at PDH/PDL "
         "and a stop at the session's actual high/low are sized).",
     )
+    lv.add_argument(
+        "--min-alert-move-adr",
+        type=float,
+        default=0.01,
+        help="How far the capitulation alert's target must move, in ADR "
+        "units, to re-alert while the leg is still live. The stop re-alerts "
+        "on any move; this gates the target alone, which drifts with the "
+        "9EMA (0 = re-alert on any change).",
+    )
     _add_avt_args(lv)
     lv.add_argument(
         "--max-tickers",
@@ -1431,6 +1450,15 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--min-retrace-pct", type=float, default=10.0)
     ex.add_argument("--max-retrace-pct", type=float, default=50.0)
     ex.add_argument("--min-confirm-minutes", type=float, default=0.0)
+    ex.add_argument(
+        "--min-alert-move-adr",
+        type=float,
+        default=0.01,
+        help="How far the capitulation alert's target must move, in ADR "
+        "units, to re-alert while the leg is still live. The stop re-alerts "
+        "on any move; this gates the target alone, which drifts with the "
+        "9EMA (0 = re-alert on any change).",
+    )
     ex.add_argument("--max-loss", type=float, default=100.0)
     _add_avt_args(ex)
     ex.add_argument("--cache-dir", default="data/bars")
