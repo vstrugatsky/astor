@@ -290,12 +290,12 @@ class _ReversalBase(Setup):
 
     def __init__(
         self,
-        min_leg_adr: float = 1.0,
+        min_leg_adr: float = 0.9,
         min_retrace_pct: float = 10.0,
         max_retrace_pct: float = 50.0,
         min_confirm_minutes: float = 0.0,
         min_leg_minutes: float = 4.0,
-        min_ema9_extension_adr: float = 0.15,
+        min_ema9_extension_adr: float = 0.125,
         min_accel_price: float = 1.2,
         min_accel_vol: float = 1.0,
         accel_window: int = 3,
@@ -424,6 +424,17 @@ class _ReversalBase(Setup):
         """Whether this leg also satisfies the retired U&R (REV-L) / O&F
         (REV-S) breach+reclaim condition against PDL/PDH -- recorded under
         `legacy_name`, not filtered on."""
+        raise NotImplementedError
+
+    def _retrace_target(self, extreme: float, leg_size: float) -> float:
+        """The price a min_retrace_pct retracement off the extreme reaches --
+        one of the two ways the trigger can open."""
+        raise NotImplementedError
+
+    def _nearer_target(self, a: float, b: float) -> float:
+        """Whichever of two candidate trigger prices price reaches first
+        going the trade's way: the lower for a long retracing up off its
+        low, the higher for a short."""
         raise NotImplementedError
 
     def _extends_push(self, bar: BarEvent) -> bool:
@@ -993,6 +1004,20 @@ class _ReversalBase(Setup):
             return
 
         self._capitulation_alerted_push_started_at = push_started_at
+        # Where the trigger could first fire, so the alert can be acted on
+        # with a resting stop order instead of waiting for the bar to print.
+        # Two conditions can open it -- a min_retrace_pct retrace off the
+        # extreme, or an EMA9 reclaim -- and whichever price comes first
+        # going the trade's way is the one to name. The EMA9 leg of that is
+        # a snapshot: the line moves every bar, so this is where it would
+        # fire *if the EMA9 stood still*, which it will not. The retrace leg
+        # is fixed as long as the leg's own boundaries are.
+        retrace_target = self._retrace_target(self._extreme, leg_size)
+        ema9_now = indicators.ema9
+        target, target_basis = retrace_target, "retrace"
+        if ema9_now is not None and self._nearer_target(ema9_now, retrace_target) == ema9_now:
+            target, target_basis = ema9_now, "ema9"
+        shares, dollars = _position_size(target, self._extreme, self.max_loss_dollars)
         self._pending_capitulation_alert = CapitulationAlert(
             symbol=bar.symbol,
             direction=self.direction,
@@ -1008,6 +1033,12 @@ class _ReversalBase(Setup):
             ),
             accel_price=accel_price,
             accel_vol=accel_vol,
+            target=round(target, 4),
+            target_basis=target_basis,
+            stop=round(self._extreme, 4),
+            shares=shares,
+            dollars=dollars,
+            max_loss_dollars=self.max_loss_dollars,
         )
 
     def pop_alert(self) -> CapitulationAlert | None:
@@ -1064,6 +1095,12 @@ class ReversalLong(_ReversalBase):
 
     def _retrace_from(self, close: float, extreme: float) -> float:
         return close - extreme
+
+    def _retrace_target(self, extreme: float, leg_size: float) -> float:
+        return extreme + leg_size * self.min_retrace_pct / 100.0
+
+    def _nearer_target(self, a: float, b: float) -> float:
+        return min(a, b)  # REV-L retraces upward, so the lower price comes first
 
     def _extends_push(self, bar: BarEvent) -> bool:
         return bar.close < bar.open  # REV-L's leg is the move down
@@ -1124,6 +1161,12 @@ class ReversalShort(_ReversalBase):
 
     def _retrace_from(self, close: float, extreme: float) -> float:
         return extreme - close
+
+    def _retrace_target(self, extreme: float, leg_size: float) -> float:
+        return extreme - leg_size * self.min_retrace_pct / 100.0
+
+    def _nearer_target(self, a: float, b: float) -> float:
+        return max(a, b)  # REV-S retraces downward, so the higher price comes first
 
     def _extends_push(self, bar: BarEvent) -> bool:
         return bar.close > bar.open  # REV-S's leg is the move up
@@ -1273,6 +1316,12 @@ class _AVWAPTouchBase(Setup):
         wrong side."""
         raise NotImplementedError
 
+    def _target_from_avwap(self, avwap: float, yard: float) -> float:
+        """The price the trigger would fire at: min_recovery_adr of today's
+        range past AVWAP, the trade's way. AVWAP drifts bar to bar, so this
+        is where it would fire if AVWAP stood still."""
+        raise NotImplementedError
+
     def _stop_from_avwap(self, avwap: float, yard: float) -> float:
         """Where the stop sits: `stop_adr` of today's range the far side of
         AVWAP. Anchored to AVWAP rather than to the pullback's low, because
@@ -1389,7 +1438,11 @@ class _AVWAPTouchBase(Setup):
                 and rvol >= min_rvol
             ):
                 stop = self._stop_from_avwap(avwap, yard)
-                shares, dollars = _position_size(bar.close, stop, self.max_loss_dollars)
+                # Sized at the price the trigger would fire, not at the
+                # touch: the touch is the warning, the recovery line is
+                # where the trade actually goes on.
+                target = self._target_from_avwap(avwap, yard)
+                shares, dollars = _position_size(target, stop, self.max_loss_dollars)
                 self._pending_alert = TouchAlert(
                     symbol=bar.symbol,
                     direction=self.direction,
@@ -1402,9 +1455,12 @@ class _AVWAPTouchBase(Setup):
                     day_range_adr=round(day_range_adr, 4),
                     from_open_adr=round(from_open_adr, 4),
                     rvol=rvol,
+                    target=round(target, 4),
+                    target_basis="recovery",
                     stop=round(stop, 4),
                     shares=shares,
                     dollars=dollars,
+                    max_loss_dollars=self.max_loss_dollars,
                 )
         elif in_band:
             # Would have been a touch on distance alone -- say why it wasn't,
@@ -1546,6 +1602,9 @@ class AVWAPTouchLong(_AVWAPTouchBase):
     def _beyond(self, price: float, avwap: float) -> float:
         return price - avwap
 
+    def _target_from_avwap(self, avwap: float, yard: float) -> float:
+        return avwap + self.min_recovery_adr * yard
+
     def _stop_from_avwap(self, avwap: float, yard: float) -> float:
         return avwap - self.stop_adr * yard
 
@@ -1565,6 +1624,9 @@ class AVWAPTouchShort(_AVWAPTouchBase):
 
     def _beyond(self, price: float, avwap: float) -> float:
         return avwap - price
+
+    def _target_from_avwap(self, avwap: float, yard: float) -> float:
+        return avwap - self.min_recovery_adr * yard
 
     def _stop_from_avwap(self, avwap: float, yard: float) -> float:
         return avwap + self.stop_adr * yard

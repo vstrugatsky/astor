@@ -64,9 +64,18 @@ BACKFILL_TIMEOUT = 15.0
 # rule -- the grade-threshold path went with U&R/O&F.
 REVERSAL_NOTIFY_CUTOFF = time(15, 0)
 
+# Triggers are recorded but not announced (2026-09-24, "until further
+# notice"). The experiment underway is to act on the *alert* -- capitulation
+# or AVWAP touch -- by resting a stop order at the price the trigger would
+# fire, rather than waiting for the trigger bar to print and chasing it. A
+# trigger notification arriving after that order is already working is noise
+# at best and a second, worse entry at worst. Everything still lands in the
+# store, so nothing is lost for review.
+NOTIFY_TRIGGERS = False
+
 
 def _should_notify(trigger: Trigger) -> bool:
-    return trigger.bar_start.time() < REVERSAL_NOTIFY_CUTOFF
+    return NOTIFY_TRIGGERS and trigger.bar_start.time() < REVERSAL_NOTIFY_CUTOFF
 
 
 def _format_trigger_line(t: Trigger) -> str:
@@ -114,6 +123,11 @@ _ANSI_BLACK = "\033[30m"
 _ANSI_GREEN = "\033[32m"
 _ANSI_RED = "\033[31m"
 _ANSI_BROWN = "\033[38;5;130m"
+
+
+def _bold(text: str) -> str:
+    """Bold, still black -- for the few numbers an order is placed from."""
+    return f"{_ANSI_BOLD}{text}{_ANSI_RESET}{_ANSI_BLACK}"
 
 
 def _symbol(sym: str, width: int = 6) -> str:
@@ -227,47 +241,85 @@ def _print_track_alert(alert: TrackAlert, trade: TrackedTrade) -> None:
     _print_alert(_format_track_alert(alert, trade))
 
 
-def _format_capitulation_alert(a: CapitulationAlert) -> str:
-    # leg_extreme/anchor dropped from the display (2026-09-14): they're the
-    # leg's bookends, not something to act on mid-session. Still on the
-    # CapitulationAlert itself for the log/journal.
-    color = _ANSI_GREEN if a.direction == "long" else _ANSI_RED
-    leg = _format_leg_metrics(
-        a.leg_size_adr, a.move_rvol, a.ema9_extension_adr, a.accel_price, a.accel_vol
-    )
-    return (
-        f"[{a.bar_start:%H:%M:%S} ET] {_accent('CAPITULATION', color)} "
-        f"{_symbol(a.symbol)} {a.direction:<5} @ {a.price:.2f}   {leg}"
-    )
+# How much worse a fill has to be before the position shrinks by a whole
+# share. Walked in order until one of them costs at least one share, so a
+# $3 stock with a 15c stop reports in cents and a $700 one reports in
+# dollars, without either being told which it is.
+_OVERSHOOT_STEPS = (0.01, 0.02, 0.05, 0.10, 0.25, 0.50, 1.00, 2.50, 5.00)
 
 
-def _format_touch_alert(a: TouchAlert) -> str:
-    """The heads-up that price is AT AVWAP, before any continuation has
-    printed. Carries the stop and the size it allows, because the whole
-    point is to be ready to act on the next bar rather than work it out
-    then."""
+def _overshoot_cost(
+    target: float, stop: float, max_loss: float, direction: str
+) -> tuple[float, int] | None:
+    """(price step, shares lost) -- the first step size that costs a whole
+    share if the fill comes in past the target.
+
+    A resting stop order fills at the market, not at the price it was
+    resting at, so the size worked out from the target is only right if the
+    fill is. This says how quickly it stops being right: risk per share
+    widens as the entry moves away from the stop, so the affordable size
+    falls. None when the sizing is meaningless anyway (no risk, no budget).
+    """
+    def shares_at(entry: float) -> int:
+        risk = abs(entry - stop)
+        return int(max_loss / risk) if risk > 0 else 0
+
+    base = shares_at(target)
+    if base <= 0:
+        return None
+    worse = 1.0 if direction == "long" else -1.0
+    for step in _OVERSHOOT_STEPS:
+        lost = base - shares_at(target + worse * step)
+        if lost >= 1:
+            return step, lost
+    return None
+
+
+def _format_order_alert(label: str, a: SetupAlert) -> str:
+    """One line, sized to be acted on rather than studied.
+
+    Everything that describes *why* the alert fired -- the leg, the touch,
+    the volume -- is in the store and deliberately not here (2026-09-24).
+    What is here is what a resting Buy/Sell Stop order needs: the price the
+    trigger would fire at, the stop that trade carries, the size that pair
+    allows, and how fast that size decays if the fill overshoots.
+    """
     color = _ANSI_GREEN if a.direction == "long" else _ANSI_RED
-    sized = (
-        f"{a.shares} sh (${a.dollars:,.0f})" if a.shares is not None
-        else "no size (risk too wide)"
-    )
+    if a.shares is None or a.target is None:
+        sized = "no size (risk too wide)"
+    else:
+        sized = f"sh: {_bold(str(a.shares))} (${a.dollars:,.0f})"
+    tail = ""
+    if a.target is not None and a.shares:
+        cost = _overshoot_cost(a.target, a.stop, a.max_loss_dollars, a.direction)
+        if cost is not None:
+            step, lost = cost
+            beyond = "above" if a.direction == "long" else "below"
+            unit = "share" if lost == 1 else "shares"
+            tail = f"; {_bold(f'-{lost}')} {unit} / {_bold(f'{step:.2f}')} {beyond} target"
+    target = _bold(f"{a.target:.2f}") if a.target is not None else "n/a"
+    # A resting stop order only works when the market has not already gone
+    # through the level. It happens: the touch can print while price is
+    # still beyond the recovery line from an earlier push, so the trigger is
+    # held back by the crossing rule rather than by price. Saying so beats
+    # sending an order ticket that cannot be placed -- 5 of 38 alerts on
+    # 2026-09-21 were this.
+    if a.target is not None:
+        passed = a.price >= a.target if a.direction == "long" else a.price <= a.target
+        if passed:
+            target = f"{target} {_bold('(already through)')}"
     return (
-        f"[{a.bar_start:%H:%M:%S} ET] {_accent('AVWAP TOUCH', color)} "
-        f"{_symbol(a.symbol)} {a.direction:<5} @ {a.price:.2f}   "
-        f"avwap {a.avwap:.2f}   touch {a.touch_adr:+.3f}   depth {a.depth_adr:.3f}   "
-        f"range {a.day_range_adr:.2f}x ADR   rvol "
-        f"{a.rvol if a.rvol is not None else 'n/a'}\n"
-        f"    stop {a.stop:.2f}  ->  {sized}   (waiting on the continuation bar)"
+        f"[{a.bar_start:%H:%M:%S} ET] {_accent(label, color)} {_bold(a.symbol)} "
+        f"{a.direction}; target: {target} stop: {_bold(f'{a.stop:.2f}')} {sized}{tail}"
     )
 
 
 def _print_setup_alert(a: SetupAlert) -> None:
     """One entry point for every setup-produced alert; the only thing that
-    differs by kind is how it reads."""
-    if isinstance(a, TouchAlert):
-        _print_alert(_format_touch_alert(a))
-    else:
-        _print_alert(_format_capitulation_alert(a))
+    differs by kind is what it is called."""
+    _print_alert(
+        _format_order_alert("AVWAP TOUCH" if isinstance(a, TouchAlert) else "CAPITULATION", a)
+    )
 
 
 async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | None:
@@ -446,9 +498,12 @@ class LiveDriver:
 
         trade = self.tracker.track(symbol, entry, stop, account)
         where = f" [{account}]" if account else ""
+        # Styled like the TRACKING alerts this turns on, so the confirmation
+        # and the alerts that follow it read as one thing.
         return (
-            f"Tracking {symbol} {trade.direction}: entry {entry:.2f} stop {stop:.2f} "
-            f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}){where}"
+            f"{_ANSI_BLACK}{_accent('TRACKING', _ANSI_BROWN)} {_bold(symbol)} "
+            f"{trade.direction}: entry {entry:.2f} stop {stop:.2f} "
+            f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}){where}{_ANSI_RESET}"
         )
 
     # -- open transition --------------------------------------------------

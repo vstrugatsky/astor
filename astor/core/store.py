@@ -289,6 +289,17 @@ SELECT
     json_extract(a.extras_json, '$.rvol')                AS rvol,
     json_extract(a.extras_json, '$.level_stop_shares')   AS level_stop_shares,
     json_extract(a.extras_json, '$.level_stop_dollars')  AS level_stop_dollars,
+    -- On every setup alert: the price its trigger could first fire at, what
+    -- sets that price (an AVT recovery line, or a Reversal EMA9 reclaim vs
+    -- retrace -- whichever price comes first), the stop that trade carries,
+    -- and the risk budget the share count was worked out from. These are
+    -- what the alert notification is built to place an order from, so they
+    -- are recorded rather than recomputed when reviewing whether the order
+    -- would have been the right one.
+    json_extract(a.extras_json, '$.target')              AS target,
+    json_extract(a.extras_json, '$.target_basis')        AS target_basis,
+    json_extract(a.extras_json, '$.stop')                AS stop_price,
+    json_extract(a.extras_json, '$.max_loss_dollars')    AS max_loss_dollars,
     -- Track-alert-only fields (breakeven/sell)
     json_extract(a.extras_json, '$.entry')               AS entry,
     json_extract(a.extras_json, '$.stop')                AS stop,

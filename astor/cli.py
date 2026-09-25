@@ -1225,10 +1225,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--min-leg-adr",
         type=float,
-        default=1.0,
+        default=0.9,
         help="Minimum directional-leg size, in ADR units, for both the final "
         "trigger and the earlier capitulation-in-progress alert "
-        "(1.0 = the leg must be at least the symbol's full ADR).",
+        "(1.0 would mean the leg must be at least the symbol's full ADR).",
     )
     r.add_argument(
         "--min-leg-minutes",
@@ -1241,7 +1241,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--min-ema9-extension-adr",
         type=float,
-        default=0.15,
+        default=0.125,
         help="Minimum distance the leg's extreme finished from the frozen "
         "9EMA (1-min), in ADR units, for both the final trigger and the "
         "capitulation alert (0 = off).",
@@ -1327,7 +1327,7 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument(
         "--min-leg-adr",
         type=float,
-        default=1.0,
+        default=0.9,
         help="Minimum directional-leg size, in ADR units, for both the final "
         "trigger and the earlier capitulation-in-progress alert.",
     )
@@ -1341,7 +1341,7 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument(
         "--min-ema9-extension-adr",
         type=float,
-        default=0.15,
+        default=0.125,
         help="Minimum distance the leg's extreme finished from the frozen "
         "9EMA (1-min), in ADR units, for both the final trigger and the "
         "capitulation alert (0 = off).",
@@ -1422,9 +1422,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--setup", required=True, help=f"One of: {', '.join(SETUPS_BY_NAME)}"
     )
     ex.add_argument("--adr-sessions", type=int, default=14)
-    ex.add_argument("--min-leg-adr", type=float, default=1.0)
+    ex.add_argument("--min-leg-adr", type=float, default=0.9)
     ex.add_argument("--min-leg-minutes", type=float, default=4.0)
-    ex.add_argument("--min-ema9-extension-adr", type=float, default=0.15)
+    ex.add_argument("--min-ema9-extension-adr", type=float, default=0.125)
     ex.add_argument("--min-accel-price", type=float, default=1.2)
     ex.add_argument("--min-accel-vol", type=float, default=1.0)
     ex.add_argument("--accel-window", type=int, default=3)

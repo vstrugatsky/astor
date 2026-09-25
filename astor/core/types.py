@@ -128,6 +128,15 @@ class CapitulationAlert:
     ema9_extension_adr: float | None
     accel_price: float | None
     accel_vol: float | None
+    # What it would take to act on this before the trigger prints: the price
+    # the trigger could first fire at, the stop that trade would carry, and
+    # the size that pair allows. See _ReversalBase._maybe_flag_capitulation.
+    target: float | None
+    target_basis: str  # 'ema9' | 'retrace' -- which condition sets the price
+    stop: float
+    shares: int | None
+    dollars: float | None
+    max_loss_dollars: float
 
     def store_extras(self) -> dict[str, Any]:
         """What the alerts table records beyond the columns every alert
@@ -140,6 +149,12 @@ class CapitulationAlert:
             "ema9_extension_adr": self.ema9_extension_adr,
             "accel_price": self.accel_price,
             "accel_vol": self.accel_vol,
+            "target": self.target,
+            "target_basis": self.target_basis,
+            "stop": self.stop,
+            "level_stop_shares": self.shares,
+            "level_stop_dollars": self.dollars,
+            "max_loss_dollars": self.max_loss_dollars,
         }
 
 
@@ -169,9 +184,17 @@ class TouchAlert:
     day_range_adr: float   # in ADR(14), the "is this day worth joining" gauge
     from_open_adr: float
     rvol: float | None
+    # Same trade-placement trio as CapitulationAlert: the price an AVT
+    # trigger could first fire at (the recovery threshold, off AVWAP), the
+    # stop that trade would carry, and the size that pair allows. shares is
+    # sized at `target`, not at the touch price -- the touch is not where
+    # the trade goes on.
+    target: float
+    target_basis: str
     stop: float            # where the trade's stop would sit, off AVWAP
     shares: int | None
     dollars: float | None
+    max_loss_dollars: float
 
     def store_extras(self) -> dict[str, Any]:
         return {
@@ -181,9 +204,12 @@ class TouchAlert:
             "day_range_adr": self.day_range_adr,
             "from_open_adr": self.from_open_adr,
             "rvol": self.rvol,
+            "target": self.target,
+            "target_basis": self.target_basis,
             "stop": self.stop,
             "level_stop_shares": self.shares,
             "level_stop_dollars": self.dollars,
+            "max_loss_dollars": self.max_loss_dollars,
         }
 
 

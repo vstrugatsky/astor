@@ -779,27 +779,58 @@ def test_format_trigger_line_renders_unmeasurable_leg_values() -> None:
     check("still two lines", len(line.splitlines()), 2)
 
 
-def test_format_capitulation_alert() -> None:
+def test_alert_line_is_an_order_ticket() -> None:
+    """The notification carries what a resting stop order needs and nothing
+    else -- the leg/touch diagnostics live in the store, not here."""
     from astor.core.types import CapitulationAlert
-    from astor.drivers.live import _format_capitulation_alert
+    from astor.drivers.live import _format_order_alert
 
     a = CapitulationAlert(
         symbol="ABAT", direction="short", bar_start=OPEN,
         bar_end=OPEN + timedelta(minutes=1), price=2.40,
         leg_extreme=2.62, anchor=2.95, leg_size_adr=1.25, move_rvol=2.5,
         ema9_extension_adr=0.6723, accel_price=4.6667, accel_vol=1.0,
+        target=2.55, target_basis="retrace", stop=2.62, shares=1428,
+        dollars=3641.4, max_loss_dollars=100.0,
     )
-    line = _format_capitulation_alert(a)
-    check("headline present", "CAPITULATION" in line and "ABAT" in line, True)
-    check("leg metrics shown", "leg 1.25x ADR   move_rvol 2.5" in line, True)
-    # Dropped from the display -- bookends of the leg, not actionable mid-session.
-    check("extreme not shown", "extreme" in line, False)
-    check("anchor not shown", "anchor" in line, False)
+    line = _format_order_alert("CAPITULATION", a)
+    for needed in ("CAPITULATION", "ABAT", "short", "target: ", "2.55", "stop: ", "2.62", "1428"):
+        check(f"{needed!r} present", needed in line, True)
+    # A short's worse fill is a lower one.
+    check("overshoot reads the short's way", "below target" in line, True)
+    # Everything that explains *why* it fired is deliberately absent.
+    for gone in ("move_rvol", "accel", "ema9_ext", "leg "):
+        check(f"{gone!r} omitted", gone in line, False)
+
+
+def test_overshoot_cost_scales_with_the_stock() -> None:
+    """The step size is found, not assumed: a cheap stock on a tight stop
+    loses shares by the cent, an expensive one by the dime."""
+    from astor.drivers.live import _overshoot_cost
+
+    # $100 of risk, 15c stop distance -> ~666 shares, and a cent of
+    # overshoot costs dozens of them.
+    step, lost = _overshoot_cost(target=7.35, stop=7.20, max_loss=100.0, direction="long")
+    check("cheap stock reports in cents", step, 0.01)
+    check("and loses many shares per cent", lost > 20, True)
+
+    # Same risk budget, a $6 stop distance -> 16 shares, so a cent is
+    # nothing and the step has to widen before it costs a whole share.
+    step, lost = _overshoot_cost(target=700.0, stop=694.0, max_loss=100.0, direction="long")
+    check("expensive stock needs a wider step", step >= 0.25, True)
+    check("and loses at least one share there", lost >= 1, True)
+
+    check("no size, nothing to say",
+          _overshoot_cost(target=10.0, stop=10.0, max_loss=100.0, direction="long"), None)
 
 
 def test_should_notify() -> None:
+    """Trigger notifications are suspended (2026-09-24): the experiment is
+    to act on the alert by resting a stop order at the price the trigger
+    would fire, so a trigger announcement arriving afterwards is noise.
+    Recording is unaffected -- this gates printing only."""
     from astor.core.types import Trigger
-    from astor.drivers.live import _should_notify
+    from astor.drivers.live import NOTIFY_TRIGGERS, _should_notify
 
     def trigger_at(setup: str, hh: int, mm: int, grade: int | None) -> Trigger:
         start = datetime(2026, 8, 14, hh, mm, tzinfo=ET)
@@ -810,22 +841,17 @@ def test_should_notify() -> None:
             extras={} if grade is None else {"auto_grade": grade},
         )
 
-    # The 15:00 ET cutoff is the whole rule: grade is never consulted.
-    check(
-        "REV-L notifies with no grade at all, before the cutoff",
-        _should_notify(trigger_at("REV-L", 11, 30, None)),
-        True,
-    )
-    check(
-        "REV-S notifies with grade 1, before the cutoff",
-        _should_notify(trigger_at("REV-S", 14, 59, 1)),
-        True,
-    )
-    check(
-        "REV-L does not notify at/after the 15:00 cutoff, even grade 4",
-        _should_notify(trigger_at("REV-L", 15, 0, 4)),
-        False,
-    )
+    check("suspended, so nothing notifies", NOTIFY_TRIGGERS, False)
+    for hh, mm in [(9, 45), (11, 30), (14, 59)]:
+        check(
+            f"no trigger notification at {hh}:{mm:02d}",
+            _should_notify(trigger_at("REV-L", hh, mm, 4)),
+            False,
+        )
+    # The 15:00 cutoff is still in the expression, so turning notifications
+    # back on restores the old behaviour rather than a different one.
+    check("cutoff still applies underneath",
+          _should_notify(trigger_at("REV-L", 15, 0, 4)), False)
 
 
 def test_latest_triggers_spans_sessions_and_supersedes_reruns() -> None:
