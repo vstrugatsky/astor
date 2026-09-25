@@ -2222,36 +2222,41 @@ def test_reversal_meets_of_condition_flag() -> None:
     )
 
 
-def test_capitulation_alert_fires_once_per_leg() -> None:
-    """A leg already clearing the trigger's own leg-quality bar (size,
-    duration, volume, EMA extension, acceleration) gets a one-time alert
-    while it is still extending -- and only once for the whole leg, even
-    if the extreme goes on to deepen further afterward, since that's still
-    the same push (no death in between). Real case that motivated this:
-    FEIM 2026-09-11 alerted three times in three minutes (09:37-09:40) as
-    one up-move kept setting marginally deeper highs -- noise, not three
-    separate heads-ups.
+def test_capitulation_alert_refreshes_every_bar() -> None:
+    """A live capitulation re-alerts on every bar, with the target and stop
+    recomputed each time.
+
+    This reverses an earlier rule (one alert per leg, added because FEIM
+    2026-09-11 alerted three times in three minutes as one up-move set
+    marginally deeper highs). What changed is what an alert is *for*: it is
+    now an order ticket, and its numbers go stale every bar -- the 9EMA leg
+    of the target redraws, and a deepening extreme moves both the target and
+    the stop. A repeat carrying the same levels would be noise; a repeat
+    carrying corrected ones is the point.
     """
-    sc = _rev_scanner(ReversalLong)
-    bars = _canonical_long_bars() + [
-        bar(6, 94.0, 94.2, 93.9, 94.1, 5_000, symbol="REV"),  # more retrace, no boundary move
-        # deeper extreme, but the SAME push (no death since bar 4) --
-        # must NOT alert again, even though this bar alone would clear
-        # every leg-quality floor on its own.
-        bar(7, 94.1, 94.3, 88.0, 88.5, 200_000, symbol="REV"),
+    sc = _rev_scanner(ReversalLong, setup_kwargs={"min_accel_price": 0.0})
+    bars = [
+        bar(0, 98.0, 98.0, 97.5, 97.8, 50_000, symbol="REV"),
+        bar(1, 97.8, 97.9, 96.0, 96.2, 50_000, symbol="REV"),
+        bar(2, 96.2, 96.3, 95.0, 95.1, 50_000, symbol="REV"),
+        bar(3, 95.1, 95.2, 94.0, 94.1, 50_000, symbol="REV"),  # floors clear here
+        bar(4, 94.1, 94.2, 93.0, 93.1, 50_000, symbol="REV"),  # deeper
+        bar(5, 93.1, 93.2, 92.5, 92.6, 50_000, symbol="REV"),  # deeper again
     ]
-    seen = []
+    per_bar = []
     for b in bars:
         sc.on_bar(b)
-        seen.append(len(sc.pop_alerts()))
-    check(
-        "only one alert, at the first bar clearing every floor (minute 4) -- "
-        "none at the deeper extreme (minute 7), same push",
-        seen,
-        [0, 0, 0, 0, 1, 0, 0, 0],
-    )
-    check("full-history list has just the one", len(sc.alerts), 1)
-    check("alert's leg matches the first extreme, not the later deeper one", sc.alerts[0].leg_extreme, 93.0)
+        per_bar.append(sc.pop_alerts())
+
+    check("one alert per bar once the leg qualifies",
+          [len(a) for a in per_bar], [0, 0, 0, 1, 1, 1])
+    live = [a[0] for a in per_bar if a]
+    check("each one names the extreme as it stood",
+          [a.leg_extreme for a in live], [94.0, 93.0, 92.5])
+    check("the stop follows the extreme down", [a.stop for a in live], [94.0, 93.0, 92.5])
+    check("and so does the target -- these are not stale repeats",
+          len({a.target for a in live}), 3)
+
 
 
 def test_capitulation_alert_rearms_after_a_genuine_death_and_revival() -> None:
@@ -2282,12 +2287,19 @@ def test_capitulation_alert_rearms_after_a_genuine_death_and_revival() -> None:
         bar(15, 87.8, 88.0, 86.0, 86.3, 40_000, symbol="REV"),  # leg2 deepens to 86.0
     ]
     alerts = []
-    for b in bars:
+    for i, b in enumerate(bars):
         sc.on_bar(b)
-        alerts.extend(sc.pop_alerts())
-    check("one alert for leg1, one for the revived leg2", len(alerts), 2)
-    check("first alert is leg1's own extreme, not leg2's", alerts[0].leg_extreme, 94.0)
-    check("second alert is leg2's own extreme, not a re-alert of leg1", alerts[1].leg_extreme, 87.5)
+        alerts.extend((i, a) for a in sc.pop_alerts())
+
+    leg1 = [a for i, a in alerts if i <= 4]
+    dead = [a for i, a in alerts if 5 <= i <= 10]
+    leg2 = [a for i, a in alerts if i >= 11]
+    check("leg1 alerts while it is live", len(leg1) >= 1, True)
+    check("leg1's alerts name leg1's own extreme, never leg2's",
+          {a.leg_extreme for a in leg1} <= {94.0, 93.0}, True)
+    check("nothing at all while the leg is dead", dead, [])
+    check("the revived leg alerts again", len(leg2) >= 1, True)
+    check("and names its own extreme", {a.leg_extreme for a in leg2} <= {87.5, 86.0}, True)
 
 
 def test_capitulation_alert_gated_by_leg_quality() -> None:

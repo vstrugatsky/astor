@@ -346,8 +346,6 @@ class _ReversalBase(Setup):
         # a new extreme almost every bar; re-alerting on each of those is
         # noise, not a fresh heads-up). Re-arms only when push_started_at
         # itself changes: a genuinely new leg (new anchor) or a revival
-        # after a real death -- see _push_started_at's own comment.
-        self._capitulation_alerted_push_started_at: datetime | None = None
         self._pending_capitulation_alert: CapitulationAlert | None = None
 
     # -- direction-specific hooks, overridden by Long/Short below -----------
@@ -675,8 +673,18 @@ class _ReversalBase(Setup):
         retrace = self._retrace_from(bar.close, self._extreme)
         retrace_pct = retrace / leg_size * 100.0
 
+        # Still a live capitulation on this bar -- neither dead nor fired --
+        # so refresh the heads-up. The numbers it carries go stale every
+        # bar: the 9EMA leg of the target redraws, and a deepening extreme
+        # moves both the target and the stop. An order resting off the
+        # first alert of a leg would be working the wrong levels minutes
+        # later, which is the whole reason this repeats rather than
+        # announcing once per push.
+        self._maybe_flag_capitulation(bar, levels, indicators, curve)
+
         if retrace_pct > self.max_retrace_pct:
             self._retrace_dead = True
+            self._pending_capitulation_alert = None  # the leg just died
             _trace(
                 trace, bar,
                 f"retrace {retrace_pct:.1f}% > max {self.max_retrace_pct}% -- "
@@ -799,6 +807,10 @@ class _ReversalBase(Setup):
         ):
             _candidate("FAIL accel_vol: volume not building into the extreme")
             return None
+
+        # The trigger is the answer the alert was waiting for; do not send
+        # both for the same bar.
+        self._pending_capitulation_alert = None
 
         legacy_condition = self._legacy_condition(levels, self._extreme, bar.close)
 
@@ -961,8 +973,6 @@ class _ReversalBase(Setup):
         extreme_at = self._extreme_at(indicators)
         anchor_at = self._anchor_at(indicators)
         push_started_at = self._push_started_at if self._push_started_at is not None else anchor_at
-        if push_started_at == self._capitulation_alerted_push_started_at:
-            return
 
         leg_size = abs(self._anchor - self._extreme)
         adr = levels.adr
@@ -1003,7 +1013,6 @@ class _ReversalBase(Setup):
         ):
             return
 
-        self._capitulation_alerted_push_started_at = push_started_at
         # Where the trigger could first fire, so the alert can be acted on
         # with a resting stop order instead of waiting for the bar to print.
         # Two conditions can open it -- a min_retrace_pct retrace off the
