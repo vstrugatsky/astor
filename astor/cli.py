@@ -93,6 +93,8 @@ def parse_symbols(args: argparse.Namespace) -> list[str]:
 def _setup_kwargs(args: argparse.Namespace) -> dict:
     reversal_kwargs = {
         "min_leg_adr": args.min_leg_adr,
+        "min_leg_pct": args.min_leg_pct,
+        "min_leg_pct_adr": args.min_leg_pct_adr,
         "min_retrace_pct": args.min_retrace_pct,
         "max_retrace_pct": args.max_retrace_pct,
         "min_confirm_minutes": args.min_confirm_minutes,
@@ -1313,6 +1315,21 @@ def build_parser() -> argparse.ArgumentParser:
         "on any move; this gates the target alone, which drifts with the "
         "9EMA (0 = re-alert on any change).",
     )
+    r.add_argument(
+        "--min-leg-pct",
+        type=float,
+        default=6.0,
+        help="Second route to a big-enough leg: a move of at least this "
+        "percent qualifies even below --min-leg-adr, which otherwise "
+        "under-reads a high-ADR name (0 = off).",
+    )
+    r.add_argument(
+        "--min-leg-pct-adr",
+        type=float,
+        default=0.6,
+        help="ADR floor that still applies on the percent route, so a "
+        "sleepy name's drift cannot qualify on percent alone.",
+    )
     r.add_argument("--db", default="data/astor.db")
     r.add_argument("--cache-dir", default="data/bars")
     r.add_argument("--host", default="127.0.0.1")
@@ -1415,6 +1432,21 @@ def build_parser() -> argparse.ArgumentParser:
         "on any move; this gates the target alone, which drifts with the "
         "9EMA (0 = re-alert on any change).",
     )
+    lv.add_argument(
+        "--min-leg-pct",
+        type=float,
+        default=6.0,
+        help="Second route to a big-enough leg: a move of at least this "
+        "percent qualifies even below --min-leg-adr, which otherwise "
+        "under-reads a high-ADR name (0 = off).",
+    )
+    lv.add_argument(
+        "--min-leg-pct-adr",
+        type=float,
+        default=0.6,
+        help="ADR floor that still applies on the percent route, so a "
+        "sleepy name's drift cannot qualify on percent alone.",
+    )
     _add_avt_args(lv)
     lv.add_argument(
         "--max-tickers",
@@ -1458,6 +1490,21 @@ def build_parser() -> argparse.ArgumentParser:
         "units, to re-alert while the leg is still live. The stop re-alerts "
         "on any move; this gates the target alone, which drifts with the "
         "9EMA (0 = re-alert on any change).",
+    )
+    ex.add_argument(
+        "--min-leg-pct",
+        type=float,
+        default=6.0,
+        help="Second route to a big-enough leg: a move of at least this "
+        "percent qualifies even below --min-leg-adr, which otherwise "
+        "under-reads a high-ADR name (0 = off).",
+    )
+    ex.add_argument(
+        "--min-leg-pct-adr",
+        type=float,
+        default=0.6,
+        help="ADR floor that still applies on the percent route, so a "
+        "sleepy name's drift cannot qualify on percent alone.",
     )
     ex.add_argument("--max-loss", type=float, default=100.0)
     _add_avt_args(ex)

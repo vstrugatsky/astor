@@ -1597,6 +1597,39 @@ def test_avt_and_reversal_run_independently_on_one_symbol() -> None:
           [t.setup for t in triggers], ["AVT-L"])
 
 
+def test_leg_qualifies_by_adr_or_by_percent() -> None:
+    """ADR alone under-reads a high-ADR name: a stock that routinely swings
+    10% has an ADR wide enough that a real move can still come in under the
+    multiple. Real cases, 2026-09-28: SHMD 8.33% at 0.85x ADR and SRFM
+    11.63% at 0.76x, both rejected as too small."""
+    from astor.core.setups import _leg_is_big_enough
+
+    def ok(leg_size, adr, anchor, **kw):
+        return _leg_is_big_enough(
+            leg_size, adr, anchor,
+            kw.get("min_leg_adr", 0.9), kw.get("min_leg_pct", 6.0),
+            kw.get("min_leg_pct_adr", 0.6),
+        )
+
+    # SHMD: $0.39 leg, $0.46 ADR, anchor 4.68 -> 0.85x ADR, 8.33%.
+    check("high-ADR name clears on percent", ok(0.39, 0.46, 4.68), True)
+    # SRFM: $0.12 leg, $0.16 ADR, anchor 1.07 -> 0.76x, 11.63%.
+    check("and again on a $1 name", ok(0.12, 0.16, 1.07), True)
+    # The ADR route on its own still works.
+    check("a full-ADR leg needs no percent", ok(1.0, 1.0, 1000.0), True)
+
+    # The floor under the percent route: a big percent on a leg that is a
+    # tiny fraction of the name's own range is drift, not capitulation.
+    check("percent alone is not enough", ok(0.05, 1.0, 0.5), False)
+    # And a big ADR multiple with a trivial percent still clears, since the
+    # ADR route does not consult percent at all.
+    check("ADR route ignores percent", ok(0.95, 1.0, 10_000.0), True)
+
+    # Switched off, the second route disappears entirely.
+    check("min_leg_pct 0 restores the old single test",
+          ok(0.39, 0.46, 4.68, min_leg_pct=0.0), False)
+
+
 def test_rev_rvol_threshold_tiers() -> None:
     """The more liquid the name, the less relative volume it takes to stand
     out. Boundaries sit 20% below the round figures they stand for, because

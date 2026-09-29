@@ -97,6 +97,8 @@ class _FilterReadout:
     leg_adr: float | None
     min_leg_adr: float
     leg_pct: float | None
+    min_leg_pct: float
+    min_leg_pct_adr: float
     move_rvol: float | None
     min_move_rvol: float
     ema9_extension_adr: float | None
@@ -118,7 +120,7 @@ class _FilterReadout:
                 f"elapsed {self.elapsed_minutes:.0f}m/{self.min_confirm_minutes:g}m",
                 f"built {self.leg_duration_minutes:.1f}m/{self.min_leg_minutes:g}m",
                 f"leg {self.leg_size:.2f} ({v(self.leg_adr)}x/{self.min_leg_adr:g}x ADR, "
-                f"{v(self.leg_pct)}%)",
+                f"{v(self.leg_pct)}%/{self.min_leg_pct:g}% at {self.min_leg_pct_adr:g}x)",
                 f"move_rvol {v(self.move_rvol)}/{self.min_move_rvol:g}",
                 f"ema9_ext {v(self.ema9_extension_adr, 4)}/{self.min_ema9_extension_adr:g}",
                 f"accel_price {v(self.accel_price, 4)}/{self.min_accel_price:g}",
@@ -172,6 +174,39 @@ def _position_size(
 # be made *wrong* by inflating the input.
 _REV_RVOL_TIERS = ((4_000_000_000, 1.5), (400_000_000, 1.75))
 _REV_RVOL_DEFAULT = 2.0
+
+
+def _leg_is_big_enough(
+    leg_size: float, adr: float, anchor: float,
+    min_leg_adr: float, min_leg_pct: float, min_leg_pct_adr: float,
+) -> bool:
+    """Whether a leg is a big enough move to be worth fading, by either of
+    two routes.
+
+    ADR alone is the primary test, but it misreads a high-ADR name: a stock
+    that routinely swings 10% has an ADR wide enough that a genuinely large
+    move can still come in under the multiple. Real cases, 2026-09-28:
+    SHMD's 8.33% move measured 0.85x ADR and SRFM's 11.63% measured 0.76x,
+    both rejected as "too small" while being exactly the kind of move the
+    setup wants.
+
+    So a leg also qualifies on percent -- but only with an ADR floor still
+    under it (min_leg_pct_adr), because percent alone would admit a sleepy
+    name's unremarkable drift as readily as a violent one's capitulation.
+    Set min_leg_pct to 0 to switch the second route off entirely.
+    """
+    if adr <= 0 or leg_size <= 0:
+        return False
+    leg_adr = leg_size / adr
+    if leg_adr >= min_leg_adr:
+        return True
+    leg_pct = _pct_of_level(leg_size, anchor)
+    return (
+        min_leg_pct > 0
+        and leg_adr >= min_leg_pct_adr
+        and leg_pct is not None
+        and leg_pct >= min_leg_pct
+    )
 
 
 def rev_rvol_threshold(adv: float) -> float:
@@ -291,6 +326,8 @@ class _ReversalBase(Setup):
     def __init__(
         self,
         min_leg_adr: float = 0.9,
+        min_leg_pct: float = 6.0,
+        min_leg_pct_adr: float = 0.6,
         min_retrace_pct: float = 10.0,
         max_retrace_pct: float = 50.0,
         min_confirm_minutes: float = 0.0,
@@ -303,6 +340,8 @@ class _ReversalBase(Setup):
         max_loss_dollars: float = 100.0,
     ):
         self.min_leg_adr = min_leg_adr
+        self.min_leg_pct = min_leg_pct
+        self.min_leg_pct_adr = min_leg_pct_adr
         self.min_retrace_pct = min_retrace_pct
         self.max_retrace_pct = max_retrace_pct
         self.min_confirm_minutes = min_confirm_minutes
@@ -759,6 +798,8 @@ class _ReversalBase(Setup):
             leg_size=leg_size,
             leg_adr=leg_size / adr if adr > 0 else None,
             min_leg_adr=self.min_leg_adr,
+            min_leg_pct=self.min_leg_pct,
+            min_leg_pct_adr=self.min_leg_pct_adr,
             leg_pct=_pct_of_level(leg_size, self._anchor),
             move_rvol=move_rvol,
             min_move_rvol=move_rvol_floor,
@@ -786,10 +827,14 @@ class _ReversalBase(Setup):
             _candidate("FAIL built: too fast to be a real leg")
             return None
 
-        if adr <= 0 or leg_size < self.min_leg_adr * adr:
+        if not _leg_is_big_enough(
+            leg_size, adr, self._anchor,
+            self.min_leg_adr, self.min_leg_pct, self.min_leg_pct_adr,
+        ):
             _candidate(
-                f"FAIL leg: below {self.min_leg_adr}x ADR "
-                f"(${adr:.2f}, so {self.min_leg_adr * adr:.2f} required) -- leg too small"
+                f"FAIL leg: needs {self.min_leg_adr}x ADR, or "
+                f"{self.min_leg_pct_adr}x with a {self.min_leg_pct:g}% move -- "
+                f"neither route clears"
                 if adr > 0
                 else "FAIL leg: no ADR for this symbol, cannot size the leg"
             )
@@ -986,7 +1031,10 @@ class _ReversalBase(Setup):
 
         leg_size = abs(self._anchor - self._extreme)
         adr = levels.adr
-        if leg_size <= 0 or adr <= 0 or leg_size < self.min_leg_adr * adr:
+        if not _leg_is_big_enough(
+            leg_size, adr, self._anchor,
+            self.min_leg_adr, self.min_leg_pct, self.min_leg_pct_adr,
+        ):
             return
 
         leg_duration_minutes = self._leg_duration_minutes(push_started_at, extreme_at)
