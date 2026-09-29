@@ -183,6 +183,7 @@ SELECT
     -- took (0 = the same bar did both). stop_source says which term set the
     -- stop: the pullback extreme, or the percent-of-entry floor under it.
     json_extract(t.extras_json, '$.day_range_adr')             AS day_range_adr,
+    json_extract(t.extras_json, '$.day_range_pct')             AS day_range_pct,
     json_extract(t.extras_json, '$.touch_adr')                 AS touch_adr,
     json_extract(t.extras_json, '$.touch_at')                  AS touch_at,
     json_extract(t.extras_json, '$.touch_price')               AS touch_price,
@@ -285,6 +286,7 @@ SELECT
     json_extract(a.extras_json, '$.touch_adr')           AS touch_adr,
     json_extract(a.extras_json, '$.depth_adr')           AS depth_adr,
     json_extract(a.extras_json, '$.day_range_adr')       AS day_range_adr,
+    json_extract(a.extras_json, '$.day_range_pct')       AS day_range_pct,
     json_extract(a.extras_json, '$.from_open_adr')       AS from_open_adr,
     json_extract(a.extras_json, '$.rvol')                AS rvol,
     json_extract(a.extras_json, '$.level_stop_shares')   AS level_stop_shares,

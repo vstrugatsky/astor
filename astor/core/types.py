@@ -182,6 +182,7 @@ class TouchAlert:
     touch_adr: float       # signed: which side of AVWAP the wick reached
     depth_adr: float
     day_range_adr: float   # in ADR(14), the "is this day worth joining" gauge
+    day_range_pct: float | None  # the same range as a percent, for comparison
     from_open_adr: float
     rvol: float | None
     # Same trade-placement trio as CapitulationAlert: the price an AVT
@@ -202,6 +203,7 @@ class TouchAlert:
             "touch_adr": self.touch_adr,
             "depth_adr": self.depth_adr,
             "day_range_adr": self.day_range_adr,
+            "day_range_pct": self.day_range_pct,
             "from_open_adr": self.from_open_adr,
             "rvol": self.rvol,
             "target": self.target,

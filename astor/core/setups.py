@@ -1269,6 +1269,13 @@ class _AVTReadout:
 
     day_range_adr: float
     min_day_range_adr: float
+    # The same day range as a percent, next to the name's own ADR%. The
+    # multiple alone hides which kind of name this is: 0.69x of a 3% ADR
+    # and 0.69x of a 12% ADR are very different days, and telling them
+    # apart is the first thing needed to judge whether AVT wants a
+    # percent route the way Reversal now has one.
+    day_range_pct: float | None
+    adr_pct: float
     rvol: float | None
     min_rvol: float
     touch_adr: float | None  # signed: which side of AVWAP the wick reached
@@ -1290,7 +1297,8 @@ class _AVTReadout:
         bars = "none" if self.bars_since_touch is None else f"{self.bars_since_touch}"
         return "  ".join(
             [
-                f"range {self.day_range_adr:.2f}x/{self.min_day_range_adr:g}x ADR",
+                f"range {self.day_range_adr:.2f}x/{self.min_day_range_adr:g}x ADR"
+                + f" (day {v(self.day_range_pct, 2)}%, ADR {self.adr_pct:.2f}%)",
                 f"rvol {v(self.rvol, 2)}/{self.min_rvol:g}",
                 f"from open {self.from_open_adr:+.3f}",
                 f"touch {v(self.touch_adr)}/±{self.touch_band_adr:g}"
@@ -1496,6 +1504,9 @@ class _AVWAPTouchBase(Setup):
         # so everything "touches" it before the day has shape.
         after_floor = bar.start.time() >= self.earliest_touch
         day_range_adr = day_range / adr  # the one ADR(14) measure that stays
+        # (high/low - 1), the same arithmetic ADR% itself is built from, so
+        # the two percents are directly comparable.
+        day_range_pct = _pct_of_level(day_range, indicators.session_low)
         rvol = compute_rvol(indicators.cum_volume, bar.start, curve) if curve else None
         min_rvol = rvol_threshold(levels.adv)
         if in_band and with_session and after_floor:
@@ -1535,6 +1546,7 @@ class _AVWAPTouchBase(Setup):
                     touch_adr=round(wick_adr, 4),
                     depth_adr=round(wick_depth_adr, 4),
                     day_range_adr=round(day_range_adr, 4),
+                    day_range_pct=day_range_pct,
                     from_open_adr=round(from_open_adr, 4),
                     rvol=rvol,
                     target=round(target, 4),
@@ -1561,6 +1573,8 @@ class _AVWAPTouchBase(Setup):
         readout = _AVTReadout(
             day_range_adr=day_range_adr,
             min_day_range_adr=self.min_day_range_adr,
+            day_range_pct=day_range_pct,
+            adr_pct=levels.adr_pct,
             rvol=rvol,
             min_rvol=min_rvol,
             # The qualifying touch's own measurements, not this bar's -- see
@@ -1637,6 +1651,7 @@ class _AVWAPTouchBase(Setup):
                 "rvol": rvol,
                 "rvol_floor": min_rvol,
                 "day_range_adr": round(day_range_adr, 4),
+                "day_range_pct": day_range_pct,
                 "touch_adr": round(self._touch_adr, 4) if self._touch_adr is not None else None,
                 "touch_at": touch_at.isoformat(),
                 "touch_price": touch_extreme,
