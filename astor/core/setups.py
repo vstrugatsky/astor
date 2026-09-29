@@ -1269,13 +1269,11 @@ class _AVTReadout:
 
     day_range_adr: float
     min_day_range_adr: float
-    # The same day range as a percent, next to the name's own ADR%. The
-    # multiple alone hides which kind of name this is: 0.69x of a 3% ADR
-    # and 0.69x of a 12% ADR are very different days, and telling them
-    # apart is the first thing needed to judge whether AVT wants a
-    # percent route the way Reversal now has one.
+    # The same day range as a percent of itself -- the actual size of the
+    # move, next to the multiple. Reversal states its leg both ways for
+    # exactly this reason (see _leg_is_big_enough); whether AVT wants the
+    # same two-route rule is the open question this is here to answer.
     day_range_pct: float | None
-    adr_pct: float
     rvol: float | None
     min_rvol: float
     touch_adr: float | None  # signed: which side of AVWAP the wick reached
@@ -1298,7 +1296,7 @@ class _AVTReadout:
         return "  ".join(
             [
                 f"range {self.day_range_adr:.2f}x/{self.min_day_range_adr:g}x ADR"
-                + f" (day {v(self.day_range_pct, 2)}%, ADR {self.adr_pct:.2f}%)",
+                + f" ({v(self.day_range_pct, 2)}%)",
                 f"rvol {v(self.rvol, 2)}/{self.min_rvol:g}",
                 f"from open {self.from_open_adr:+.3f}",
                 f"touch {v(self.touch_adr)}/±{self.touch_band_adr:g}"
@@ -1574,7 +1572,6 @@ class _AVWAPTouchBase(Setup):
             day_range_adr=day_range_adr,
             min_day_range_adr=self.min_day_range_adr,
             day_range_pct=day_range_pct,
-            adr_pct=levels.adr_pct,
             rvol=rvol,
             min_rvol=min_rvol,
             # The qualifying touch's own measurements, not this bar's -- see
