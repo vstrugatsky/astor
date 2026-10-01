@@ -411,23 +411,56 @@ def test_build_cum_volume_curve() -> None:
     check("09:31 averaged only over the session that has it", curve2[time(9, 31)], 150.0)
 
 
-def test_scanner_backfill_bar_updates_indicators_not_setups() -> None:
+def test_scanner_backfill_bar_builds_setup_state_silently() -> None:
+    """Backfill brings everything up to date -- indicators and setup state --
+    without announcing anything. A symbol added mid-session has to judge its
+    leg on the whole leg, not on the few bars since it was added, or filters
+    computed from bar history (accel_price/accel_vol) read the wrong thing.
+    """
     sc = Scanner({"TEST": LEVELS}, [ReversalLong])
 
     b0 = bar(0, 101, 101, 99, 99.5)
     sc.backfill_bar(b0)
     check("indicators updated by backfill", sc.indicators["TEST"].cum_volume, b0.volume)
-    check("no setup state created by backfill", sc._state, {})
-    check("no triggers recorded by backfill", sc.triggers, [])
+    check("setup state now exists too", list(sc._state), [("TEST", "REV-L")])
+    check("but nothing is recorded", sc.triggers, [])
+    check("and nothing is announced", sc.pop_alerts(), [])
+    check("backfilled bars counted apart from evaluated ones",
+          (sc.bars_backfilled, sc.bars_evaluated), (1, 0))
 
-    # Setup state starts clean: on_bar sees this as the FIRST bar it has ever
-    # evaluated for TEST, so both extreme and anchor "move" (they were None)
-    # -- it can only arm a fresh leg, never fire off a push it never saw form.
     b1 = bar(1, 99.5, 100, 99.4, 99.8)
-    fired = sc.on_bar(b1)
-    check("setup starts clean -- this bar only arms it, can't fire yet", fired, [])
-    check("but indicators keep accumulating across backfill and live bars",
+    sc.on_bar(b1)
+    check("indicators keep accumulating across backfill and live bars",
           sc.indicators["TEST"].cum_volume, b0.volume + b1.volume)
+
+
+def test_backfill_gives_a_mid_session_add_the_whole_leg() -> None:
+    """The RXRX 2026-09-30 case: a leg whose quality can only be measured
+    from its own bars. Added late, the setup used to see three bars, fall
+    back to a neutral accel_price of 1.0, and be rejected by the 1.2 floor
+    -- no alert, no trigger. Backfilled, it sees the leg.
+    """
+    bars = _canonical_long_bars()
+
+    def run(backfill_through: int):
+        sc = _rev_scanner(ReversalLong)
+        for i, b in enumerate(bars):
+            if i < backfill_through:
+                sc.backfill_bar(b)
+            else:
+                sc.on_bar(b)
+        return sc.triggers
+
+    full = run(0)
+    check("watched from the open, it fires", len(full), 1)
+    # Joining at bar 4 -- one bar before the trigger -- still fires, and on
+    # the same bar at the same price, because the leg behind it is intact.
+    late = run(4)
+    check("joined one bar before the trigger, it still fires", len(late), 1)
+    check("same bar", late[0].bar_start, full[0].bar_start)
+    check("same accel, measured off the whole leg",
+          late[0].extras["accel_price"], full[0].extras["accel_price"])
+
 
 
 def test_trigger_extras_include_avwap_and_rvol() -> None:

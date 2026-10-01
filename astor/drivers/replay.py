@@ -594,9 +594,20 @@ def run_replay(
     on_trigger=None,
     on_setup_alert=None,
 ) -> int:
-    """Drive the scanner over a replay stream. Returns bars fed."""
+    """Drive the scanner over a replay stream. Returns bars fed.
+
+    Bars before `start_time` are backfilled rather than skipped. Windowing a
+    replay is meant to narrow what gets *reported*, not to pretend the
+    session began at 10:00 -- without this the window rebases AVWAP, RVOL
+    and the session extremes to its own first bar, and every setup judges
+    the day from there. (Live has always backfilled a mid-session add this
+    way; replay simply never did.)
+    """
     fed = 0
-    for bar in ReplayDriver.stream(bars_by_symbol, start_time, end_time):
+    for bar in ReplayDriver.stream(bars_by_symbol, None, end_time):
+        if start_time is not None and bar.start.time() < start_time:
+            scanner.backfill_bar(bar)
+            continue
         fed += 1
         for trigger in scanner.on_bar(bar):
             if on_trigger:

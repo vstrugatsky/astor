@@ -54,6 +54,7 @@ class Scanner:
         self.bars_seen = 0
         self.bars_evaluated = 0
         self.skipped_zero_volume = 0
+        self.bars_backfilled = 0
         self.skipped_no_levels: set[str] = set()
 
     def _gate(self, bar: BarEvent) -> DailyLevels | None:
@@ -131,12 +132,44 @@ class Scanner:
 
     def backfill_bar(self, bar: BarEvent) -> None:
         """Feed one bar that happened before this symbol joined the live
-        scan (or before a Replay run's start-time window). Indicators (AVWAP,
-        RVOL's running volume) stay continuous from the first bar of the day;
-        Setup state does not -- a setup added mid-session starts clean, as if
-        the bars before it never happened, so it is never evaluated here.
+        scan (or before a Replay run's start-time window).
+
+        Everything is brought up to date -- indicators *and* setup state --
+        but nothing is announced: whatever a setup would have fired or
+        flagged on these bars is computed and discarded, since the trader
+        was not watching this symbol then and a trigger from before that is
+        not a trade.
+
+        The setups used to be skipped here entirely, and the cost was
+        silent. A setup's own bar history feeds accel_price/accel_vol, so a
+        symbol added mid-session judged its leg on the handful of bars since
+        the add rather than the whole leg -- and with fewer than
+        accel_window + 2 of them, accel_price returns its neutral 1.0, which
+        the 1.2 floor then rejects as though it had been measured. Real
+        case: RXRX 2026-09-30 added around 10:18 produced no capitulation
+        alert and no REV-S trigger, while the same leg added three minutes
+        earlier produced both. Everything else about it passed.
+
+        Running the setups here instead means a mid-session add behaves like
+        a symbol watched since the open, including in what it does *not*
+        re-announce: a leg that already fired before the add stays fired, so
+        the second half of a move the trader missed is not served up as a
+        fresh entry.
         """
         levels = self._gate(bar)
         if levels is None:
             return
-        self.indicators.setdefault(bar.symbol, SessionIndicators(bar.symbol)).update(bar)
+        indicators = self.indicators.setdefault(bar.symbol, SessionIndicators(bar.symbol))
+        indicators.update(bar)
+        self.bars_backfilled += 1
+        curve = self.curves.get(bar.symbol)
+        for cls in self.setup_classes:
+            key = (bar.symbol, cls.name)
+            setup = self._state.get(key)
+            if setup is None:
+                setup = cls(**self.setup_kwargs.get(cls.name, {}))
+                self._state[key] = setup
+            # Return value and alert both dropped on the floor: this bar is
+            # history, and history does not get announced.
+            setup.on_bar(bar, levels, indicators, curve)
+            setup.pop_alert()
