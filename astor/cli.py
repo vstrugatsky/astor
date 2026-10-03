@@ -159,16 +159,7 @@ async def cmd_replay(args: argparse.Namespace) -> int:
         "end": args.end,
         "setups": [s.name for s in setups],
         "adr_sessions": args.adr_sessions,
-        "min_leg_adr": args.min_leg_adr,
-        "min_retrace_pct": args.min_retrace_pct,
-        "max_retrace_pct": args.max_retrace_pct,
-        "min_confirm_minutes": args.min_confirm_minutes,
-        "min_leg_minutes": args.min_leg_minutes,
-        "min_ema9_extension_adr": args.min_ema9_extension_adr,
-        "min_accel_price": args.min_accel_price,
-        "min_accel_vol": args.min_accel_vol,
-        "accel_window": args.accel_window,
-        "max_loss": args.max_loss,
+"setup_kwargs": _setup_kwargs(args),
     }
 
     ib = IB()
@@ -975,16 +966,13 @@ async def cmd_live(args: argparse.Namespace) -> int:
                 "session": str(driver.session),
                 "bar_size": args.bar_size,
                 "setups": [s.name for s in setups],
-                "min_leg_adr": args.min_leg_adr,
-                "min_retrace_pct": args.min_retrace_pct,
-                "max_retrace_pct": args.max_retrace_pct,
-                "min_confirm_minutes": args.min_confirm_minutes,
-                "min_leg_minutes": args.min_leg_minutes,
-                "min_ema9_extension_adr": args.min_ema9_extension_adr,
-                "min_accel_price": args.min_accel_price,
-                "min_accel_vol": args.min_accel_vol,
-                "accel_window": args.accel_window,
-                "max_loss": args.max_loss,
+# Every setup threshold actually in force, taken from the same
+                # place the setups get them. Hand-listing these drifted: the
+                # 2026-10-02 live run recorded neither min_leg_pct nor the
+                # AVT thresholds, so its own record could not say what rules
+                # it ran under -- which is the one question a run record
+                # exists to answer.
+                "setup_kwargs": _setup_kwargs(args),
             },
         )
 
