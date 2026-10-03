@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3 -readonly *)",
+      "Bash(uv run python -m astor.cli explain *)",
+      "Bash(uv run python -m astor.cli profile *)",
+      "Bash(uv run python -m astor.cli positions)",
+      "Bash(uv run python -m astor.test_setups)"
+    ]
+  }
+}

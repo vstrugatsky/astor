@@ -7,6 +7,22 @@ dependencies = [
     "tzdata",
 ]
 
+# Declaring a build backend is what makes uv treat this as an installable
+# package rather than a "virtual" project: without it, `uv run` re-syncs the
+# environment on every invocation and drops any editable install, so a
+# script outside the project root cannot import astor at all.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+# Without this, a flat layout leaves setuptools guessing between astor/,
+# data/, scripts/ and spike/, and it refuses rather than pick. Naming the
+# package makes `uv pip install -e .` work, which in turn lets a script
+# anywhere on disk `import astor` -- scratch analysis scripts no longer need
+# a PYTHONPATH prefix to find the package they are analysing.
+[tool.setuptools.packages.find]
+include = ["astor*"]
+
 [dependency-groups]
 dev = [
     "ruff>=0.16.1",
