@@ -1309,6 +1309,12 @@ class _AVTReadout:
         )
 
 
+# How far outside the touch band still counts as worth mentioning in a
+# trace. Diagnostic only -- it changes nothing about what fires, so it is a
+# constant rather than another knob.
+_NEAR_TOUCH = 3.0
+
+
 class _AVWAPTouchBase(Setup):
     """AVT-L/AVT-S -- a significant move on elevated volume, a pullback that
     touches daily AVWAP, then a quick continuation the way the move was
@@ -1596,12 +1602,30 @@ class _AVWAPTouchBase(Setup):
             _trace(trace, bar, f"candidate @ {bar.close:.2f}: {readout.line()} -- {verdict}")
 
         if self._touch_bar is None:
-            # Nothing has reached the band since the last extreme. Silent,
-            # except for the one case worth explaining: price crossing into
-            # the recovery zone anyway, which is the shape that looks like a
-            # trigger on a chart but has no pullback behind it.
+            # Nothing has reached the band since the last extreme. Mostly
+            # silent -- tracing all 390 bars of a session would bury the
+            # decisions -- but two cases are worth a line.
             if recovery >= self.min_recovery_adr and not was_recovered:
+                # Price crossed into the recovery zone anyway: the shape that
+                # looks like a trigger on a chart but has no pullback behind
+                # it.
                 candidate("FAIL touch: nothing reached the AVWAP band since the last extreme")
+            elif trace is not None and abs(wick_adr) <= _NEAR_TOUCH * self.touch_band_adr:
+                # A near miss. Without this, "missed the band by a hair" and
+                # "never came close" look identical from the outside, since
+                # both are simply absent. Deliberately NOT gated on the day
+                # qualifying: when the range is what is actually holding
+                # things up, that is the answer being looked for, so the
+                # line carries it rather than suppressing itself. Real case:
+                # TER 2026-10-02 09:57, wick 0.069 against a 0.05 band on a
+                # day only 0.71x ADR wide -- two reasons, no trace of either.
+                _trace(
+                    trace, bar,
+                    f"near touch @ {bar.close:.2f}: wick {wick_adr:+.3f} vs "
+                    f"±{self.touch_band_adr:g}, range {day_range_adr:.2f}x/"
+                    f"{self.min_day_range_adr:g}x ADR -- closest this pullback "
+                    f"came, not a touch",
+                )
             return None
         if self._bars_since_touch > self.max_bars_since_touch:
             candidate("FAIL bars since touch: the pullback is stale, waiting for a new one")
