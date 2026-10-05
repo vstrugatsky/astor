@@ -118,6 +118,7 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
         "max_break_adr": args.avt_max_break_adr,
         "stop_adr": args.avt_stop_adr,
         "earliest_touch": parse_hhmm(args.avt_earliest_touch),
+        "require_deeper_touch": args.avt_require_deeper_touch,
         "max_loss_dollars": args.max_loss,
     }
     return {
@@ -1212,6 +1213,14 @@ def _add_avt_args(p) -> None:
         help="Earliest HH:MM ET a touch counts -- AVWAP sits on top of price "
         "for the first few minutes, so everything touches it before the day "
         "has shape (AVT).",
+    )
+    p.add_argument(
+        "--avt-require-deeper-touch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Only alert or fire on a pullback that went deeper than the one "
+        "already acted on, until a new extreme resets the leg. A leg nudging "
+        "AVWAP at the same depth over and over is one setup, not six (AVT).",
     )
     p.add_argument(
         "--avt-stop-adr",

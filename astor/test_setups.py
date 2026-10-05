@@ -1658,6 +1658,47 @@ def test_avt_day_qualifies_on_adr_percent_or_the_overnight_gap() -> None:
           _leg_is_big_enough(qualifying, adr, session_low, 0.8, 6.0, 0.6), True)
 
 
+def test_avt_speaks_once_per_depth_until_the_pullback_goes_deeper() -> None:
+    """A leg nudging AVWAP at the same depth over and over is one setup,
+    not six. ALGM 2026-10-02 fired twelve AVT-L triggers and WOLF four in
+    seven minutes, all off pullbacks no deeper than the one before."""
+    bars = _avt_long_bars()
+    # After the trigger at 10:05, another pullback to the same place: it
+    # touches, it recovers, and it is the same setup replayed.
+    again = [
+        bar(36, 102.9, 103.0, 101.85, 102.0, 30_000, symbol="AVT"),   # same depth
+        bar(37, 102.0, 103.0, 102.0, 102.9, 60_000, symbol="AVT"),    # would fire
+    ]
+
+    def run(extra, **kw):
+        sc = _avt_scanner(AVWAPTouchLong, setup_kwargs=kw or None)
+        return [t.bar_start.strftime("%H:%M") for t in _feed(sc, bars + extra)]
+
+    check("a repeat at the same depth is suppressed", run(again), ["10:05"])
+    check("the rule can be switched off",
+          len(run(again, require_deeper_touch=False)), 2)
+
+    # The gate itself. Tested directly rather than through a fixture,
+    # because constructing a *deeper* second touch that is still inside the
+    # band is often impossible by then: AVWAP has drifted toward price, so
+    # going deeper means leaving the band. That interaction makes the rule
+    # stricter in practice than it reads -- in an uptrend the usual way a
+    # second setup qualifies is a fresh extreme, which resets the gate
+    # outright rather than having to clear it.
+    from datetime import datetime
+
+    s = AVWAPTouchLong()
+    check("nothing has spoken yet, so anything may", s._may_speak(0.20), True)
+    s._pullback_bar = bars[4]
+    s._mark_spoken(0.30)
+    check("the same pullback may speak again (alert, then its trigger)",
+          s._may_speak(0.30), True)
+    s._pullback_bar = bars[5]  # a different pullback
+    check("a shallower one may not", s._may_speak(0.25), False)
+    check("one at the same depth may not", s._may_speak(0.30), False)
+    check("a deeper one may", s._may_speak(0.31), True)
+
+
 def test_avt_short_mirrors_long() -> None:
     sc = _avt_scanner(AVWAPTouchShort)
     bars = [

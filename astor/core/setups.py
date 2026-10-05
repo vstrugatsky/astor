@@ -1363,6 +1363,7 @@ class _AVWAPTouchBase(Setup):
         max_break_adr: float = 0.05,
         stop_adr: float = 0.05,
         earliest_touch: time = time(9, 34),
+        require_deeper_touch: bool = True,
         max_loss_dollars: float = 100.0,
     ):
         self.min_day_range_adr = min_day_range_adr
@@ -1376,6 +1377,7 @@ class _AVWAPTouchBase(Setup):
         self.max_break_adr = max_break_adr
         self.stop_adr = stop_adr
         self.earliest_touch = earliest_touch
+        self.require_deeper_touch = require_deeper_touch
         self.max_loss_dollars = max_loss_dollars
 
         # `_touch_bar` is the most recent bar to reach the band -- what the
@@ -1399,6 +1401,16 @@ class _AVWAPTouchBase(Setup):
         # Whether the previous evaluated bar already closed beyond the
         # recovery threshold -- the transition rule above.
         self._prev_close: float | None = None
+        # The pullback that last spoke -- how deep it got, and which bar it
+        # was. A leg that keeps nudging AVWAP at the same depth is one
+        # setup, not six: ALGM 2026-10-02 fired twelve AVT-L triggers and
+        # WOLF four in seven minutes, all off pullbacks no deeper than the
+        # one before. Requiring the next pullback to go further leaves the
+        # first entry and drops the echoes. Cleared when a new extreme or a
+        # dead leg starts the count over -- deliberately NOT cleared when a
+        # trigger fires, since that is the case it exists to gate.
+        self._spoken_depth: float | None = None
+        self._spoken_pullback: datetime | None = None
         # One AVWAP-touch alert per pullback, not per in-band bar. That is
         # `first_of_this_pullback` at the touch site -- `_touch_bar` is None
         # between pullbacks and set within one, so it latches on its own. An
@@ -1424,6 +1436,25 @@ class _AVWAPTouchBase(Setup):
         """How far `price` sits the trade's way of AVWAP. Negative means the
         wrong side."""
         raise NotImplementedError
+
+    def _may_speak(self, depth: float) -> bool:
+        """Whether this pullback has earned an alert or a trigger.
+
+        The pullback that already spoke may speak again -- that is the alert
+        followed by its own trigger, one setup reporting twice. A *different*
+        pullback has to have gone deeper than it.
+        """
+        if not self.require_deeper_touch or self._spoken_depth is None:
+            return True
+        if self._pullback_bar is not None and self._pullback_bar.start == self._spoken_pullback:
+            return True
+        return depth > self._spoken_depth
+
+    def _mark_spoken(self, depth: float) -> None:
+        self._spoken_depth = depth
+        self._spoken_pullback = (
+            self._pullback_bar.start if self._pullback_bar is not None else None
+        )
 
     def _target_from_touch(self, touch: float, avwap: float, yard: float) -> float:
         """The price the trigger would fire at: recovery_adr of today's
@@ -1505,6 +1536,8 @@ class _AVWAPTouchBase(Setup):
             self._touch_bar = None
             self._pullback_bar = None
             self._bars_since_touch = 0
+            self._spoken_depth = None
+            self._spoken_pullback = None
         self._prev_extreme = extreme
 
         # Distance past AVWAP, still the measure the wrong-side break uses.
@@ -1522,6 +1555,8 @@ class _AVWAPTouchBase(Setup):
             self._dead = True
             self._touch_bar = None
             self._pullback_bar = None
+            self._spoken_depth = None
+            self._spoken_pullback = None
             return None
         if self._dead:
             return None
@@ -1583,6 +1618,7 @@ class _AVWAPTouchBase(Setup):
             # worth interrupting anyone for. One per pullback.
             if (
                 first_of_this_pullback
+                and self._may_speak(wick_depth_adr)
                 and _leg_is_big_enough(
                     qualifying_size, adr, indicators.session_low,
                     self.min_day_range_adr, self.min_day_range_pct,
@@ -1597,6 +1633,7 @@ class _AVWAPTouchBase(Setup):
                 # where the trade actually goes on.
                 target = self._target_from_touch(wick, avwap, yard)
                 shares, dollars = _position_size(target, stop, self.max_loss_dollars)
+                self._mark_spoken(wick_depth_adr)
                 self._pending_alert = TouchAlert(
                     symbol=bar.symbol,
                     direction=self.direction,
@@ -1730,10 +1767,18 @@ class _AVWAPTouchBase(Setup):
         if rvol is None or rvol < min_rvol:
             candidate("FAIL rvol: not enough volume behind the day")
             return None
+        if not self._may_speak(self._touch_depth_adr or 0.0):
+            candidate(
+                f"FAIL depth: this pullback reached "
+                f"{self._touch_depth_adr or 0.0:.3f}, no deeper than the "
+                f"{self._spoken_depth:.3f} already acted on -- same setup, not a new one"
+            )
+            return None
 
         stop = self._stop_from_avwap(avwap, yard)
         shares, dollars = _position_size(bar.close, stop, self.max_loss_dollars)
         candidate("FIRE -- all filters pass")
+        self._mark_spoken(self._touch_depth_adr or 0.0)
 
         touch_at = self._pullback_bar.start
         self._touch_bar = self._pullback_bar = None  # one trigger per pullback
