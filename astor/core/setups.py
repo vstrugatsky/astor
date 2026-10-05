@@ -1355,7 +1355,7 @@ class _AVWAPTouchBase(Setup):
         min_depth_adr: float = 0.15,
         recovery_adr: float = 0.05,
         max_bars_since_touch: int = 5,
-        max_break_adr: float = 0.06,
+        max_break_adr: float = 0.05,
         stop_adr: float = 0.05,
         earliest_touch: time = time(9, 37),
         max_loss_dollars: float = 100.0,
@@ -1443,7 +1443,9 @@ class _AVWAPTouchBase(Setup):
         the trade's thesis is that AVWAP held -- if price is back through it
         by this much, the thesis is wrong, whatever the pullback's own low
         happened to be. It is also exactly where max_break_adr calls the leg
-        dead, so the stop and the invalidation agree by construction.
+        dead, so the stop and the invalidation agree by construction: the
+        bar that stops the trade out is the bar that ends the leg, and a leg
+        cannot stop you out and then go on to offer a second entry.
         """
         raise NotImplementedError
 

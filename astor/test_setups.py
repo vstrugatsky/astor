@@ -1587,6 +1587,26 @@ def test_avt_target_is_measured_from_the_touch() -> None:
     check("short, overshot through", short_setup._target_from_touch(100.4, avwap, yard), 99.5)
 
 
+def test_avt_stop_and_invalidation_are_the_same_line() -> None:
+    """The bar that stops the trade out is the bar that ends the leg. These
+    drifted apart once (stop moved to 0.05 while the break stayed 0.06),
+    which would let a leg stop you out and then offer a second entry off
+    the same pullback -- so the invariant is pinned here rather than left
+    to the defaults happening to match."""
+    from astor.core.setups import AVWAPTouchLong, AVWAPTouchShort
+
+    for cls in (AVWAPTouchLong, AVWAPTouchShort):
+        s = cls()
+        check(f"{cls.name}: stop and break are one distance",
+              s.stop_adr, s.max_break_adr)
+        # ...and on the same side of AVWAP, so they describe one price.
+        avwap, yard = 100.0, 10.0
+        stop = s._stop_from_avwap(avwap, yard)
+        breach = avwap - s.max_break_adr * yard if cls.direction == "long" else (
+            avwap + s.max_break_adr * yard)
+        check(f"{cls.name}: at the same price", round(stop, 6), round(breach, 6))
+
+
 def test_avt_yardstick_is_capped_on_a_wide_day() -> None:
     """Past a certain width the pullback geometry stops scaling with the
     day: a tenth of a 25% range is a vast distance to ask price to travel,

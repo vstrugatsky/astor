@@ -1187,7 +1187,7 @@ def _add_avt_args(p) -> None:
     p.add_argument(
         "--avt-max-break-adr",
         type=float,
-        default=0.06,
+        default=0.05,
         help="A close this far the wrong side of AVWAP, as a fraction of today's "
         "range, kills the leg until a new extreme -- this is a touch setup, "
         "not a breakdown (AVT).",
