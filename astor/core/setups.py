@@ -1362,7 +1362,7 @@ class _AVWAPTouchBase(Setup):
         max_bars_since_touch: int = 5,
         max_break_adr: float = 0.05,
         stop_adr: float = 0.05,
-        earliest_touch: time = time(9, 37),
+        earliest_touch: time = time(9, 34),
         max_loss_dollars: float = 100.0,
     ):
         self.min_day_range_adr = min_day_range_adr
@@ -1541,7 +1541,12 @@ class _AVWAPTouchBase(Setup):
         in_band = abs(wick_adr) <= self.touch_band_adr and wick_depth_adr >= self.min_depth_adr
         with_session = from_open_adr > 0
         # AVWAP sits on top of price for the first few minutes of a session,
-        # so everything "touches" it before the day has shape.
+        # so everything "touches" it before the day has shape. How few is a
+        # judgement that has moved: 09:40 at first, then 09:37, now 09:34,
+        # because a gapper arrives with its move already made -- TER
+        # 2026-10-02 qualified at 09:34 on 0.91x ADR of which 0.63x was the
+        # overnight gap, and waiting on an intraday range it had no need to
+        # build just meant missing it.
         after_floor = bar.start.time() >= self.earliest_touch
         # What counts as "the move" for deciding the day is worth joining.
         # An overnight gap is part of the move: a name that gapped 0.4x ADR

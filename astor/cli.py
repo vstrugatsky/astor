@@ -1208,7 +1208,7 @@ def _add_avt_args(p) -> None:
     )
     p.add_argument(
         "--avt-earliest-touch",
-        default="09:37",
+        default="09:34",
         help="Earliest HH:MM ET a touch counts -- AVWAP sits on top of price "
         "for the first few minutes, so everything touches it before the day "
         "has shape (AVT).",

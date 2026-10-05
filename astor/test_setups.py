@@ -1697,15 +1697,29 @@ def test_avt_touch_requires_the_session_to_be_going_the_trade_s_way() -> None:
 
 def test_avt_ignores_touches_before_the_time_floor() -> None:
     """AVWAP sits on top of price for the first few minutes, so everything
-    'touches' it before the day has any shape."""
-    early = [bar(i - 30, b.open, b.high, b.low, b.close, int(b.volume), symbol="AVT")
-             for i, b in enumerate(_avt_long_bars(), start=30)]
-    check("the same bars at the open do not fire", _feed(_avt_scanner(AVWAPTouchLong), early), [])
+    "touches" it before the day has shape.
+
+    The floor's *value* is a judgement that keeps moving -- 09:40, then
+    09:37, now 09:34 -- so it is asserted once, separately, and the
+    behaviour is exercised against an explicit floor that does not care
+    what the default happens to be this week.
+    """
+    from astor.core.setups import AVWAPTouchLong
+
+    check("current default", AVWAPTouchLong().earliest_touch, time(9, 34))
+
+    bars = _avt_long_bars()  # touch at 10:04, continuation at 10:05
     check(
-        "...but do once the floor is moved back",
-        len(_feed(_avt_scanner(AVWAPTouchLong, setup_kwargs={"earliest_touch": time(9, 0)}), early)),
+        "a floor past the touch suppresses it",
+        _feed(_avt_scanner(AVWAPTouchLong, setup_kwargs={"earliest_touch": time(10, 10)}), bars),
+        [],
+    )
+    check(
+        "...and a floor before it does not",
+        len(_feed(_avt_scanner(AVWAPTouchLong, setup_kwargs={"earliest_touch": time(9, 0)}), bars)),
         1,
     )
+
 
 
 def test_avt_and_reversal_run_independently_on_one_symbol() -> None:
