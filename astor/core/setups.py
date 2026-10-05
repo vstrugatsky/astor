@@ -107,6 +107,10 @@ class _FilterReadout:
     min_accel_price: float
     accel_vol: float | None
     min_accel_vol: float
+    # No threshold: recorded and shown, not filtered on, until there is
+    # enough of it to know what a good value looks like.
+    pace_adr1: float | None
+    pace_adr: float | None
 
     def line(self) -> str:
         """Every filter as `value/threshold`, in the order they are checked."""
@@ -125,6 +129,7 @@ class _FilterReadout:
                 f"ema9_ext {v(self.ema9_extension_adr, 4)}/{self.min_ema9_extension_adr:g}",
                 f"accel_price {v(self.accel_price, 4)}/{self.min_accel_price:g}",
                 f"accel_vol {v(self.accel_vol)}/{self.min_accel_vol:g}",
+                f"pace {v(self.pace_adr, 5)} ADR/bar",
             ]
         )
 
@@ -207,6 +212,39 @@ def _leg_is_big_enough(
         and leg_pct is not None
         and leg_pct >= min_leg_pct
     )
+
+
+def _pace_adr1(size: float, minutes: float, day_range: float) -> float | None:
+    """How fast a move was built: its size per bar, as a fraction of the
+    day's own range.
+
+    Size alone says nothing about urgency. QSI 2026-10-02 put together a
+    leg over three and a half hours; the same leg in twenty minutes is a
+    different event, and only the second is the violent flush Reversal is
+    meant to fade. Expressed in ADR(1) per bar so it is comparable across
+    names, and recorded rather than filtered on -- what separates a good
+    leg from a slow one is exactly what there is not enough data to say
+    yet.
+    """
+    if minutes <= 0 or day_range <= 0 or size <= 0:
+        return None
+    return round(size / minutes / day_range, 5)
+
+
+def _pace_adr(size: float, minutes: float, adr: float) -> float | None:
+    """The same pace against the prior-session average range instead.
+
+    Recorded alongside _pace_adr1 because for Reversal the ADR(1) version
+    carries no information: a Reversal leg runs between the session's own
+    extremes by construction (_session_anchor and _session_extreme *are*
+    session_high and session_low), so its size always equals the day's
+    range and the ratio collapses to 1/minutes exactly. Verified on all ten
+    REV triggers of 2026-10-02. Against ADR(14) the size survives, so a
+    big fast leg and a small fast one are told apart.
+    """
+    if minutes <= 0 or adr <= 0 or size <= 0:
+        return None
+    return round(size / minutes / adr, 5)
 
 
 def _reward_to_risk(entry: float, stop: float, exit_price: float) -> float | None:
@@ -825,6 +863,12 @@ class _ReversalBase(Setup):
             min_accel_price=self.min_accel_price,
             accel_vol=accel_vol,
             min_accel_vol=self.min_accel_vol,
+            pace_adr1=_pace_adr1(
+                leg_size,
+                leg_duration_minutes,
+                indicators.session_high - indicators.session_low,
+            ),
+            pace_adr=_pace_adr(leg_size, leg_duration_minutes, adr),
         )
 
         def _candidate(verdict: str) -> None:
@@ -924,6 +968,12 @@ class _ReversalBase(Setup):
                 "retrace_pct": round(retrace_pct, 4),
                 "retrace_minutes": round(elapsed_minutes, 1),
                 "retrace_via": "ema9_reclaim" if reclaimed and retrace_pct < self.min_retrace_pct else "pct",
+                "pace_adr1": _pace_adr1(
+                    leg_size,
+                    leg_duration_minutes,
+                    indicators.session_high - indicators.session_low,
+                ),
+                "pace_adr": _pace_adr(leg_size, leg_duration_minutes, adr),
                 "exit_target": round(self._session_anchor(indicators), 4),
                 "rr": _reward_to_risk(
                     bar.close, self._extreme, self._session_anchor(indicators)
@@ -1143,6 +1193,12 @@ class _ReversalBase(Setup):
             target_basis=target_basis,
             exit_target=round(exit_target, 4),
             rr=_reward_to_risk(target, self._extreme, exit_target),
+            pace_adr1=_pace_adr1(
+                leg_size,
+                leg_duration_minutes,
+                indicators.session_high - indicators.session_low,
+            ),
+            pace_adr=_pace_adr(leg_size, leg_duration_minutes, adr),
             stop=round(self._extreme, 4),
             shares=shares,
             dollars=dollars,

@@ -175,6 +175,11 @@ SELECT
     json_extract(t.extras_json, '$.ema9_extension_adr')        AS ema9_extension_adr,
     json_extract(t.extras_json, '$.accel_price')                AS accel_price,
     json_extract(t.extras_json, '$.accel_vol')                  AS accel_vol,
+    -- Leg size per bar as a fraction of today's range: how violently
+    -- the leg was built, as opposed to how far it went. Recorded for
+    -- analysis, not filtered on.
+    json_extract(t.extras_json, '$.pace_adr1')                  AS pace_adr1,
+    json_extract(t.extras_json, '$.pace_adr')                   AS pace_adr,
     -- The retired U&R (REV-L)/O&F (REV-S) breach+reclaim condition against
     -- PDL/PDH -- one of these two keys is present depending on direction,
     -- coalesced the same way bars_below/bars_above already are above.
@@ -281,6 +286,8 @@ SELECT
     json_extract(a.extras_json, '$.ema9_extension_adr')  AS ema9_extension_adr,
     json_extract(a.extras_json, '$.accel_price')         AS accel_price,
     json_extract(a.extras_json, '$.accel_vol')           AS accel_vol,
+    json_extract(a.extras_json, '$.pace_adr1')           AS pace_adr1,
+    json_extract(a.extras_json, '$.pace_adr')            AS pace_adr,
     -- AVWAP-touch-only fields (kind 'avwap_touch'): the pullback as it
     -- stood when the touch was flagged, before any continuation. touch_adr
     -- is signed -- which side of AVWAP the wick reached. All of these are

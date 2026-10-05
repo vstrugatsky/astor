@@ -827,7 +827,7 @@ def test_alert_line_is_an_order_ticket() -> None:
         dollars=3641.4, max_loss_dollars=100.0,
         # Short from 2.55 with a 2.62 stop, expecting the day's low at 2.20:
         # 0.35 of reward against 0.07 of risk.
-        exit_target=2.20, rr=5.0,
+        exit_target=2.20, rr=5.0, pace_adr1=0.004, pace_adr=0.011,
     )
     line = _format_order_alert("CAPITULATION", a)
     check("R:R leads, right after the direction", "short; R:R " in line, True)
