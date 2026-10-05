@@ -1020,6 +1020,15 @@ async def cmd_live(args: argparse.Namespace) -> int:
             for sym, status in results.items():
                 logger.info("%s: %s", sym, status)
 
+        # Start sell-rule tracking on everything held, so the pre-session
+        # work is nothing rather than a `track` per position. Resolution is
+        # all-or-nothing per symbol (astor.drivers.live.resolve_open_trade
+        # declines rather than guesses), so anything it cannot pin down is
+        # named and left for a manual `track SYM ENTRY STOP`.
+        if args.track_positions:
+            for sym in held:
+                logger.info("%s", await driver.track(scanner, sym, None, None, run_id, store))
+
         open_task = asyncio.create_task(
             driver.run_open_transition(scanner, run_id, store)
         )
@@ -1512,6 +1521,14 @@ def build_parser() -> argparse.ArgumentParser:
         "sleepy name's drift cannot qualify on percent alone.",
     )
     _add_avt_args(lv)
+    lv.add_argument(
+        "--track-positions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Start sell-rule tracking on every open position at startup, "
+        "resolving entry and stop from IBKR. Anything that cannot be "
+        "resolved unambiguously is reported and left alone.",
+    )
     lv.add_argument(
         "--max-tickers",
         type=int,

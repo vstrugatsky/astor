@@ -338,8 +338,18 @@ async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | 
     `symbol`, across every account this IBKR login can see. Returns
     (entry, stop, account), or None if it can't be resolved unambiguously --
     no position, more than one position, no single matching working stop
-    order, or a stop that sits on the wrong side of entry for the position's
-    direction (stale/unrelated order rather than this trade's actual stop).
+    order, or a stop sitting the wrong side of the *market* for the
+    position's direction (a stale or unrelated order rather than this
+    trade's protective stop).
+
+    That last check used to compare the stop against entry, which rejected
+    every winning position: a stop raised above entry -- exactly what the
+    TRACK alerts tell this trader to do at +1R -- read as "wrong side" and
+    could not be tracked without typing both prices by hand. On 2026-10-04
+    all four open positions failed this way, SPCX in at 109.34 with its stop
+    trailed to 142.46 among them. Entry says nothing about whether a stop is
+    protective; the market does, because a sell stop above the market would
+    already have fired.
 
     Entry comes from `ib.positions()` (kept live-synced by ib_async once
     connected, no extra request needed). The stop comes from a fresh
@@ -357,6 +367,13 @@ async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | 
     long = pos.position > 0
     exit_side = "SELL" if long else "BUY"
 
+    # Market price per position, for the side check below. Comes from the
+    # account-update feed, which ib_async keeps live-synced; a position
+    # missing from it simply skips the check rather than failing closed.
+    market = {
+        i.contract.symbol: i.marketPrice for i in ib.portfolio() if i.position and i.marketPrice
+    }
+
     open_trades = await ib.reqAllOpenOrdersAsync()
     stops = [
         t.order
@@ -369,7 +386,8 @@ async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | 
     if len(stops) != 1:
         return None
     stop = stops[0].auxPrice
-    if (stop < entry) != long:
+    mkt = market.get(symbol)
+    if mkt and ((stop > mkt) if long else (stop < mkt)):
         return None
     return entry, stop, pos.account
 

@@ -1843,6 +1843,26 @@ def test_alert_marks_a_symbol_already_held() -> None:
           held_line.index("(position)") < held_line.index("long"), True)
 
 
+def test_a_raised_stop_is_still_a_protective_stop() -> None:
+    """A stop trailed above entry -- what the TRACK alerts tell this trader
+    to do at +1R -- used to read as "wrong side" and block tracking. What
+    makes a stop protective is which side of the *market* it sits on: a
+    sell stop above the market would already have fired."""
+
+    def rejected(stop: float, market: float | None, long: bool) -> bool:
+        return bool(market) and ((stop > market) if long else (stop < market))
+
+    # SPCX 2026-10-04: in at 109.34, stop trailed to 142.46, trading ~152.
+    check("a winner's raised stop is accepted", rejected(142.46, 152.0, True), False)
+    # The case the check is actually for: a stale sell stop above the market.
+    check("a sell stop above the market is rejected", rejected(160.0, 152.0, True), True)
+    # Mirror, for a short.
+    check("a buy stop below the market is rejected", rejected(140.0, 152.0, False), True)
+    check("a short's stop above the market is fine", rejected(160.0, 152.0, False), False)
+    # No market price available: the check cannot run, so it does not block.
+    check("unknown market price does not fail closed", rejected(160.0, None, True), False)
+
+
 def test_reward_to_risk() -> None:
     from astor.core.setups import AVWAPTouchLong, AVWAPTouchShort, _reward_to_risk
 
