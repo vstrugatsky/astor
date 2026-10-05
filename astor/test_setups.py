@@ -1521,7 +1521,7 @@ def test_avt_stop_sits_the_far_side_of_avwap() -> None:
     t = _feed(sc, _avt_long_bars())[0]
     avwap, day_range = t.extras["avwap"], 4.5  # 104.00 high, 99.50 low
     check("stop is stop_adr of today's range below AVWAP",
-          round(t.level_value, 4), round(avwap - 0.06 * day_range, 4))
+          round(t.level_value, 4), round(avwap - 0.05 * day_range, 4))
     check("named for what it is anchored to", t.level_name, "AVW")
     check("and it sits below the entry", t.level_value < t.trigger_price, True)
 
@@ -1565,6 +1565,77 @@ def test_avt_touch_alert_needs_the_same_day_quality_as_a_trigger() -> None:
         sc.on_bar(b)
         alerts.extend(sc.pop_alerts())
     check("no alert when the day is too quiet to trade", alerts, [])
+
+
+def test_avt_target_is_measured_from_the_touch() -> None:
+    """A pullback that only grazed the band was already most of the way
+    back; asking it for a fixed distance past AVWAP gave up the entry. The
+    target is recovery_adr past the touch -- or past AVWAP when the touch
+    overshot through it, since price has to reclaim the line first."""
+    from astor.core.setups import AVWAPTouchLong, AVWAPTouchShort
+
+    long_setup, short_setup = AVWAPTouchLong(), AVWAPTouchShort()
+    avwap, yard = 100.0, 10.0  # recovery_adr 0.05 -> half a point
+
+    # Long, touch above AVWAP: the touch is the anchor, so the target sits
+    # closer than the old AVWAP + 0.10 x yard (101.00) did.
+    check("grazed the band from above", long_setup._target_from_touch(100.4, avwap, yard), 100.9)
+    # Long, touch below AVWAP: AVWAP is the anchor instead.
+    check("overshot through AVWAP", long_setup._target_from_touch(99.6, avwap, yard), 100.5)
+    # Short mirrors both.
+    check("short, grazed from below", short_setup._target_from_touch(99.6, avwap, yard), 99.1)
+    check("short, overshot through", short_setup._target_from_touch(100.4, avwap, yard), 99.5)
+
+
+def test_avt_yardstick_is_capped_on_a_wide_day() -> None:
+    """Past a certain width the pullback geometry stops scaling with the
+    day: a tenth of a 25% range is a vast distance to ask price to travel,
+    and a stop that far from AVWAP is not a tight stop. The cap is what
+    'switch to fixed percents above 10%' means -- 0.05 of a 10% range is
+    0.5%, so the two descriptions are one rule."""
+    from astor.core.setups import AVWAPTouchLong
+
+    s = AVWAPTouchLong()
+    low, avwap = 100.0, 110.0
+
+    # A 6% day: under the cap, so distances scale with the range.
+    narrow = min(6.0, s.max_yard_pct / 100 * low)
+    check("narrow day uses its own range", narrow, 6.0)
+    check("...and the stop with it", s._stop_from_avwap(avwap, narrow), 110.0 - 0.05 * 6.0)
+
+    # A 25% day: capped at 10% of price, so the stop stays 0.5% of price.
+    wide = min(25.0, s.max_yard_pct / 100 * low)
+    check("wide day is capped", wide, 10.0)
+    check("stop is 0.5% of price, not 1.25%", s._stop_from_avwap(avwap, wide), 110.0 - 0.5)
+
+
+def test_avt_day_qualifies_on_adr_percent_or_the_overnight_gap() -> None:
+    """Same two-route size test Reversal uses, and the gap counts: a name
+    that gapped 0.4x ADR and has added 0.4x since the open has travelled
+    0.8x from where it last closed."""
+    from astor.core.setups import _leg_is_big_enough
+
+    adr, low = 1.0, 50.0  # 1.0 ADR(14); 6% of 50 is 3.0
+
+    # Route one: the plain ADR multiple.
+    check("0.8x ADR qualifies", _leg_is_big_enough(0.8, adr, low, 0.8, 6.0, 0.6), True)
+    check("0.7x alone does not", _leg_is_big_enough(0.7, adr, low, 0.8, 6.0, 0.6), False)
+    # Route two: a big percent with the 0.6x floor still under it.
+    check("0.7x and 6% qualifies", _leg_is_big_enough(3.5, 5.0, low, 0.8, 6.0, 0.6), True)
+    check("percent alone does not clear the floor",
+          _leg_is_big_enough(3.5, 10.0, low, 0.8, 6.0, 0.6), False)
+
+    # The gap: intraday range 0.4x ADR, but 0.8x from the prior close.
+    # Numbers kept clear of the threshold: 50.85 - 50.0 is 0.85 in decimal
+    # but lands a hair under 0.8 if you pick 50.8, and a test should not
+    # hinge on binary float representation.
+    prev_close, session_high, session_low = 50.0, 50.85, 50.4
+    day_range = session_high - session_low
+    qualifying = max(day_range, abs(session_high - prev_close))
+    check("intraday range alone falls short",
+          _leg_is_big_enough(day_range, adr, session_low, 0.8, 6.0, 0.6), False)
+    check("counting the gap, it qualifies",
+          _leg_is_big_enough(qualifying, adr, session_low, 0.8, 6.0, 0.6), True)
 
 
 def test_avt_short_mirrors_long() -> None:

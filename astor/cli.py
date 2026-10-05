@@ -108,9 +108,12 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
     }
     avt_kwargs = {
         "min_day_range_adr": args.min_avt_day_range_adr,
+        "min_day_range_pct": args.min_avt_day_range_pct,
+        "min_day_range_pct_adr": args.min_avt_day_range_pct_adr,
+        "max_yard_pct": args.avt_max_yard_pct,
         "touch_band_adr": args.avt_touch_band_adr,
         "min_depth_adr": args.min_avt_depth_adr,
-        "min_recovery_adr": args.min_avt_recovery_adr,
+        "recovery_adr": args.avt_recovery_adr,
         "max_bars_since_touch": args.avt_max_bars_since_touch,
         "max_break_adr": args.avt_max_break_adr,
         "stop_adr": args.avt_stop_adr,
@@ -1145,12 +1148,34 @@ def _add_avt_args(p) -> None:
         "today's range (AVT).",
     )
     p.add_argument(
-        "--min-avt-recovery-adr",
+        "--min-avt-day-range-pct",
         type=float,
-        default=0.10,
-        help="How far past AVWAP the bar must close, as a fraction of today's "
-        "range, to count as the continuation -- and it must CROSS that line, "
-        "not already sit past it (AVT).",
+        default=6.0,
+        help="Second route to a big-enough day: a range of at least this "
+        "percent qualifies even below --min-avt-day-range-adr (0 = off).",
+    )
+    p.add_argument(
+        "--min-avt-day-range-pct-adr",
+        type=float,
+        default=0.6,
+        help="ADR floor that still applies on the percent route (AVT).",
+    )
+    p.add_argument(
+        "--avt-max-yard-pct",
+        type=float,
+        default=10.0,
+        help="Cap on the day's range as a yardstick, in percent of price. "
+        "Past this the pullback distances stop scaling with the day -- a "
+        "tenth of a 25%% range is not a tight anything (AVT).",
+    )
+    p.add_argument(
+        "--avt-recovery-adr",
+        type=float,
+        default=0.05,
+        help="How far past the touch the bar must close, as a fraction of "
+        "today's range, to count as the continuation. Measured from AVWAP "
+        "instead when the touch overshot through it, and it must CROSS the "
+        "target, not already sit past it (AVT).",
     )
     p.add_argument(
         "--avt-max-bars-since-touch",
@@ -1169,7 +1194,7 @@ def _add_avt_args(p) -> None:
     )
     p.add_argument(
         "--avt-earliest-touch",
-        default="09:40",
+        default="09:37",
         help="Earliest HH:MM ET a touch counts -- AVWAP sits on top of price "
         "for the first few minutes, so everything touches it before the day "
         "has shape (AVT).",

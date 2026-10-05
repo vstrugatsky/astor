@@ -1283,10 +1283,12 @@ class _AVTReadout:
     from_open_adr: float  # signed the trade's way: is the session itself with us
     touch_at: str | None
     recovery_adr: float
-    min_recovery_adr: float
+    target: float | None
+    min_day_range_pct: float
+    min_day_range_pct_adr: float
     bars_since_touch: int | None
     max_bars_since_touch: int
-    was_recovered: bool
+    already_past_target: bool
 
     def line(self) -> str:
         def v(x: float | None, nd: int = 3) -> str:
@@ -1296,15 +1298,17 @@ class _AVTReadout:
         return "  ".join(
             [
                 f"range {self.day_range_adr:.2f}x/{self.min_day_range_adr:g}x ADR"
-                + f" ({v(self.day_range_pct, 2)}%)",
+                + f" ({v(self.day_range_pct, 2)}%/{self.min_day_range_pct:g}% at "
+                + f"{self.min_day_range_pct_adr:g}x)",
                 f"rvol {v(self.rvol, 2)}/{self.min_rvol:g}",
                 f"from open {self.from_open_adr:+.3f}",
                 f"touch {v(self.touch_adr)}/±{self.touch_band_adr:g}"
                 + (f" @{self.touch_at}" if self.touch_at else ""),
                 f"depth {v(self.depth_adr)}/{self.min_depth_adr:g}",
-                f"recovery {v(self.recovery_adr)}/{self.min_recovery_adr:g}",
+                f"recovery {v(self.recovery_adr)}"
+                + (f" -> target {self.target:.2f}" if self.target is not None else ""),
                 f"bars since touch {bars}/{self.max_bars_since_touch}",
-                f"already recovered {'yes' if self.was_recovered else 'no'}",
+                f"already past target {'yes' if self.already_past_target else 'no'}",
             ]
         )
 
@@ -1344,19 +1348,25 @@ class _AVWAPTouchBase(Setup):
     def __init__(
         self,
         min_day_range_adr: float = 0.8,
+        min_day_range_pct: float = 6.0,
+        min_day_range_pct_adr: float = 0.6,
+        max_yard_pct: float = 10.0,
         touch_band_adr: float = 0.05,
         min_depth_adr: float = 0.15,
-        min_recovery_adr: float = 0.10,
+        recovery_adr: float = 0.05,
         max_bars_since_touch: int = 5,
         max_break_adr: float = 0.06,
-        stop_adr: float = 0.06,
-        earliest_touch: time = time(9, 40),
+        stop_adr: float = 0.05,
+        earliest_touch: time = time(9, 37),
         max_loss_dollars: float = 100.0,
     ):
         self.min_day_range_adr = min_day_range_adr
+        self.min_day_range_pct = min_day_range_pct
+        self.min_day_range_pct_adr = min_day_range_pct_adr
+        self.max_yard_pct = max_yard_pct
         self.touch_band_adr = touch_band_adr
         self.min_depth_adr = min_depth_adr
-        self.min_recovery_adr = min_recovery_adr
+        self.recovery_adr = recovery_adr
         self.max_bars_since_touch = max_bars_since_touch
         self.max_break_adr = max_break_adr
         self.stop_adr = stop_adr
@@ -1383,7 +1393,7 @@ class _AVWAPTouchBase(Setup):
         self._prev_extreme: float | None = None
         # Whether the previous evaluated bar already closed beyond the
         # recovery threshold -- the transition rule above.
-        self._prev_recovered = False
+        self._prev_close: float | None = None
         # One AVWAP-touch alert per pullback, not per in-band bar. That is
         # `first_of_this_pullback` at the touch site -- `_touch_bar` is None
         # between pullbacks and set within one, so it latches on its own. An
@@ -1410,10 +1420,21 @@ class _AVWAPTouchBase(Setup):
         wrong side."""
         raise NotImplementedError
 
-    def _target_from_avwap(self, avwap: float, yard: float) -> float:
-        """The price the trigger would fire at: min_recovery_adr of today's
-        range past AVWAP, the trade's way. AVWAP drifts bar to bar, so this
-        is where it would fire if AVWAP stood still."""
+    def _target_from_touch(self, touch: float, avwap: float, yard: float) -> float:
+        """The price the trigger would fire at: recovery_adr of today's
+        range past the pullback, the trade's way.
+
+        Measured from the touch rather than from AVWAP, because a fixed
+        distance past AVWAP is the wrong thing to ask of a pullback that
+        only grazed the band -- it was already most of the way there, and
+        waiting for the full distance gave up the entry. When the touch
+        overshot *through* AVWAP, AVWAP is the anchor instead: price has to
+        reclaim the line before the distance past it counts for anything.
+        So the anchor is whichever of the two sits further the trade's way.
+
+        AVWAP drifts bar to bar, so like every other level here this is
+        where it would fire if AVWAP stood still.
+        """
         raise NotImplementedError
 
     def _stop_from_avwap(self, avwap: float, yard: float) -> float:
@@ -1457,7 +1478,15 @@ class _AVWAPTouchBase(Setup):
         day_range = indicators.session_high - indicators.session_low
         if day_range <= 0:
             return None
-        yard = day_range
+        # ...and the yardstick is capped. Past a certain width the pullback
+        # geometry stops scaling with the day: on a name that has already
+        # run 25%, a tenth of that range is a vast distance to ask price to
+        # travel before the entry, and a stop that far beyond AVWAP is no
+        # longer a tight stop. Capping at max_yard_pct of price is what the
+        # trader described as switching to fixed percents above 10% -- the
+        # two are the same rule, since 0.05 of a 10% range *is* 0.5%, and
+        # capping keeps it continuous at the boundary instead of a jump.
+        yard = min(day_range, self.max_yard_pct / 100.0 * indicators.session_low)
 
         if self._touch_bar is not None:
             self._bars_since_touch += 1
@@ -1471,9 +1500,9 @@ class _AVWAPTouchBase(Setup):
             self._bars_since_touch = 0
         self._prev_extreme = extreme
 
+        # Distance past AVWAP, still the measure the wrong-side break uses.
         recovery = self._beyond(bar.close, avwap) / yard
-        was_recovered = self._prev_recovered
-        self._prev_recovered = recovery >= self.min_recovery_adr
+        prev_close, self._prev_close = self._prev_close, bar.close
 
         if -recovery > self.max_break_adr:
             if not self._dead:
@@ -1507,7 +1536,14 @@ class _AVWAPTouchBase(Setup):
         # AVWAP sits on top of price for the first few minutes of a session,
         # so everything "touches" it before the day has shape.
         after_floor = bar.start.time() >= self.earliest_touch
-        day_range_adr = day_range / adr  # the one ADR(14) measure that stays
+        # What counts as "the move" for deciding the day is worth joining.
+        # An overnight gap is part of the move: a name that gapped 0.4x ADR
+        # and has added 0.4x since the open has travelled 0.8x from where it
+        # last closed, even though its intraday range is only half that.
+        # Measured to the extreme in the trade's own direction, so a gap up
+        # followed by a slide down does not count as an up move.
+        qualifying_size = max(day_range, abs(extreme - levels.prev_close))
+        day_range_adr = qualifying_size / adr  # the one ADR(14) measure that stays
         # (high/low - 1), the same arithmetic ADR% itself is built from, so
         # the two percents are directly comparable.
         day_range_pct = _pct_of_level(day_range, indicators.session_low)
@@ -1530,7 +1566,11 @@ class _AVWAPTouchBase(Setup):
             # worth interrupting anyone for. One per pullback.
             if (
                 first_of_this_pullback
-                and day_range_adr >= self.min_day_range_adr
+                and _leg_is_big_enough(
+                    qualifying_size, adr, indicators.session_low,
+                    self.min_day_range_adr, self.min_day_range_pct,
+                    self.min_day_range_pct_adr,
+                )
                 and rvol is not None
                 and rvol >= min_rvol
             ):
@@ -1538,7 +1578,7 @@ class _AVWAPTouchBase(Setup):
                 # Sized at the price the trigger would fire, not at the
                 # touch: the touch is the warning, the recovery line is
                 # where the trade actually goes on.
-                target = self._target_from_avwap(avwap, yard)
+                target = self._target_from_touch(wick, avwap, yard)
                 shares, dollars = _position_size(target, stop, self.max_loss_dollars)
                 self._pending_alert = TouchAlert(
                     symbol=bar.symbol,
@@ -1592,10 +1632,25 @@ class _AVWAPTouchBase(Setup):
                 f"{self._pullback_bar.start:%H:%M}" if self._pullback_bar is not None else None
             ),
             recovery_adr=recovery,
-            min_recovery_adr=self.min_recovery_adr,
+            target=(
+                self._target_from_touch(self._pullback_wick(self._pullback_bar), avwap, yard)
+                if self._pullback_bar is not None
+                else None
+            ),
+            min_day_range_pct=self.min_day_range_pct,
+            min_day_range_pct_adr=self.min_day_range_pct_adr,
             bars_since_touch=None if self._touch_bar is None else self._bars_since_touch,
             max_bars_since_touch=self.max_bars_since_touch,
-            was_recovered=was_recovered,
+            already_past_target=(
+                prev_close is not None
+                and self._pullback_bar is not None
+                and self._beyond(
+                    prev_close,
+                    self._target_from_touch(
+                        self._pullback_wick(self._pullback_bar), avwap, yard
+                    ),
+                ) >= 0
+            ),
         )
 
         def candidate(verdict: str) -> None:
@@ -1605,7 +1660,9 @@ class _AVWAPTouchBase(Setup):
             # Nothing has reached the band since the last extreme. Mostly
             # silent -- tracing all 390 bars of a session would bury the
             # decisions -- but two cases are worth a line.
-            if recovery >= self.min_recovery_adr and not was_recovered:
+            if recovery >= self.recovery_adr and prev_close is not None and (
+                self._beyond(prev_close, avwap) / yard < self.recovery_adr
+            ):
                 # Price crossed into the recovery zone anyway: the shape that
                 # looks like a trigger on a chart but has no pullback behind
                 # it.
@@ -1632,23 +1689,29 @@ class _AVWAPTouchBase(Setup):
             self._touch_bar = None
             self._pullback_bar = None
             return None
-        if recovery < self.min_recovery_adr:
-            candidate("HOLD recovery: has not yet cleared AVWAP by enough -- stay armed")
+        touch_extreme = self._pullback_wick(self._pullback_bar)
+        target = self._target_from_touch(touch_extreme, avwap, yard)
+        if self._beyond(bar.close, target) < 0:
+            candidate("HOLD recovery: has not yet reached the target -- stay armed")
             return None
-        if was_recovered:
+        # The crossing rule: price has to arrive at the target on this bar,
+        # not already have been sitting past it.
+        if prev_close is not None and self._beyond(prev_close, target) >= 0:
             candidate(
-                "FAIL already recovered: price was beyond the threshold before this bar, "
+                "FAIL already recovered: price was past the target before this bar, "
                 "so nothing continued here"
             )
             return None
-        if day_range_adr < self.min_day_range_adr:
+        if not _leg_is_big_enough(
+            qualifying_size, adr, indicators.session_low,
+            self.min_day_range_adr, self.min_day_range_pct, self.min_day_range_pct_adr,
+        ):
             candidate("FAIL range: the day has not moved enough to be worth joining")
             return None
         if rvol is None or rvol < min_rvol:
             candidate("FAIL rvol: not enough volume behind the day")
             return None
 
-        touch_extreme = self._pullback_wick(self._pullback_bar)
         stop = self._stop_from_avwap(avwap, yard)
         shares, dollars = _position_size(bar.close, stop, self.max_loss_dollars)
         candidate("FIRE -- all filters pass")
@@ -1720,8 +1783,8 @@ class AVWAPTouchLong(_AVWAPTouchBase):
     def _beyond(self, price: float, avwap: float) -> float:
         return price - avwap
 
-    def _target_from_avwap(self, avwap: float, yard: float) -> float:
-        return avwap + self.min_recovery_adr * yard
+    def _target_from_touch(self, touch: float, avwap: float, yard: float) -> float:
+        return max(touch, avwap) + self.recovery_adr * yard
 
     def _stop_from_avwap(self, avwap: float, yard: float) -> float:
         return avwap - self.stop_adr * yard
@@ -1743,8 +1806,8 @@ class AVWAPTouchShort(_AVWAPTouchBase):
     def _beyond(self, price: float, avwap: float) -> float:
         return avwap - price
 
-    def _target_from_avwap(self, avwap: float, yard: float) -> float:
-        return avwap - self.min_recovery_adr * yard
+    def _target_from_touch(self, touch: float, avwap: float, yard: float) -> float:
+        return min(touch, avwap) - self.recovery_adr * yard
 
     def _stop_from_avwap(self, avwap: float, yard: float) -> float:
         return avwap + self.stop_adr * yard
