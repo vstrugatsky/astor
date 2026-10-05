@@ -111,6 +111,7 @@ class _FilterReadout:
     # enough of it to know what a good value looks like.
     pace_adr1: float | None
     pace_adr: float | None
+    rr: float | None
 
     def line(self) -> str:
         """Every filter as `value/threshold`, in the order they are checked."""
@@ -130,6 +131,7 @@ class _FilterReadout:
                 f"accel_price {v(self.accel_price, 4)}/{self.min_accel_price:g}",
                 f"accel_vol {v(self.accel_vol)}/{self.min_accel_vol:g}",
                 f"pace {v(self.pace_adr, 5)} ADR/bar",
+                f"R:R {v(self.rr, 1)}",
             ]
         )
 
@@ -523,6 +525,27 @@ class _ReversalBase(Setup):
         `legacy_name`, not filtered on."""
         raise NotImplementedError
 
+    def _entry_target(
+        self, indicators: SessionIndicators, leg_size: float
+    ) -> tuple[float, str]:
+        """Where the trigger could first fire, and which condition sets it.
+
+        Two conditions can open it -- a min_retrace_pct retrace off the
+        extreme, or an EMA9 reclaim -- and whichever price comes first going
+        the trade's way is the one to name. The EMA9 leg is a snapshot: the
+        line moves every bar, so this is where it would fire *if the EMA9
+        stood still*, which it will not. The retrace leg is fixed as long as
+        the leg's own boundaries are.
+
+        Shared by the capitulation alert and the filter readout so the price
+        quoted while waiting is the price the readout reasons about.
+        """
+        retrace_target = self._retrace_target(self._extreme, leg_size)
+        ema9_now = indicators.ema9
+        if ema9_now is not None and self._nearer_target(ema9_now, retrace_target) == ema9_now:
+            return ema9_now, "ema9"
+        return retrace_target, "retrace"
+
     def _retrace_target(self, extreme: float, leg_size: float) -> float:
         """The price a min_retrace_pct retracement off the extreme reaches --
         one of the two ways the trigger can open."""
@@ -869,6 +892,11 @@ class _ReversalBase(Setup):
                 indicators.session_high - indicators.session_low,
             ),
             pace_adr=_pace_adr(leg_size, leg_duration_minutes, adr),
+            rr=_reward_to_risk(
+                self._entry_target(indicators, leg_size)[0],
+                self._extreme,
+                self._session_anchor(indicators),
+            ),
         )
 
         def _candidate(verdict: str) -> None:
@@ -1149,11 +1177,7 @@ class _ReversalBase(Setup):
         # a snapshot: the line moves every bar, so this is where it would
         # fire *if the EMA9 stood still*, which it will not. The retrace leg
         # is fixed as long as the leg's own boundaries are.
-        retrace_target = self._retrace_target(self._extreme, leg_size)
-        ema9_now = indicators.ema9
-        target, target_basis = retrace_target, "retrace"
-        if ema9_now is not None and self._nearer_target(ema9_now, retrace_target) == ema9_now:
-            target, target_basis = ema9_now, "ema9"
+        target, target_basis = self._entry_target(indicators, leg_size)
         # Only a *changed* ticket is worth sending, and the two halves of it
         # change for different reasons. The stop is the leg's extreme: when
         # it moves the trade has genuinely moved, so any move at ticket
@@ -1370,6 +1394,7 @@ class _AVTReadout:
     touch_at: str | None
     recovery_adr: float
     target: float | None
+    rr: float | None
     min_day_range_pct: float
     min_day_range_pct_adr: float
     bars_since_touch: int | None
@@ -1393,7 +1418,8 @@ class _AVTReadout:
                 + (f" @{self.touch_at}" if self.touch_at else ""),
                 f"depth {v(self.depth_adr)}/{self.min_depth_adr:g}",
                 f"recovery {v(self.recovery_adr)}"
-                + (f" -> target {self.target:.2f}" if self.target is not None else ""),
+                + (f" -> target {self.target:.2f}" if self.target is not None else "")
+                + (f"  R:R {self.rr:.1f}" if self.rr is not None else ""),
                 f"bars since touch {bars}/{self.max_bars_since_touch}",
                 f"already past target {'yes' if self.already_past_target else 'no'}",
             ]
@@ -1786,6 +1812,17 @@ class _AVWAPTouchBase(Setup):
             recovery_adr=recovery,
             target=(
                 self._target_from_touch(self._pullback_wick(self._pullback_bar), avwap, yard)
+                if self._pullback_bar is not None
+                else None
+            ),
+            rr=(
+                _reward_to_risk(
+                    self._target_from_touch(
+                        self._pullback_wick(self._pullback_bar), avwap, yard
+                    ),
+                    self._stop_from_avwap(avwap, yard),
+                    self._exit_from_touch(self._pullback_wick(self._pullback_bar), extreme),
+                )
                 if self._pullback_bar is not None
                 else None
             ),

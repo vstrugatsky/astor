@@ -963,6 +963,17 @@ async def cmd_purge_db(args: argparse.Namespace) -> int:
     return 0
 
 
+def _with_open_positions(symbols: list[str], held: list[str]) -> tuple[list[str], list[str]]:
+    """The scan list plus anything held that is not already on it.
+
+    Returns (symbols, added). Order is preserved and the watchlist comes
+    first, so a held name that is already on it keeps its place rather than
+    being moved to the end.
+    """
+    added = [h for h in held if h not in symbols]
+    return symbols + added, added
+
+
 async def cmd_live(args: argparse.Namespace) -> int:
     symbols = parse_symbols(args)
     setups, kwargs = _setups_and_kwargs(args)
@@ -994,6 +1005,15 @@ async def cmd_live(args: argparse.Namespace) -> int:
                 "setup_kwargs": _setup_kwargs(args),
             },
         )
+
+        # Whatever is already held gets scanned, watchlist or not. A
+        # position is the one symbol that cannot afford to go unwatched,
+        # and the watchlist is rebuilt each morning from what looked
+        # interesting the night before -- which is not the same question.
+        held = sorted({p.contract.symbol for p in ib.positions() if p.position})
+        symbols, extra = _with_open_positions(symbols, held)
+        if extra:
+            logger.info("Open positions not on the watchlist, adding: %s", ", ".join(extra))
 
         if symbols:
             results = await driver.add_symbols(scanner, symbols, run_id, store)

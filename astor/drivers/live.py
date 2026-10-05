@@ -125,6 +125,7 @@ _ANSI_BLACK = "\033[30m"
 _ANSI_GREEN = "\033[32m"
 _ANSI_RED = "\033[31m"
 _ANSI_BROWN = "\033[38;5;130m"
+_ANSI_PURPLE = "\033[35m"
 
 
 def _bold(text: str) -> str:
@@ -277,7 +278,7 @@ def _overshoot_cost(
     return None
 
 
-def _format_order_alert(label: str, a: SetupAlert) -> str:
+def _format_order_alert(label: str, a: SetupAlert, held: bool = False) -> str:
     """One line, sized to be acted on rather than studied.
 
     Everything that describes *why* the alert fired -- the leg, the touch,
@@ -314,17 +315,21 @@ def _format_order_alert(label: str, a: SetupAlert) -> str:
     # whether this setup is worth the attention the rest of the line asks
     # for.
     rr = f"R:R {_bold(f'{a.rr:.1f}')}; " if a.rr is not None else ""
+    marker = f"{_accent('(position)', _ANSI_PURPLE)} " if held else ""
     return (
         f"[{a.bar_start:%H:%M:%S} ET] {_accent(label, color)} {_bold(a.symbol)} "
-        f"{a.direction}; {rr}target: {target} stop: {_bold(f'{a.stop:.2f}')} {sized}{tail}"
+        f"{marker}{a.direction}; {rr}target: {target} "
+        f"stop: {_bold(f'{a.stop:.2f}')} {sized}{tail}"
     )
 
 
-def _print_setup_alert(a: SetupAlert) -> None:
+def _print_setup_alert(a: SetupAlert, held: bool = False) -> None:
     """One entry point for every setup-produced alert; the only thing that
     differs by kind is what it is called."""
     _print_alert(
-        _format_order_alert("AVWAP TOUCH" if isinstance(a, TouchAlert) else "CAPITULATION", a)
+        _format_order_alert(
+            "AVWAP TOUCH" if isinstance(a, TouchAlert) else "CAPITULATION", a, held
+        )
     )
 
 
@@ -384,6 +389,18 @@ class LiveDriver:
         self._subs: dict[str, object] = {}  # symbol -> BarDataList
         self._last_bar_start: dict[str, datetime] = {}
         self.tracker = SellRuleTracker()
+
+    @property
+    def positions(self) -> set[str]:
+        """Symbols currently held, read straight from IBKR each time rather
+        than cached: positions change through the session, and a cached set
+        would start marking alerts for something already sold. ib_async
+        keeps this live-synced once connected, so reading it is free.
+
+        Used only to mark alerts -- one on something already held is a
+        different read (add, exit, or sit) from one on a fresh name.
+        """
+        return {p.contract.symbol for p in self.ib.positions() if p.position}
 
     def symbol_count(self) -> int:
         return len(self._pending) + len(self._subs)
@@ -667,7 +684,7 @@ class LiveDriver:
                         bar_end=alert.bar_end,
                     )
                     store.commit()
-                    _print_setup_alert(alert)
+                    _print_setup_alert(alert, alert.symbol in self.positions)
 
                 track_alert = self.tracker.on_close(symbol, bar_event.close, bar_event.start)
                 if track_alert is not None:

@@ -1813,6 +1813,36 @@ def test_leg_qualifies_by_adr_or_by_percent() -> None:
           ok(0.39, 0.46, 4.68, min_leg_pct=0.0), False)
 
 
+def test_live_scans_what_is_held() -> None:
+    """A position is the one symbol that cannot afford to go unwatched, and
+    the watchlist is rebuilt each morning from what looked interesting the
+    night before -- not the same question."""
+    from astor.cli import _with_open_positions
+
+    syms, added = _with_open_positions(["AAPL", "NVDA"], ["DELL", "NVDA"])
+    check("held names not on the list are added", added, ["DELL"])
+    check("and the watchlist keeps its order and place", syms, ["AAPL", "NVDA", "DELL"])
+    check("nothing held, nothing added", _with_open_positions(["AAPL"], []), (["AAPL"], []))
+    check("an empty watchlist still scans the position",
+          _with_open_positions([], ["DELL"]), (["DELL"], ["DELL"]))
+
+
+def test_alert_marks_a_symbol_already_held() -> None:
+    from astor.core.types import TouchAlert
+    from astor.drivers.live import _format_order_alert
+
+    a = TouchAlert("NNE", "long", OPEN, OPEN + timedelta(minutes=1), 16.85, 16.83,
+                   0.031, 0.36, 0.94, None, 0.22, 3.57, target=16.95,
+                   target_basis="recovery", exit_target=17.40, rr=3.0, stop=16.80,
+                   shares=666, dollars=11289.0, max_loss_dollars=100.0)
+    check("a fresh name carries no marker",
+          "(position)" in _format_order_alert("AVWAP TOUCH", a, held=False), False)
+    held_line = _format_order_alert("AVWAP TOUCH", a, held=True)
+    check("a held one does", "(position)" in held_line, True)
+    check("and it sits right after the symbol, before the direction",
+          held_line.index("(position)") < held_line.index("long"), True)
+
+
 def test_reward_to_risk() -> None:
     from astor.core.setups import AVWAPTouchLong, AVWAPTouchShort, _reward_to_risk
 
