@@ -349,8 +349,17 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     )
     ind = scanner.indicators.get(symbol)
     if ind is not None and ind.session_open is not None:
+        gap = _pct_change(ind.session_open, lv.prev_close)
+        gap_adr = (
+            (ind.session_open - lv.prev_close) / lv.adr if lv.adr > 0 else None
+        )
+        gap_str = (
+            f" (gap {gap:+.2f}%" + (f", {gap_adr:+.2f}x ADR)" if gap_adr is not None else ")")
+            if gap is not None
+            else ""
+        )
         print(
-            f"Session open {ind.session_open:.2f}  high {ind.session_high:.2f}  "
+            f"Session open {ind.session_open:.2f}{gap_str}  high {ind.session_high:.2f}  "
             f"low {ind.session_low:.2f}"
         )
     print(
@@ -600,7 +609,12 @@ def print_profile(
     print(f"PROFILE {levels.symbol} {args.date}   {args.interval}-min intervals")
     print(rule)
     open_str = f"{session_open:.2f}" if session_open is not None else "n/a"
-    gap = signed(_pct_change(session_open, levels.prev_close))
+    gap_pct = _pct_change(session_open, levels.prev_close)
+    gap = signed(gap_pct)
+    if gap_pct is not None and levels.adr_pct > 0:
+        # Also in ADR multiples, so it reads directly against the range
+        # columns and against what AVT's day-size filter actually counts.
+        gap = f"{gap} ({gap_pct / levels.adr_pct:+.2f}x ADR)"
     print(
         f"open {open_str}   gap {gap}   prev close {levels.prev_close:.2f}   "
         f"PDH {levels.pdh:.2f}   PDL {levels.pdl:.2f}   "

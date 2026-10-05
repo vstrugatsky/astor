@@ -1274,6 +1274,10 @@ class _AVTReadout:
     # exactly this reason (see _leg_is_big_enough); whether AVT wants the
     # same two-route rule is the open question this is here to answer.
     day_range_pct: float | None
+    # How much of the range figure came from the overnight gap rather than
+    # from today's own high-low. None when the gap added nothing -- saying
+    # "incl. 0.00x gap" on every other line would be noise.
+    gap_adr: float | None
     rvol: float | None
     min_rvol: float
     touch_adr: float | None  # signed: which side of AVWAP the wick reached
@@ -1299,7 +1303,8 @@ class _AVTReadout:
             [
                 f"range {self.day_range_adr:.2f}x/{self.min_day_range_adr:g}x ADR"
                 + f" ({v(self.day_range_pct, 2)}%/{self.min_day_range_pct:g}% at "
-                + f"{self.min_day_range_pct_adr:g}x)",
+                + f"{self.min_day_range_pct_adr:g}x)"
+                + (f" incl. {self.gap_adr:.2f}x gap" if self.gap_adr else ""),
                 f"rvol {v(self.rvol, 2)}/{self.min_rvol:g}",
                 f"from open {self.from_open_adr:+.3f}",
                 f"touch {v(self.touch_adr)}/±{self.touch_band_adr:g}"
@@ -1546,6 +1551,11 @@ class _AVWAPTouchBase(Setup):
         # followed by a slide down does not count as an up move.
         qualifying_size = max(day_range, abs(extreme - levels.prev_close))
         day_range_adr = qualifying_size / adr  # the one ADR(14) measure that stays
+        # What the gap contributed: how far the figure exceeds today's own
+        # high-low. In the clean case -- gapped one way, continued the same
+        # way -- this is the gap itself; when the day traded back through
+        # its open it is less, which is the honest number either way.
+        gap_adr = (qualifying_size - day_range) / adr if adr > 0 else 0.0
         # (high/low - 1), the same arithmetic ADR% itself is built from, so
         # the two percents are directly comparable.
         day_range_pct = _pct_of_level(day_range, indicators.session_low)
@@ -1620,6 +1630,7 @@ class _AVWAPTouchBase(Setup):
             day_range_adr=day_range_adr,
             min_day_range_adr=self.min_day_range_adr,
             day_range_pct=day_range_pct,
+            gap_adr=gap_adr if gap_adr > 0.005 else None,
             rvol=rvol,
             min_rvol=min_rvol,
             # The qualifying touch's own measurements, not this bar's -- see
@@ -1682,8 +1693,9 @@ class _AVWAPTouchBase(Setup):
                     trace, bar,
                     f"near touch @ {bar.close:.2f}: wick {wick_adr:+.3f} vs "
                     f"±{self.touch_band_adr:g}, range {day_range_adr:.2f}x/"
-                    f"{self.min_day_range_adr:g}x ADR -- closest this pullback "
-                    f"came, not a touch",
+                    f"{self.min_day_range_adr:g}x ADR"
+                    + (f" incl. {gap_adr:.2f}x gap" if gap_adr > 0.005 else "")
+                    + " -- closest this pullback came, not a touch",
                 )
             return None
         if self._bars_since_touch > self.max_bars_since_touch:
