@@ -216,7 +216,7 @@ def _leg_is_big_enough(
     )
 
 
-def _pace_adr1(size: float, minutes: float, day_range: float) -> float | None:
+def _pace_adr1(size: float | None, minutes: float, day_range: float) -> float | None:
     """How fast a move was built: its size per bar, as a fraction of the
     day's own range.
 
@@ -227,24 +227,38 @@ def _pace_adr1(size: float, minutes: float, day_range: float) -> float | None:
     names, and recorded rather than filtered on -- what separates a good
     leg from a slow one is exactly what there is not enough data to say
     yet.
+
+    `size` is _push_size(), NOT leg_size: it has to span the same stretch
+    of time `minutes` does or the ratio means nothing. See _push_size.
     """
-    if minutes <= 0 or day_range <= 0 or size <= 0:
+    if size is None or minutes <= 0 or day_range <= 0 or size <= 0:
         return None
     return round(size / minutes / day_range, 5)
 
 
-def _pace_adr(size: float, minutes: float, adr: float) -> float | None:
+def _pace_adr(size: float | None, minutes: float, adr: float) -> float | None:
     """The same pace against the prior-session average range instead.
 
-    Recorded alongside _pace_adr1 because for Reversal the ADR(1) version
-    carries no information: a Reversal leg runs between the session's own
-    extremes by construction (_session_anchor and _session_extreme *are*
-    session_high and session_low), so its size always equals the day's
-    range and the ratio collapses to 1/minutes exactly. Verified on all ten
-    REV triggers of 2026-10-02. Against ADR(14) the size survives, so a
-    big fast leg and a small fast one are told apart.
+    Recorded alongside _pace_adr1 because for an ordinary Reversal leg the
+    ADR(1) version carries no information: such a leg runs between the
+    session's own extremes by construction (_session_anchor and
+    _session_extreme *are* session_high and session_low), so its size
+    equals the day's range and the ratio collapses to 1/minutes exactly --
+    true of all twenty REV triggers recorded through 2026-10-02. Against
+    ADR(14) the size survives, so a big fast leg and a small fast one are
+    told apart: QSI 2026-10-02 (2.04x ADR in 125m) and PACB the same day
+    (0.82x in 127m) are indistinguishable in ADR(1) and 2.5x apart here.
+
+    The collapse is a property of the leg *definition*, not of ADR(1): a
+    revived leg measures from its own turnaround (see _push_size), its
+    push is a genuine sub-move of the day, and the ADR(1) version carries
+    information again. pace_adr1 != 1/minutes is exactly the signature of
+    a revived leg.
+
+    Both stay recorded; which one predicts better is an empirical question
+    there is not enough data to answer yet.
     """
-    if minutes <= 0 or adr <= 0 or size <= 0:
+    if size is None or minutes <= 0 or adr <= 0 or size <= 0:
         return None
     return round(size / minutes / adr, 5)
 
@@ -438,6 +452,13 @@ class _ReversalBase(Setup):
         # useful as a stop reference), but "how long did this push take"
         # shouldn't count the dead, unrelated stretch before the revival.
         self._push_started_at: datetime | None = None
+        # The price as of _push_started_at -- self._anchor on an ordinary
+        # leg, the dead leg's retracement turnaround on a revived one. Set
+        # in lockstep with _push_started_at in every branch below so the
+        # two always describe the same instant. Exists only so `pace` can
+        # measure a size over the same stretch of time it divides by; see
+        # _push_size.
+        self._push_started_price: float | None = None
         # The push_started_at a capitulation alert was already fired for --
         # one alert per push, not per deepening extreme (a fast leg can set
         # a new extreme almost every bar; re-alerting on each of those is
@@ -610,6 +631,31 @@ class _ReversalBase(Setup):
         capitulation-in-progress alert, so both read the same number."""
         return abs((self._leg_ended_at(extreme_at) - push_started_at).total_seconds()) / 60.0
 
+    def _push_size(self) -> float | None:
+        """The price distance covered over exactly the stretch
+        `_leg_duration_minutes` measures: push start to extreme.
+
+        On an ordinary leg this *is* leg_size -- push_started_at is the
+        anchor's own timestamp, so the push spans anchor to extreme.
+
+        On a revived leg the two diverge, and `pace` was reading the
+        divergence as speed. push_started_at jumps forward to the dead
+        leg's retracement turnaround while self._anchor stays the stale
+        session-wide level it has held all day, so pace divided the whole
+        day's range by only the revival's duration -- a leg that ground
+        out its range over four hours and then revived in six minutes
+        scored as one of the fastest of the session. The numerator has to
+        span the same clock the denominator does.
+
+        Deliberately scoped to pace alone. leg_size still spans anchor to
+        extreme everywhere else, because that is what the leg-size filter,
+        the stop, and R:R all mean by "the leg" -- so nothing here changes
+        which triggers fire.
+        """
+        if self._push_started_price is None or self._extreme is None:
+            return None
+        return abs(self._push_started_price - self._extreme)
+
     def on_bar(
         self,
         bar: BarEvent,
@@ -675,6 +721,7 @@ class _ReversalBase(Setup):
             # own timestamp.
             self._leg_bars = [bar]
             self._push_started_at = self._anchor_at(indicators)
+            self._push_started_price = self._anchor
             self._dead_extreme = None
             self._dead_bars = []
         elif extreme_moved and leg_was_dead:
@@ -691,6 +738,15 @@ class _ReversalBase(Setup):
                 # accel_price/accel_vol of exactly the bars that mattered.
                 self._leg_bars = self._dead_bars + [bar]
                 self._push_started_at = self._dead_bars[0].start
+                # Where that turnaround actually was: _dead_extreme is the
+                # retracement's own furthest close, set on the bar right
+                # before _dead_bars started accumulating, so it is the
+                # price at _dead_bars[0].start.
+                self._push_started_price = (
+                    self._dead_extreme
+                    if self._dead_extreme is not None
+                    else self._dead_bars[0].open
+                )
             else:
                 # No observable bars of the turn before the break itself --
                 # the revival happened in a single bar (dead retracement's
@@ -704,6 +760,14 @@ class _ReversalBase(Setup):
                 # the dead leg's own earlier alert.
                 self._leg_bars = [bar]
                 self._push_started_at = bar.start
+                # The whole push happened inside this one bar, so it
+                # started at this bar's own open -- unless the retracement
+                # had already registered a turnaround close (the previous
+                # bar's, i.e. the price at bar.start), which is the same
+                # instant and the more faithful level.
+                self._push_started_price = (
+                    self._dead_extreme if self._dead_extreme is not None else bar.open
+                )
             self._dead_extreme = None
             self._dead_bars = []
         elif not leg_was_dead:
@@ -844,6 +908,7 @@ class _ReversalBase(Setup):
         push_started_at = self._push_started_at if self._push_started_at is not None else anchor_at
         elapsed_minutes = (bar.start - extreme_at).total_seconds() / 60.0
         leg_duration_minutes = self._leg_duration_minutes(push_started_at, extreme_at)
+        push_size = self._push_size()
 
         # Every filter's input is computed here, before the first check, so
         # a rejection can report the whole picture instead of only what it
@@ -887,11 +952,11 @@ class _ReversalBase(Setup):
             accel_vol=accel_vol,
             min_accel_vol=self.min_accel_vol,
             pace_adr1=_pace_adr1(
-                leg_size,
+                push_size,
                 leg_duration_minutes,
                 indicators.session_high - indicators.session_low,
             ),
-            pace_adr=_pace_adr(leg_size, leg_duration_minutes, adr),
+            pace_adr=_pace_adr(push_size, leg_duration_minutes, adr),
             rr=_reward_to_risk(
                 self._entry_target(indicators, leg_size)[0],
                 self._extreme,
@@ -997,11 +1062,11 @@ class _ReversalBase(Setup):
                 "retrace_minutes": round(elapsed_minutes, 1),
                 "retrace_via": "ema9_reclaim" if reclaimed and retrace_pct < self.min_retrace_pct else "pct",
                 "pace_adr1": _pace_adr1(
-                    leg_size,
+                    push_size,
                     leg_duration_minutes,
                     indicators.session_high - indicators.session_low,
                 ),
-                "pace_adr": _pace_adr(leg_size, leg_duration_minutes, adr),
+                "pace_adr": _pace_adr(push_size, leg_duration_minutes, adr),
                 "exit_target": round(self._session_anchor(indicators), 4),
                 "rr": _reward_to_risk(
                     bar.close, self._extreme, self._session_anchor(indicators)
@@ -1138,6 +1203,7 @@ class _ReversalBase(Setup):
         leg_duration_minutes = self._leg_duration_minutes(push_started_at, extreme_at)
         if leg_duration_minutes < self.min_leg_minutes:
             return
+        push_size = self._push_size()
 
         move_rvol = (
             compute_rvol(self._extreme_cum_volume_at(indicators), extreme_at, curve)
@@ -1218,11 +1284,11 @@ class _ReversalBase(Setup):
             exit_target=round(exit_target, 4),
             rr=_reward_to_risk(target, self._extreme, exit_target),
             pace_adr1=_pace_adr1(
-                leg_size,
+                push_size,
                 leg_duration_minutes,
                 indicators.session_high - indicators.session_low,
             ),
-            pace_adr=_pace_adr(leg_size, leg_duration_minutes, adr),
+            pace_adr=_pace_adr(push_size, leg_duration_minutes, adr),
             stop=round(self._extreme, 4),
             shares=shares,
             dollars=dollars,

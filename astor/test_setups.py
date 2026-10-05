@@ -2160,6 +2160,94 @@ def test_reversal_leg_bars_reset_on_rearm_after_dead_leg() -> None:
     check("accel_vol computed only from leg2's own bars", t.extras["accel_vol"], 4.0)
 
 
+def _revived_leg_bars() -> list[BarEvent]:
+    """leg1 dies at bar 5, the retracement tops out at 96.9 (bar 10), and
+    leg2 drives from there to 86.0 by bar 15. Anchor stays 98.0 all day."""
+    return [
+        bar(0, 98.0, 98.0, 97.5, 97.8, 500_000, symbol="REV"),
+        bar(1, 97.8, 98.0, 96.0, 96.2, 500_000, symbol="REV"),
+        bar(2, 96.2, 96.5, 95.0, 95.3, 500_000, symbol="REV"),
+        bar(3, 95.3, 96.0, 94.0, 94.3, 500_000, symbol="REV"),
+        bar(4, 94.3, 95.0, 93.0, 93.3, 500_000, symbol="REV"),
+        bar(5, 93.3, 98.0, 93.5, 98.0, 500_000, symbol="REV"),  # retrace 100% -- kills leg1
+        bar(6, 98.0, 98.0, 96.0, 96.5, 500_000, symbol="REV"),
+        bar(7, 96.5, 96.8, 96.0, 96.6, 500_000, symbol="REV"),
+        bar(8, 96.6, 96.9, 96.0, 96.7, 500_000, symbol="REV"),
+        bar(9, 96.7, 97.0, 96.0, 96.8, 500_000, symbol="REV"),
+        bar(10, 96.8, 97.1, 96.0, 96.9, 500_000, symbol="REV"),  # retracement tops at 96.9
+        bar(11, 96.9, 97.0, 92.0, 92.3, 5_000, symbol="REV"),  # leg2 begins
+        bar(12, 92.3, 92.7, 90.5, 90.8, 10_000, symbol="REV"),
+        bar(13, 90.8, 91.0, 89.0, 89.3, 20_000, symbol="REV"),
+        bar(14, 89.3, 89.6, 87.5, 87.8, 30_000, symbol="REV"),
+        bar(15, 87.8, 88.0, 86.0, 86.3, 40_000, symbol="REV"),  # leg2 extreme 86.0
+        bar(16, 86.3, 87.5, 86.1, 87.4, 5_000, symbol="REV"),  # retrace 11.7%, fires
+    ]
+
+
+def test_pace_measures_size_over_the_same_window_as_duration() -> None:
+    """Regression test for a window mismatch in `pace`.
+
+    leg_duration_minutes measures from push_started_at, which on a revived
+    leg jumps forward to the dead leg's own retracement turnaround. The
+    size it was divided by did not: that stayed abs(anchor - extreme), and
+    the anchor here is the session high set back at bar 0. So pace was
+    dividing the *whole day's* 12.0-point range -- sixteen bars in the
+    making -- by only the revival's 5 minutes, and reporting the result as
+    speed. The numerator has to span the same clock the denominator does.
+
+    leg_size itself is deliberately left spanning anchor-to-extreme, since
+    that is what the leg-size filter, the stop and R:R all mean by "the
+    leg" -- so this changes no firing decision, only what pace reports.
+    """
+    sc = _rev_scanner(ReversalLong, setup_kwargs={"min_accel_price": 0.0})
+    t = _feed(sc, _revived_leg_bars())[0]
+    setup = sc._state[("REV", "REV-L")]
+
+    check("push started at the retracement's turnaround", setup._push_started_price, 96.9)
+    check("anchor is still the session high", setup._anchor, 98.0)
+    check("leg_size still spans anchor to extreme", abs(setup._anchor - setup._extreme), 12.0)
+    check("push_size spans the revival only", round(setup._push_size(), 4), 10.9)
+
+    minutes = t.extras["leg_duration_minutes"]
+    check("duration is the revival's, not the whole day's", minutes, 5.0)
+    # adr 4.0 and day_range 12.0 (98.0 high, 86.0 low) at fire time.
+    check("pace_adr uses push_size", t.extras["pace_adr"], round(10.9 / 5.0 / 4.0, 5))
+    check("pace_adr1 uses push_size", t.extras["pace_adr1"], round(10.9 / 5.0 / 12.0, 5))
+    # The old numerator was the day's range itself, which is what made
+    # pace_adr1 collapse to 1/minutes. On a revived leg it no longer does,
+    # and that inequality is precisely the signature of a revived leg.
+    check(
+        "pace_adr1 no longer collapses to 1/minutes on a revived leg",
+        t.extras["pace_adr1"] == round(1.0 / minutes, 5),
+        False,
+    )
+
+
+def test_pace_is_unchanged_on_an_ordinary_leg() -> None:
+    """The other half of the same fix: when the leg never died,
+    push_started_at *is* the anchor's own timestamp, so push_size and
+    leg_size are the same number and pace reports exactly what it did
+    before. This is also where pace_adr1's documented collapse to
+    1/minutes holds -- an ordinary Reversal leg runs between the session's
+    own extremes, so its size is the day's range by construction.
+    """
+    sc = _rev_scanner(ReversalShort, setup_kwargs={"min_accel_price": 0.0, "min_accel_vol": 0.0})
+    triggers = _feed(sc, _cdna_style_bars())
+    check("the fixture fires", len(triggers) >= 1, True)
+    t = triggers[0]
+    setup = sc._state[("REV", "REV-S")]
+    check(
+        "push_size equals leg_size on a leg that never died",
+        round(setup._push_size(), 6),
+        round(abs(setup._anchor - setup._extreme), 6),
+    )
+    check(
+        "pace_adr1 collapses to 1/minutes, as documented",
+        t.extras["pace_adr1"],
+        round(1.0 / t.extras["leg_duration_minutes"], 5),
+    )
+
+
 def _cdna_style_bars() -> list[BarEvent]:
     """REV-S leg: pre-leg low at bar 2 (9:32), peak at bar 6 (9:36). Under
     the new looser defaults this now fires at bar 7 (a 15% retrace already
