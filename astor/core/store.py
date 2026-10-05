@@ -109,6 +109,11 @@ SELECT
     json_extract(t.extras_json, '$.avwap')                    AS avwap,
     json_extract(t.extras_json, '$.avwap_pct')                AS avwap_pct,
     json_extract(t.extras_json, '$.rvol')                     AS rvol,
+    -- Reward over risk: entry to stop against entry to where the setup
+    -- expects to be out (the day's extreme for Reversal, a multiple of
+    -- the pullback depth for AVT).
+    json_extract(t.extras_json, '$.exit_target')              AS exit_target,
+    json_extract(t.extras_json, '$.rr')                       AS rr,
     -- Notify's trade-decision fields: two stop/position-size framings, one
     -- off the technical level (PDH/PDL, in level_value already) and one off
     -- the session's actual high/low, which can be much farther for a wide
@@ -300,6 +305,8 @@ SELECT
     -- would have been the right one.
     json_extract(a.extras_json, '$.target')              AS target,
     json_extract(a.extras_json, '$.target_basis')        AS target_basis,
+    json_extract(a.extras_json, '$.exit_target')         AS exit_target,
+    json_extract(a.extras_json, '$.rr')                  AS rr,
     json_extract(a.extras_json, '$.stop')                AS stop_price,
     json_extract(a.extras_json, '$.max_loss_dollars')    AS max_loss_dollars,
     -- Track-alert-only fields (breakeven/sell)

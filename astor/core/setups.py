@@ -209,6 +209,22 @@ def _leg_is_big_enough(
     )
 
 
+def _reward_to_risk(entry: float, stop: float, exit_price: float) -> float | None:
+    """How many times the risk the move is worth, if it goes the way the
+    setup says.
+
+    Risk is the distance to the stop; reward is the distance to where the
+    setup expects to be out. None when there is no risk to divide by, or
+    when the exit sits the wrong side of the entry -- a setup whose target
+    is already behind price has nothing to say about reward.
+    """
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    reward = (exit_price - entry) if entry > stop else (entry - exit_price)
+    return round(reward / risk, 2) if reward > 0 else None
+
+
 def rev_rvol_threshold(adv: float) -> float:
     """The RVOL floor a Reversal leg's move must clear, highest-liquidity
     tier first. Shared between the final retrace filter and the earlier
@@ -908,6 +924,10 @@ class _ReversalBase(Setup):
                 "retrace_pct": round(retrace_pct, 4),
                 "retrace_minutes": round(elapsed_minutes, 1),
                 "retrace_via": "ema9_reclaim" if reclaimed and retrace_pct < self.min_retrace_pct else "pct",
+                "exit_target": round(self._session_anchor(indicators), 4),
+                "rr": _reward_to_risk(
+                    bar.close, self._extreme, self._session_anchor(indicators)
+                ),
                 "move_rvol": move_rvol,
                 "ema9_at_extreme": ema9_at_extreme,
                 "extreme_close": extreme_close,
@@ -1100,6 +1120,10 @@ class _ReversalBase(Setup):
                 return
         self._alerted_levels = (target, self._extreme)
         shares, dollars = _position_size(target, self._extreme, self.max_loss_dollars)
+        # Where the trade expects to be out: back at the other end of the
+        # day. _session_anchor is exactly that -- the high for a long fading
+        # a flush, the low for a short fading a spike.
+        exit_target = self._session_anchor(indicators)
         self._pending_capitulation_alert = CapitulationAlert(
             symbol=bar.symbol,
             direction=self.direction,
@@ -1117,6 +1141,8 @@ class _ReversalBase(Setup):
             accel_vol=accel_vol,
             target=round(target, 4),
             target_basis=target_basis,
+            exit_target=round(exit_target, 4),
+            rr=_reward_to_risk(target, self._extreme, exit_target),
             stop=round(self._extreme, 4),
             shares=shares,
             dollars=dollars,
@@ -1364,6 +1390,7 @@ class _AVWAPTouchBase(Setup):
         stop_adr: float = 0.05,
         earliest_touch: time = time(9, 34),
         require_deeper_touch: bool = True,
+        exit_depth_mult: float = 1.5,
         max_loss_dollars: float = 100.0,
     ):
         self.min_day_range_adr = min_day_range_adr
@@ -1378,6 +1405,7 @@ class _AVWAPTouchBase(Setup):
         self.stop_adr = stop_adr
         self.earliest_touch = earliest_touch
         self.require_deeper_touch = require_deeper_touch
+        self.exit_depth_mult = exit_depth_mult
         self.max_loss_dollars = max_loss_dollars
 
         # `_touch_bar` is the most recent bar to reach the band -- what the
@@ -1436,6 +1464,16 @@ class _AVWAPTouchBase(Setup):
         """How far `price` sits the trade's way of AVWAP. Negative means the
         wrong side."""
         raise NotImplementedError
+
+    def _exit_from_touch(self, touch: float, extreme: float) -> float:
+        """A measured move: the pullback's own depth, times
+        exit_depth_mult, projected from the touch.
+
+        One expression for both directions -- for a short the extreme sits
+        below the touch, so the same arithmetic walks the target down
+        instead of up.
+        """
+        return touch + self.exit_depth_mult * (extreme - touch)
 
     def _may_speak(self, depth: float) -> bool:
         """Whether this pullback has earned an alert or a trigger.
@@ -1633,6 +1671,7 @@ class _AVWAPTouchBase(Setup):
                 # where the trade actually goes on.
                 target = self._target_from_touch(wick, avwap, yard)
                 shares, dollars = _position_size(target, stop, self.max_loss_dollars)
+                exit_target = self._exit_from_touch(wick, extreme)
                 self._mark_spoken(wick_depth_adr)
                 self._pending_alert = TouchAlert(
                     symbol=bar.symbol,
@@ -1649,6 +1688,8 @@ class _AVWAPTouchBase(Setup):
                     rvol=rvol,
                     target=round(target, 4),
                     target_basis="recovery",
+                    exit_target=round(exit_target, 4),
+                    rr=_reward_to_risk(target, stop, exit_target),
                     stop=round(stop, 4),
                     shares=shares,
                     dollars=dollars,
@@ -1810,6 +1851,10 @@ class _AVWAPTouchBase(Setup):
                 ),
                 "recovery_adr": round(recovery, 4),
                 "from_open_adr": round(from_open_adr, 4),
+                "exit_target": round(self._exit_from_touch(touch_extreme, extreme), 4),
+                "rr": _reward_to_risk(
+                    bar.close, stop, self._exit_from_touch(touch_extreme, extreme)
+                ),
                 "bars_since_touch": self._bars_since_touch,
                 "session_open": indicators.session_open,
                 "session_high": indicators.session_high,

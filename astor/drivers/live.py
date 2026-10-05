@@ -102,7 +102,9 @@ def _format_trigger_line(t: Trigger) -> str:
     return (
         f"[{t.bar_start:%H:%M:%S} ET] TRIGGER {_symbol(t.symbol)} "
         f"{_setup_token(t.setup, t.direction)} {t.direction:<5} "
-        f"@ {t.trigger_price:.2f}   {_format_metrics(t)}\n"
+        f"@ {t.trigger_price:.2f}"
+        + (f"   R:R {_bold(f'{t.extras["rr"]:.1f}')}" if t.extras.get("rr") else "")
+        + f"   {_format_metrics(t)}\n"
         f"    {t.level_name:<3} {magnitude(level_pct)} {toward}, stop {t.level_value:.2f}"
         f"  ->  {sized(level_shares, level_dollars)}"
     )
@@ -308,9 +310,13 @@ def _format_order_alert(label: str, a: SetupAlert) -> str:
         passed = a.price >= a.target if a.direction == "long" else a.price <= a.target
         if passed:
             target = f"{target} {_bold('(already through)')}"
+    # R:R leads, before any of the prices: it is the one number that says
+    # whether this setup is worth the attention the rest of the line asks
+    # for.
+    rr = f"R:R {_bold(f'{a.rr:.1f}')}; " if a.rr is not None else ""
     return (
         f"[{a.bar_start:%H:%M:%S} ET] {_accent(label, color)} {_bold(a.symbol)} "
-        f"{a.direction}; target: {target} stop: {_bold(f'{a.stop:.2f}')} {sized}{tail}"
+        f"{a.direction}; {rr}target: {target} stop: {_bold(f'{a.stop:.2f}')} {sized}{tail}"
     )
 
 

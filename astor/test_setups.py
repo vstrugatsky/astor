@@ -825,9 +825,13 @@ def test_alert_line_is_an_order_ticket() -> None:
         ema9_extension_adr=0.6723, accel_price=4.6667, accel_vol=1.0,
         target=2.55, target_basis="retrace", stop=2.62, shares=1428,
         dollars=3641.4, max_loss_dollars=100.0,
+        # Short from 2.55 with a 2.62 stop, expecting the day's low at 2.20:
+        # 0.35 of reward against 0.07 of risk.
+        exit_target=2.20, rr=5.0,
     )
     line = _format_order_alert("CAPITULATION", a)
-    for needed in ("CAPITULATION", "ABAT", "short", "target: ", "2.55", "stop: ", "2.62", "1428"):
+    check("R:R leads, right after the direction", "short; R:R " in line, True)
+    for needed in ("CAPITULATION", "ABAT", "short", "5.0", "target: ", "2.55", "stop: ", "2.62", "1428"):
         check(f"{needed!r} present", needed in line, True)
     # A short's worse fill is a lower one.
     check("overshoot reads the short's way", "below target" in line, True)
@@ -1807,6 +1811,28 @@ def test_leg_qualifies_by_adr_or_by_percent() -> None:
     # Switched off, the second route disappears entirely.
     check("min_leg_pct 0 restores the old single test",
           ok(0.39, 0.46, 4.68, min_leg_pct=0.0), False)
+
+
+def test_reward_to_risk() -> None:
+    from astor.core.setups import AVWAPTouchLong, AVWAPTouchShort, _reward_to_risk
+
+    # Long: 2 of risk, 10 of reward.
+    check("long", _reward_to_risk(entry=100, stop=98, exit_price=110), 5.0)
+    # Short: stop above, exit below.
+    check("short", _reward_to_risk(entry=100, stop=102, exit_price=94), 3.0)
+    check("an exit behind price is not reward",
+          _reward_to_risk(entry=100, stop=98, exit_price=99), None)
+    check("no risk, no ratio", _reward_to_risk(entry=100, stop=100, exit_price=110), None)
+
+    # AVT's exit is a measured move: the pullback's depth times the
+    # multiple, projected from the touch. One expression, both directions.
+    long_, short_ = AVWAPTouchLong(), AVWAPTouchShort()
+    check("long projects above the day's high",
+          long_._exit_from_touch(touch=100.0, extreme=110.0), 115.0)
+    check("short projects below the day's low",
+          short_._exit_from_touch(touch=100.0, extreme=90.0), 85.0)
+    check("the multiple is tunable",
+          AVWAPTouchLong(exit_depth_mult=2.0)._exit_from_touch(100.0, 110.0), 120.0)
 
 
 def test_rev_rvol_threshold_tiers() -> None:

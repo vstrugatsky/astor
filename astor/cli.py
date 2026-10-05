@@ -119,6 +119,7 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
         "stop_adr": args.avt_stop_adr,
         "earliest_touch": parse_hhmm(args.avt_earliest_touch),
         "require_deeper_touch": args.avt_require_deeper_touch,
+        "exit_depth_mult": args.avt_exit_depth_mult,
         "max_loss_dollars": args.max_loss,
     }
     return {
@@ -1221,6 +1222,13 @@ def _add_avt_args(p) -> None:
         help="Only alert or fire on a pullback that went deeper than the one "
         "already acted on, until a new extreme resets the leg. A leg nudging "
         "AVWAP at the same depth over and over is one setup, not six (AVT).",
+    )
+    p.add_argument(
+        "--avt-exit-depth-mult",
+        type=float,
+        default=1.5,
+        help="Where AVT expects to be out, as a multiple of the pullback's "
+        "own depth projected from the touch -- the reward half of R:R (AVT).",
     )
     p.add_argument(
         "--avt-stop-adr",

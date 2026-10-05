@@ -133,6 +133,8 @@ class CapitulationAlert:
     # the size that pair allows. See _ReversalBase._maybe_flag_capitulation.
     target: float | None
     target_basis: str  # 'ema9' | 'retrace' -- which condition sets the price
+    exit_target: float | None  # where the setup expects to be out
+    rr: float | None           # reward over risk, from target to exit
     stop: float
     shares: int | None
     dollars: float | None
@@ -151,6 +153,8 @@ class CapitulationAlert:
             "accel_vol": self.accel_vol,
             "target": self.target,
             "target_basis": self.target_basis,
+            "exit_target": self.exit_target,
+            "rr": self.rr,
             "stop": self.stop,
             "level_stop_shares": self.shares,
             "level_stop_dollars": self.dollars,
@@ -192,6 +196,8 @@ class TouchAlert:
     # the trade goes on.
     target: float
     target_basis: str
+    exit_target: float | None
+    rr: float | None
     stop: float            # where the trade's stop would sit, off AVWAP
     shares: int | None
     dollars: float | None
@@ -208,6 +214,8 @@ class TouchAlert:
             "rvol": self.rvol,
             "target": self.target,
             "target_basis": self.target_basis,
+            "exit_target": self.exit_target,
+            "rr": self.rr,
             "stop": self.stop,
             "level_stop_shares": self.shares,
             "level_stop_dollars": self.dollars,
