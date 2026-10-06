@@ -1247,6 +1247,74 @@ def test_store_view_keeps_eastern_time() -> None:
     store.close()
 
 
+def test_views_report_adr1_from_session_high_and_low() -> None:
+    """ADR(1) -- the day's own realised range -- is computed in the views
+    rather than read from extras, so it covers every row ever recorded
+    instead of only the AVT rows written after the extras field existed.
+
+    Not to be confused with adr_pct, which is ADR(14). The trigger side is
+    fully retroactive because session_high/session_low have always been
+    stored; the alert side cannot be, so alerts without them report NULL.
+    """
+    import tempfile
+
+    from astor.core.store import TriggerStore
+    from astor.core.types import CapitulationAlert, Trigger
+
+    path = Path(tempfile.mkdtemp()) / "t.db"
+    store = TriggerStore(path)
+    store.start_run("r1", "replay", {})
+    store.record(
+        "r1",
+        Trigger(
+            symbol="TEST", setup="REV-L", direction="long", trigger_price=100.5,
+            bar_start=OPEN, bar_end=OPEN + timedelta(minutes=1),
+            level_name="EXT", level_value=100.0,
+            # No day_range_pct in extras at all -- a REV trigger never had one.
+            extras={"session_high": 110.0, "session_low": 100.0},
+        ),
+        OPEN + timedelta(minutes=1),
+    )
+
+    def alert(symbol: str, hi: float | None, lo: float | None) -> CapitulationAlert:
+        return CapitulationAlert(
+            symbol=symbol, direction="long",
+            bar_start=OPEN, bar_end=OPEN + timedelta(minutes=1),
+            price=100.5, leg_extreme=100.0, anchor=110.0, leg_size_adr=1.5,
+            move_rvol=None, ema9_extension_adr=None, accel_price=None,
+            accel_vol=None, target=None, target_basis="retrace",
+            exit_target=None, rr=None, pace_adr1=None, pace_adr=None,
+            stop=100.0, shares=None, dollars=None, max_loss_dollars=500.0,
+            session_high=hi, session_low=lo,
+        )
+
+    def record(a: CapitulationAlert) -> None:
+        store.record_alert(
+            "r1", a.kind, a.symbol, a.direction, a.bar_start, a.price,
+            a.bar_end, a.store_extras(), bar_end=a.bar_end,
+        )
+
+    record(alert("WITH", 110.0, 100.0))
+    # The historical shape: recorded before session high/low were carried.
+    record(alert("WITHOUT", None, None))
+    store.commit()
+
+    row = store.conn.execute(
+        "SELECT day_range, day_range_pct FROM latest_triggers"
+    ).fetchone()
+    check("REV trigger gets day_range despite no extras field", row[0], 10.0)
+    check("...and day_range_pct off session_low", round(row[1], 4), 10.0)
+
+    rows = dict(
+        store.conn.execute(
+            "SELECT symbol, day_range FROM latest_alerts WHERE kind='capitulation'"
+        ).fetchall()
+    )
+    check("alert carrying session high/low gets day_range", rows["WITH"], 10.0)
+    check("alert without them reports NULL, not a guess", rows["WITHOUT"], None)
+    store.close()
+
+
 def test_record_alert_and_alert_detail_view() -> None:
     """Capitulation alerts and sell-rule track alerts (breakeven/sell) share
     one table and one view -- kind-specific columns simply read NULL for

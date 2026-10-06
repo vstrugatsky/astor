@@ -141,11 +141,19 @@ class CapitulationAlert:
     shares: int | None
     dollars: float | None
     max_loss_dollars: float
+    # The day's own high/low as they stood when the alert fired, so
+    # alert_detail can report ADR(1) the same way trigger_detail does.
+    # Defaulted because alerts recorded before these existed have neither,
+    # and the view reports NULL for those rather than guessing.
+    session_high: float | None = None
+    session_low: float | None = None
 
     def store_extras(self) -> dict[str, Any]:
         """What the alerts table records beyond the columns every alert
         shares (astor.core.store.record_alert)."""
         return {
+            "session_high": self.session_high,
+            "session_low": self.session_low,
             "leg_extreme": self.leg_extreme,
             "anchor": self.anchor,
             "leg_size_adr": self.leg_size_adr,
@@ -206,9 +214,14 @@ class TouchAlert:
     shares: int | None
     dollars: float | None
     max_loss_dollars: float
+    # See CapitulationAlert.session_high -- same purpose, same defaulting.
+    session_high: float | None = None
+    session_low: float | None = None
 
     def store_extras(self) -> dict[str, Any]:
         return {
+            "session_high": self.session_high,
+            "session_low": self.session_low,
             "avwap": self.avwap,
             "touch_adr": self.touch_adr,
             "depth_adr": self.depth_adr,

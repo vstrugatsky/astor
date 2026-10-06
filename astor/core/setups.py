@@ -1293,6 +1293,8 @@ class _ReversalBase(Setup):
             shares=shares,
             dollars=dollars,
             max_loss_dollars=self.max_loss_dollars,
+            session_high=indicators.session_high,
+            session_low=indicators.session_low,
         )
 
     def pop_alert(self) -> CapitulationAlert | None:
@@ -1842,6 +1844,8 @@ class _AVWAPTouchBase(Setup):
                     shares=shares,
                     dollars=dollars,
                     max_loss_dollars=self.max_loss_dollars,
+                    session_high=indicators.session_high,
+                    session_low=indicators.session_low,
                 )
         elif in_band:
             # Would have been a touch on distance alone -- say why it wasn't,

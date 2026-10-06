@@ -127,6 +127,20 @@ SELECT
     json_extract(t.extras_json, '$.session_open')              AS session_open,
     json_extract(t.extras_json, '$.session_high')              AS session_high,
     json_extract(t.extras_json, '$.session_low')               AS session_low,
+    -- ADR(1): the day's own realised range, in dollars and as a percent.
+    -- Computed here rather than read from extras so it covers every row
+    -- ever recorded -- session_high/session_low have always been stored,
+    -- whereas the extras field only ever existed on AVT and only on rows
+    -- written after it was added. Not to be confused with adr_pct above,
+    -- which is ADR(14) (the prior 14 sessions' average), a different
+    -- number with a confusingly similar name.
+    json_extract(t.extras_json, '$.session_high')
+        - json_extract(t.extras_json, '$.session_low')         AS day_range,
+    CASE WHEN json_extract(t.extras_json, '$.session_low') > 0
+         THEN 100.0 * (json_extract(t.extras_json, '$.session_high')
+                       - json_extract(t.extras_json, '$.session_low'))
+                    / json_extract(t.extras_json, '$.session_low')
+    END                                                        AS day_range_pct,
     json_extract(t.extras_json, '$.session_extreme')          AS session_extreme,
     json_extract(t.extras_json, '$.session_extreme_pct')      AS session_extreme_pct,
     json_extract(t.extras_json, '$.session_stop_shares')      AS session_stop_shares,
@@ -192,8 +206,10 @@ SELECT
     -- trigger bar closed, and bars_since_touch how long the continuation
     -- took (0 = the same bar did both). stop_source says which term set the
     -- stop: the pullback extreme, or the percent-of-entry floor under it.
+    -- day_range_adr stays AVT-only and extras-sourced: it needs ADR(14) in
+    -- dollars, which is not a column here. day_range_pct used to sit
+    -- beside it; it is now computed for every row, up with session_high.
     json_extract(t.extras_json, '$.day_range_adr')             AS day_range_adr,
-    json_extract(t.extras_json, '$.day_range_pct')             AS day_range_pct,
     json_extract(t.extras_json, '$.touch_adr')                 AS touch_adr,
     json_extract(t.extras_json, '$.touch_at')                  AS touch_at,
     json_extract(t.extras_json, '$.touch_price')               AS touch_price,
@@ -278,6 +294,26 @@ SELECT
     a.direction,
     a.price,
     a.bar_end,
+    -- On every alert kind: the day's own high/low as they stood when the
+    -- alert fired, and ADR(1) derived from them -- the same two columns
+    -- trigger_detail carries, so a trigger and the alert that preceded it
+    -- can be compared on the day's range directly. Unlike there, these
+    -- cannot be backfilled: alerts recorded before 2026-10-05 stored no
+    -- session high/low, so they report NULL. The one exception is
+    -- day_range_pct on an AVT alert, which had its own extras field and is
+    -- coalesced in below, keeping the rows that already had it.
+    json_extract(a.extras_json, '$.session_high')        AS session_high,
+    json_extract(a.extras_json, '$.session_low')         AS session_low,
+    json_extract(a.extras_json, '$.session_high')
+        - json_extract(a.extras_json, '$.session_low')   AS day_range,
+    COALESCE(
+        CASE WHEN json_extract(a.extras_json, '$.session_low') > 0
+             THEN 100.0 * (json_extract(a.extras_json, '$.session_high')
+                           - json_extract(a.extras_json, '$.session_low'))
+                        / json_extract(a.extras_json, '$.session_low')
+        END,
+        json_extract(a.extras_json, '$.day_range_pct')
+    )                                                    AS day_range_pct,
     -- Capitulation-only fields
     json_extract(a.extras_json, '$.leg_extreme')         AS leg_extreme,
     json_extract(a.extras_json, '$.anchor')              AS anchor,
@@ -298,7 +334,6 @@ SELECT
     json_extract(a.extras_json, '$.touch_adr')           AS touch_adr,
     json_extract(a.extras_json, '$.depth_adr')           AS depth_adr,
     json_extract(a.extras_json, '$.day_range_adr')       AS day_range_adr,
-    json_extract(a.extras_json, '$.day_range_pct')       AS day_range_pct,
     json_extract(a.extras_json, '$.from_open_adr')       AS from_open_adr,
     json_extract(a.extras_json, '$.rvol')                AS rvol,
     json_extract(a.extras_json, '$.level_stop_shares')   AS level_stop_shares,
