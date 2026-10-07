@@ -130,7 +130,12 @@ class _FilterReadout:
                 f"ema9_ext {v(self.ema9_extension_adr, 4)}/{self.min_ema9_extension_adr:g}",
                 f"accel_price {v(self.accel_price, 4)}/{self.min_accel_price:g}",
                 f"accel_vol {v(self.accel_vol)}/{self.min_accel_vol:g}",
-                f"pace {v(self.pace_adr, 5)} ADR/bar",
+                # ADR(14), spelled out: adr_pct and ADR(1) are both in play
+                # elsewhere in this output and a bare "ADR" reads ambiguously.
+                # Per *minute*, not per bar -- the divisor is
+                # leg_duration_minutes, so the two only coincide at the
+                # default --bar-size of 1 min.
+                f"pace {v(self.pace_adr, 5)} ADR(14)/min",
                 f"R:R {v(self.rr, 1)}",
             ]
         )
@@ -217,16 +222,21 @@ def _leg_is_big_enough(
 
 
 def _pace_adr1(size: float | None, minutes: float, day_range: float) -> float | None:
-    """How fast a move was built: its size per bar, as a fraction of the
+    """How fast a move was built: its size per minute, as a fraction of the
     day's own range.
 
     Size alone says nothing about urgency. QSI 2026-10-02 put together a
     leg over three and a half hours; the same leg in twenty minutes is a
     different event, and only the second is the violent flush Reversal is
-    meant to fade. Expressed in ADR(1) per bar so it is comparable across
-    names, and recorded rather than filtered on -- what separates a good
-    leg from a slow one is exactly what there is not enough data to say
-    yet.
+    meant to fade. Expressed in ADR(1) per minute so it is comparable
+    across names, and recorded rather than filtered on -- what separates a
+    good leg from a slow one is exactly what there is not enough data to
+    say yet.
+
+    Recorded but NOT displayed: for an ordinary leg this collapses to
+    1/minutes (see _pace_adr), so showing it would just restate
+    leg_duration_minutes, which `explain` already prints as "built Nm".
+    pace_adr is what the readout carries.
 
     `size` is _push_size(), NOT leg_size: it has to span the same stretch
     of time `minutes` does or the ratio means nothing. See _push_size.

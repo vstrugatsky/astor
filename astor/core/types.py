@@ -135,8 +135,8 @@ class CapitulationAlert:
     target_basis: str  # 'ema9' | 'retrace' -- which condition sets the price
     exit_target: float | None  # where the setup expects to be out
     rr: float | None           # reward over risk, from target to exit
-    pace_adr1: float | None    # leg size per bar, as a fraction of today's range
-    pace_adr: float | None     # ...and against ADR(14), which for REV is the useful one
+    pace_adr1: float | None    # push size per minute, as a fraction of today's range
+    pace_adr: float | None     # ...and against ADR(14), which is the one explain shows
     stop: float
     shares: int | None
     dollars: float | None
