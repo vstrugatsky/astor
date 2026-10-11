@@ -43,7 +43,7 @@ from astor.core.indicators import SessionIndicators, compute_interval_rvol, comp
 from astor.core.scanner import Scanner
 from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME, rev_rvol_threshold
 from astor.core.store import TriggerStore
-from astor.drivers.live import LiveDriver
+from astor.drivers.live import LiveDriver, position_pnl
 from astor.drivers.replay import (
     ADR_SESSIONS,
     ET,
@@ -727,21 +727,26 @@ async def cmd_profile(args: argparse.Namespace) -> int:
 
 
 async def cmd_positions(args: argparse.Namespace) -> int:
-    """What IBKR thinks you are holding, from both of its feeds at once.
+    """What IBKR thinks you are holding, from two independent sources.
 
     IBKR reports positions two different ways, and the desktop app's
     Portfolio view is driven by the second one:
 
-      reqPositions      -> ib.positions()   -- the account's positions
-      account updates   -> ib.portfolio()   -- the same, plus market value
-                                               and unrealized P&L
+      reqPositions   -> ib.positions()   -- the account's positions
+      PnLSingle      -> per position     -- IB's valuation of it: its own
+                                            position count, market value,
+                                            unrealized and daily P&L
 
     They come from separate subscriptions, so when a position vanishes from
     the desktop Portfolio view this says whether it vanished from the data
-    or only from that window: if reqPositions still has it and the portfolio
-    feed does not, the position is fine and the app's feed is stale. A
-    restart would have "fixed" it either way, which is why it is worth
-    checking before restarting.
+    or only from that window: if reqPositions still has it and IB still
+    values it, the position is fine and the app's feed is stale. A restart
+    would have "fixed" it either way, which is why it is worth checking
+    before restarting.
+
+    The second source used to be the portfolio feed (`ib.portfolio()`),
+    which matches that window most closely but is empty on a login with
+    more than one account -- see `position_pnl`.
 
     Read-only -- it opens a connection, asks, prints, and disconnects.
     """
@@ -750,15 +755,8 @@ async def cmd_positions(args: argparse.Namespace) -> int:
     await ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=15)
     try:
         await ib.reqPositionsAsync()
-        # No reqAccountUpdates call on purpose. ib_async subscribes to
-        # account updates on connect and IB pushes them unasked, so both
-        # feeds are already populated here -- and asking explicitly makes
-        # this hang: reqAccountUpdatesAsync never resolves against this
-        # gateway (verified 2026-09-21; the data arrives regardless, only
-        # the future is left pending). A brief settle beat instead.
-        await asyncio.sleep(1.0)
         positions = [p for p in ib.positions() if p.position]
-        portfolio = [i for i in ib.portfolio() if i.position]
+        pnls = await asyncio.gather(*(position_pnl(ib, p) for p in positions))
         orders = await ib.reqAllOpenOrdersAsync()
     finally:
         ib.disconnect()
@@ -767,38 +765,43 @@ async def cmd_positions(args: argparse.Namespace) -> int:
     print(f"POSITIONS   {datetime.now(ET):%Y-%m-%d %H:%M:%S} ET")
     print("=" * 78)
 
+    rows = sorted(zip(positions, pnls, strict=True), key=lambda r: (r[0].account, r[0].contract.symbol))
     print(f"\nreqPositions ({len(positions)}):")
     if not positions:
         print("  (none)")
-    for p in sorted(positions, key=lambda p: (p.account, p.contract.symbol)):
+    for p, _ in rows:
         print(
-            f"  {p.contract.symbol:<8} {p.position:>10,.0f} @ avg {p.avgCost:>10,.4f}"
+            f"  {p.contract.symbol:<8} {p.position:>10,g} @ avg {p.avgCost:>10,.4f}"
             f"   {p.account}"
         )
 
-    print(f"\nportfolio / account updates ({len(portfolio)}):")
-    if not portfolio:
+    valued = [(p, v) for p, v in rows if v is not None]
+    print(f"\nIB valuation / PnLSingle ({len(valued)}):")
+    if not valued:
         print("  (none)")
-    for i in sorted(portfolio, key=lambda i: (i.account, i.contract.symbol)):
+    for p, v in valued:
+        mkt = v.value / v.position if v.position else float("nan")
         print(
-            f"  {i.contract.symbol:<8} {i.position:>10,.0f} @ mkt {i.marketPrice:>10,.4f}"
-            f"   value {i.marketValue:>12,.2f}   unreal {i.unrealizedPNL:>10,.2f}   {i.account}"
+            f"  {p.contract.symbol:<8} {v.position:>10,g} @ mkt {mkt:>10,.4f}"
+            f"   value {v.value:>12,.2f}   unreal {v.unrealizedPnL:>10,.2f}"
+            f"   day {v.dailyPnL:>10,.2f}   {p.account}"
         )
 
-    # The whole point: do the two feeds agree?
-    by_positions = {(p.account, p.contract.symbol) for p in positions}
-    by_portfolio = {(i.account, i.contract.symbol) for i in portfolio}
-    only_positions = sorted(by_positions - by_portfolio)
-    only_portfolio = sorted(by_portfolio - by_positions)
+    # The whole point: do the two sources agree?
+    unvalued = [p for p, v in rows if v is None]
+    disagree = [(p, v) for p, v in valued if v.position != p.position]
     print()
-    if not only_positions and not only_portfolio:
-        print(f"Both feeds agree: {len(by_positions)} open position(s).")
+    if not unvalued and not disagree:
+        print(f"Both sources agree: {len(positions)} open position(s).")
     else:
-        print("MISMATCH between the two feeds:")
-        for account, sym in only_positions:
-            print(f"  {sym} ({account}): in reqPositions, missing from the portfolio feed")
-        for account, sym in only_portfolio:
-            print(f"  {sym} ({account}): in the portfolio feed, missing from reqPositions")
+        print("MISMATCH between the two sources:")
+        for p in unvalued:
+            print(f"  {p.contract.symbol} ({p.account}): in reqPositions, IB sent no valuation")
+        for p, v in disagree:
+            print(
+                f"  {p.contract.symbol} ({p.account}): reqPositions has {p.position:,g},"
+                f" IB values {v.position:,g}"
+            )
 
     working = [
         t for t in orders
@@ -812,7 +815,7 @@ async def cmd_positions(args: argparse.Namespace) -> int:
         price = o.auxPrice or o.lmtPrice or 0.0
         print(
             f"  {t.contract.symbol:<8} {o.action:<4} {o.totalQuantity:>8,.0f} {o.orderType:<6}"
-            f" @ {price:>10,.4f}   {t.orderStatus.status}"
+            f" @ {price:>10,.4f}   {t.orderStatus.status:<12} {o.account}"
         )
     return 0
 

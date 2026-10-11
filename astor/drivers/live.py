@@ -18,7 +18,7 @@ import math
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
-from ib_async import IB, Position
+from ib_async import IB, PnLSingle, Position
 
 from astor.core.scanner import Scanner
 from astor.core.store import TriggerStore
@@ -396,18 +396,29 @@ def held_positions(ib: IB, symbol: str) -> list[Position]:
     return [p for p in ib.positions() if p.contract.symbol == symbol and p.position != 0]
 
 
-async def _position_mark(ib: IB, pos: Position, timeout: float = 3.0) -> float | None:
+async def _position_mark(ib: IB, pos: Position) -> float | None:
     """IB's own mark for `pos` -- the market price its portfolio valuation
-    uses -- or None if it doesn't arrive within `timeout`, which skips the
-    side check rather than failing closed.
+    uses -- or None if it doesn't arrive, which skips the side check rather
+    than failing closed.
 
     This used to read `ib.portfolio()`, which is empty on a login with more
-    than one account: ib_async only subscribes to portfolio updates itself
-    when there is exactly one, and subscribing explicitly never resolves and
-    never delivers against this gateway, with or without an account
-    (verified 2026-10-10). PnLSingle carries the same mark as the position's
-    market value and works per account. A ticker snapshot doesn't serve:
-    outside RTH it has no last price.
+    than one account (see `position_pnl`). A ticker snapshot doesn't serve
+    either: outside RTH it has no last price.
+    """
+    pnl = await position_pnl(ib, pos)
+    return pnl.value / pos.position if pnl is not None else None
+
+
+async def position_pnl(ib: IB, pos: Position, timeout: float = 3.0) -> PnLSingle | None:
+    """IB's valuation of one position -- its own position count, market
+    value, unrealized and daily P&L -- or None if none arrives within
+    `timeout`. One-shot: the subscription is cancelled before returning.
+
+    This stands in for the portfolio feed (`ib.portfolio()`), which is empty
+    on a login with more than one account: ib_async only subscribes to it
+    itself when there is exactly one, and subscribing explicitly never
+    resolves and never delivers against this gateway, with or without an
+    account (verified 2026-10-10). PnLSingle works per account.
     """
     pnl = ib.reqPnLSingle(pos.account, "", pos.contract.conId)
     try:
@@ -416,7 +427,7 @@ async def _position_mark(ib: IB, pos: Position, timeout: float = 3.0) -> float |
             if asyncio.get_running_loop().time() > deadline:
                 return None
             await asyncio.sleep(0.1)
-        return pnl.value / pos.position
+        return pnl
     finally:
         ib.cancelPnLSingle(pos.account, "", pos.contract.conId)
 
