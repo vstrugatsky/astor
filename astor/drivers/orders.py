@@ -195,7 +195,11 @@ class TrailExecutor:
             algoStrategy="Adaptive",
             algoParams=[TagValue("adaptivePriority", ADAPTIVE_PRIORITY)],
         )
-        exit_trade = self.ib.placeOrder(stop.contract, order)
+        # SMART whatever the stop was routed to: Adaptive is SMART-only, so a
+        # stop directed at one exchange would otherwise get its exit refused.
+        contract = copy.copy(stop.contract)
+        contract.exchange = "SMART"
+        exit_trade = self.ib.placeOrder(contract, order)
         await _wait_for(
             lambda: exit_trade.orderStatus.status in _WORKING + ("Filled",)
             or exit_trade.isDone()
