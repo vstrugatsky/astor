@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
-from ib_async import IB
+from ib_async import IB, Position
 
 from astor.core.scanner import Scanner
 from astor.core.store import TriggerStore
@@ -333,11 +334,14 @@ def _print_setup_alert(a: SetupAlert, held: bool = False) -> None:
     )
 
 
-async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | None:
+async def resolve_open_trade(
+    ib: IB, symbol: str, account: str | None = None
+) -> tuple[float, float, str] | None:
     """Look up entry price and protective stop for an open position in
-    `symbol`, across every account this IBKR login can see. Returns
-    (entry, stop, account), or None if it can't be resolved unambiguously --
-    no position, more than one position, no single matching working stop
+    `symbol`, across every account this IBKR login can see, or only in
+    `account` if given. Returns (entry, stop, account), or None if it can't
+    be resolved unambiguously -- no position, more than one position (the
+    same symbol held in two accounts: pass `account`), no single matching working stop
     order, or a stop sitting the wrong side of the *market* for the
     position's direction (a stale or unrelated order rather than this
     trade's protective stop).
@@ -358,7 +362,9 @@ async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | 
     by hand in TWS/Gateway, which is how this trader's stops are placed.
     """
     positions = [
-        p for p in ib.positions() if p.contract.symbol == symbol and p.position != 0
+        p
+        for p in held_positions(ib, symbol)
+        if account is None or p.account == account
     ]
     if len(positions) != 1:
         return None
@@ -366,13 +372,6 @@ async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | 
     entry = pos.avgCost
     long = pos.position > 0
     exit_side = "SELL" if long else "BUY"
-
-    # Market price per position, for the side check below. Comes from the
-    # account-update feed, which ib_async keeps live-synced; a position
-    # missing from it simply skips the check rather than failing closed.
-    market = {
-        i.contract.symbol: i.marketPrice for i in ib.portfolio() if i.position and i.marketPrice
-    }
 
     open_trades = await ib.reqAllOpenOrdersAsync()
     stops = [
@@ -386,10 +385,40 @@ async def resolve_open_trade(ib: IB, symbol: str) -> tuple[float, float, str] | 
     if len(stops) != 1:
         return None
     stop = stops[0].auxPrice
-    mkt = market.get(symbol)
+    mkt = await _position_mark(ib, pos)
     if mkt and ((stop > mkt) if long else (stop < mkt)):
         return None
     return entry, stop, pos.account
+
+
+def held_positions(ib: IB, symbol: str) -> list[Position]:
+    """Every open position in `symbol`, one per account holding it."""
+    return [p for p in ib.positions() if p.contract.symbol == symbol and p.position != 0]
+
+
+async def _position_mark(ib: IB, pos: Position, timeout: float = 3.0) -> float | None:
+    """IB's own mark for `pos` -- the market price its portfolio valuation
+    uses -- or None if it doesn't arrive within `timeout`, which skips the
+    side check rather than failing closed.
+
+    This used to read `ib.portfolio()`, which is empty on a login with more
+    than one account: ib_async only subscribes to portfolio updates itself
+    when there is exactly one, and subscribing explicitly never resolves and
+    never delivers against this gateway, with or without an account
+    (verified 2026-10-10). PnLSingle carries the same mark as the position's
+    market value and works per account. A ticker snapshot doesn't serve:
+    outside RTH it has no last price.
+    """
+    pnl = ib.reqPnLSingle(pos.account, "", pos.contract.conId)
+    try:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not math.isfinite(pnl.value):
+            if asyncio.get_running_loop().time() > deadline:
+                return None
+            await asyncio.sleep(0.1)
+        return pnl.value / pos.position
+    finally:
+        ib.cancelPnLSingle(pos.account, "", pos.contract.conId)
 
 
 class LiveDriver:
@@ -512,19 +541,27 @@ class LiveDriver:
         stop: float | None,
         run_id: str,
         store: TriggerStore,
+        account: str | None = None,
     ) -> str:
         """Start sell-rule tracking for a position in `symbol`. `entry` and
         `stop` are either both given (trusted as-is, no IBKR lookup -- the
         only path that works for an account this login can't see) or both
-        None, in which case both are resolved from IBKR.
+        None, in which case both are resolved from IBKR -- from `account`
+        only, if given, which is required when more than one account holds
+        `symbol`.
 
         Ensures `symbol` has a live bar subscription, same as `add_symbols`
         -- tracking needs the same 1-min closes a scanned symbol gets.
         """
-        account = None
         if entry is None and stop is None:
-            resolved = await resolve_open_trade(self.ib, symbol)
+            resolved = await resolve_open_trade(self.ib, symbol, account)
             if resolved is None:
+                holders = sorted(p.account for p in held_positions(self.ib, symbol))
+                if account is None and len(holders) > 1:
+                    return (
+                        f"{symbol} is held in more than one account "
+                        f"({', '.join(holders)}). Name one: 'track {symbol} ACCOUNT'."
+                    )
                 return (
                     f"Could not resolve a single open position + matching stop "
                     f"order for {symbol} from IBKR. Give both explicitly: "

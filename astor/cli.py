@@ -6,7 +6,8 @@
 
     uv run python -m astor.cli live --tickers-file watchlist.txt
         (then at the '> ' prompt: 'add TSLA,NVDA', 'remove TSLA',
-        'track NVDA' or 'track NVDA 137.50 130.10', 'untrack NVDA', 'quit')
+        'track NVDA', 'track NVDA 137.50 130.10' or
+        'track NVDA U14555356', 'untrack NVDA', 'quit')
 
     uv run python -m astor.cli warm-cache --tickers-file broad_watchlist.txt
         (run overnight via cron so a mid-session Live 'add' hits disk, not IBKR)
@@ -1061,7 +1062,7 @@ async def _live_console(
     print(
         f"Live scan running (session {driver.session}). "
         f"Tracking {driver.symbol_count()}/{cap or '∞'}. "
-        "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'track SYM [ENTRY STOP]', "
+        "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'track SYM [ENTRY STOP | ACCOUNT]', "
         "'untrack SYM', 'list', 'quit'."
     )
     while True:
@@ -1106,11 +1107,19 @@ async def _live_console(
         elif cmd == "track":
             parts = rest.split()
             if not parts:
-                print("Usage: track SYM [ENTRY STOP] -- give both prices, or neither for an IBKR lookup")
+                print("Usage: track SYM [ENTRY STOP | ACCOUNT] -- both prices, or neither for an IBKR lookup")
                 continue
             symbol = parts[0].upper().replace(".", " ")
+            entry = stop = account = None
             if len(parts) == 1:
-                entry = stop = None
+                pass
+            elif len(parts) == 2:
+                # IBKR account IDs are letters then digits (U14555356); a
+                # lone price would have been a half-given ENTRY STOP.
+                account = parts[1].upper()
+                if not account[0].isalpha():
+                    print("Usage: track SYM [ENTRY STOP | ACCOUNT] -- both prices, or neither for an IBKR lookup")
+                    continue
             elif len(parts) == 3:
                 try:
                     entry, stop = float(parts[1]), float(parts[2])
@@ -1118,14 +1127,14 @@ async def _live_console(
                     print("ENTRY and STOP must be numbers.")
                     continue
             else:
-                print("Usage: track SYM [ENTRY STOP] -- give both prices, or neither for an IBKR lookup")
+                print("Usage: track SYM [ENTRY STOP | ACCOUNT] -- both prices, or neither for an IBKR lookup")
                 continue
             if symbol not in driver.status()["live"] and symbol not in driver.status()["pending"]:
                 room = cap - driver.symbol_count() if cap else None
                 if room is not None and room < 1:
                     print(f"No room to track {symbol} (cap {cap}, currently {driver.symbol_count()}).")
                     continue
-            msg = await driver.track(scanner, symbol, entry, stop, run_id, store)
+            msg = await driver.track(scanner, symbol, entry, stop, run_id, store, account)
             print(f"  {msg}")
         elif cmd == "untrack":
             symbols = split_symbols(rest)
@@ -1152,14 +1161,15 @@ async def _live_console(
                 print(f"  sell-rule tracking ({len(driver.tracker.trades)}):")
                 for sym, trade in sorted(driver.tracker.trades.items()):
                     peak = f" peak {trade.peak:.2f}" if trade.peak is not None else ""
+                    where = f" [{trade.account}]" if trade.account else ""
                     print(
                         f"    {sym:<6} {trade.direction:<5} {trade.state:<8} "
-                        f"entry {trade.entry:.2f} stop {trade.stop:.2f} R {trade.r:.2f}{peak}"
+                        f"entry {trade.entry:.2f} stop {trade.stop:.2f} R {trade.r:.2f}{peak}{where}"
                     )
         else:
             print(
                 "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', "
-                "'track SYM [ENTRY STOP]', 'untrack SYM', 'list', 'quit'."
+                "'track SYM [ENTRY STOP | ACCOUNT]', 'untrack SYM', 'list', 'quit'."
             )
 
 
