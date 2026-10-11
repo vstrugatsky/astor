@@ -1398,6 +1398,46 @@ def test_reversal_long_basic() -> None:
     check("reclaim_pct aliases level_stop_pct", t.extras["reclaim_pct"], t.extras["level_stop_pct"])
 
 
+def _same_bar_long_bars(close: float) -> list[BarEvent]:
+    """_canonical_long_bars, but the extreme bar is also the reversal: it
+    opens at 94.2, flushes to the 93.0 extreme and closes at `close`."""
+    bars = _canonical_long_bars()[:4]
+    return bars + [bar(4, 94.2, 94.6, 93.0, close, 50_000, symbol="REV")]
+
+
+def test_reversal_fires_on_the_extreme_bar_itself() -> None:
+    # 93.0 -> 94.5 is 30% of the 5.0 leg, and the bar closed above its open
+    triggers = _feed(_rev_scanner(ReversalLong), _same_bar_long_bars(94.5))
+    check("fires on the extreme bar", len(triggers), 1)
+    t = triggers[0]
+    check("trigger_price", t.trigger_price, 94.5)
+    check("level_value is the new extreme", t.level_value, 93.0)
+    check("retrace_pct", t.extras["retrace_pct"], 30.0)
+    check("retrace_minutes", t.extras["retrace_minutes"], 0.0)
+    check("extreme_close is the bar before the reversal candle", t.extras["extreme_close"], 94.3)
+
+
+def test_reversal_same_bar_needs_a_close_against_its_open() -> None:
+    # Closes 94.1 -- 22% off the low, but below its 94.2 open
+    triggers = _feed(_rev_scanner(ReversalLong), _same_bar_long_bars(94.1))
+    check("no trigger", len(triggers), 0)
+
+
+def test_reversal_same_bar_needs_the_min_retrace() -> None:
+    # 94.3 open, 93.0 low, 93.4 close: green, but only 8% of the leg back
+    bars = _canonical_long_bars()[:4] + [bar(4, 93.3, 94.4, 93.0, 93.4, 50_000, symbol="REV")]
+    triggers = _feed(_rev_scanner(ReversalLong), bars)
+    check("no trigger", len(triggers), 0)
+
+
+def test_reversal_same_bar_short_mirrors_long() -> None:
+    bars = _canonical_short_bars()[:4] + [bar(4, 106.5, 107.7, 105.9, 106.0, 50_000, symbol="REV")]
+    triggers = _feed(_rev_scanner(ReversalShort), bars)
+    check("fires on the extreme bar", len(triggers), 1)
+    check("trigger_price", triggers[0].trigger_price, 106.0)
+    check("level_value", triggers[0].level_value, 107.7)
+
+
 def test_reversal_short_mirrors_long() -> None:
     sc = _rev_scanner(ReversalShort)
     triggers = _feed(sc, _canonical_short_bars())

@@ -849,7 +849,20 @@ class _ReversalBase(Setup):
             _trace(trace, bar, f"{what} -- leg={leg_size_now:.2f}")
             if push_active:
                 self._maybe_flag_capitulation(bar, levels, indicators, curve)
-            return None
+            # The extreme and the reversal can be one bar: price runs the
+            # leg's way in the first seconds and comes back hard in the
+            # last ones. Such a bar -- a fresh extreme on the same anchor,
+            # closing against its own open -- goes on to be judged as a
+            # candidate like any other, on the same thresholds (trader's
+            # call, 2026-10-11). Every other boundary move still only resets
+            # the leg: a new anchor is a new leg, not a reversal of one.
+            same_bar_reversal = (
+                extreme_moved and not anchor_moved and push_active and self._reverses_push(bar)
+            )
+            if not same_bar_reversal:
+                return None
+        else:
+            same_bar_reversal = False
 
         if not push_active:
             # Anchor hasn't been overtaken by a fresh extreme yet -- see
@@ -875,8 +888,10 @@ class _ReversalBase(Setup):
         # moves both the target and the stop. An order resting off the
         # first alert of a leg would be working the wrong levels minutes
         # later, which is the whole reason this repeats rather than
-        # announcing once per push.
-        self._maybe_flag_capitulation(bar, levels, indicators, curve)
+        # announcing once per push. A same-bar reversal already refreshed
+        # it above.
+        if not same_bar_reversal:
+            self._maybe_flag_capitulation(bar, levels, indicators, curve)
 
         if retrace_pct > self.max_retrace_pct:
             self._retrace_dead = True
