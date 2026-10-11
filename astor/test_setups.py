@@ -1417,6 +1417,17 @@ def test_reversal_fires_on_the_extreme_bar_itself() -> None:
     check("extreme_close is the bar before the reversal candle", t.extras["extreme_close"], 94.3)
 
 
+def test_reversal_same_bar_fire_keeps_its_alert() -> None:
+    # Triggers are not announced live, so the alert is the only place the
+    # new 93.0 stop shows up -- it must not be dropped for the trigger.
+    sc = _rev_scanner(ReversalLong)
+    for b in _same_bar_long_bars(94.5):
+        fired = sc.on_bar(b)
+        alerts = sc.pop_alerts()
+    check("fired on the last bar", len(fired), 1)
+    check("its alert kept", [a.stop for a in alerts], [93.0])
+
+
 def test_reversal_same_bar_needs_a_close_against_its_open() -> None:
     # Closes 94.1 -- 22% off the low, but below its 94.2 open
     triggers = _feed(_rev_scanner(ReversalLong), _same_bar_long_bars(94.1))

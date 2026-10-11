@@ -1041,8 +1041,12 @@ class _ReversalBase(Setup):
             return None
 
         # The trigger is the answer the alert was waiting for; do not send
-        # both for the same bar.
-        self._pending_capitulation_alert = None
+        # both for the same bar -- except on a same-bar reversal. Its alert
+        # carries the new extreme as the stop, which no earlier alert had,
+        # and with trigger notifications off (live.NOTIFY_TRIGGERS) it is
+        # the only word of that stop the trader gets.
+        if not same_bar_reversal:
+            self._pending_capitulation_alert = None
         self._alerted_levels = None
 
         legacy_condition = self._legacy_condition(levels, self._extreme, bar.close)
