@@ -48,6 +48,10 @@ FILL_REPORT_TIMEOUT = 120.0
 # giveback exit is not seconds-urgent; the price on a wide spread is.
 ADAPTIVE_PRIORITY = "Normal"
 
+# The 15:59 exit has about a minute before the close: a fill matters more
+# than the spread there.
+EOD_ADAPTIVE_PRIORITY = "Urgent"
+
 _WORKING = ("PreSubmitted", "Submitted")
 _CANCELLED = ("Cancelled", "ApiCancelled")
 
@@ -159,7 +163,7 @@ class TrailExecutor:
             extras,
         )
 
-    async def exit(self, trade: TrackedTrade) -> Outcome:
+    async def exit(self, trade: TrackedTrade, priority: str = ADAPTIVE_PRIORITY) -> Outcome:
         qty = abs(self._position_size(trade))
         if qty == 0:
             return Outcome(True, "no position left -- the stop likely filled first")
@@ -167,12 +171,12 @@ class TrailExecutor:
         if stop is None:
             return Outcome(False, f"NOT exited: {why}")
         action = "SELL" if trade.direction == "long" else "BUY"
-        extras = {"qty": qty, "stop_cancelled": stop.order.auxPrice, "priority": ADAPTIVE_PRIORITY}
+        extras = {"qty": qty, "stop_cancelled": stop.order.auxPrice, "priority": priority}
         if self.dry_run:
             return Outcome(
                 True,
                 f"{self._tag()}cancel stop {stop.order.auxPrice:.2f}, then "
-                f"{action} {qty:g} Adaptive market ({ADAPTIVE_PRIORITY})",
+                f"{action} {qty:g} Adaptive market ({priority})",
                 extras,
             )
 
@@ -193,7 +197,7 @@ class TrailExecutor:
             tif="DAY",
             account=trade.account or "",
             algoStrategy="Adaptive",
-            algoParams=[TagValue("adaptivePriority", ADAPTIVE_PRIORITY)],
+            algoParams=[TagValue("adaptivePriority", priority)],
         )
         # SMART whatever the stop was routed to: Adaptive is SMART-only, so a
         # stop directed at one exchange would otherwise get its exit refused.

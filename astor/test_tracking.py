@@ -202,6 +202,64 @@ def test_breakeven_price_rounds_away_from_a_loss() -> None:
     check("sub-dollar tick", breakeven_price(TrackedTrade("A", 0.51234, 0.45)), 0.5124)
 
 
+# -- trail: end of day ----------------------------------------------------
+# OPEN + 388 min is the 15:58 bar, the one ending at 15:59.
+
+
+def eod_bar(i: int = 388) -> tuple[datetime, datetime]:
+    return bar_time(i), bar_time(i + 1)
+
+
+def test_trail_eod_exits_under_2r() -> None:
+    tr = TrailTracker()
+    tr.track("NVDA", entry=100.0, stop=95.0)
+    tr.on_close("NVDA", 105.0, bar_time(0))  # breakeven
+    check("15:57 bar, no action", tr.on_close("NVDA", 109.0, *eod_bar(387)), None)
+    action = tr.on_close("NVDA", 109.0, *eod_bar())  # +1.8R at 15:59
+    assert action is not None and action.kind == "eod", action
+    check("done", tr.trades["NVDA"].state, "done")
+
+
+def test_trail_eod_exits_a_loser() -> None:
+    tr = TrailTracker()
+    tr.track("NVDA", entry=100.0, stop=95.0)
+    action = tr.on_close("NVDA", 98.0, *eod_bar())
+    assert action is not None and action.kind == "eod"
+
+
+def test_trail_eod_holds_at_2r_or_more() -> None:
+    tr = TrailTracker()
+    tr.track("NVDA", entry=100.0, stop=95.0)
+    tr.on_close("NVDA", 105.0, bar_time(0))
+    check("+2R at 15:59, held", tr.on_close("NVDA", 110.0, *eod_bar()), None)
+    check("still open", tr.trades["NVDA"].state, "armed")
+
+
+def test_trail_eod_beats_breakeven_on_the_same_bar() -> None:
+    tr = TrailTracker()
+    tr.track("NVDA", entry=100.0, stop=95.0)
+    action = tr.on_close("NVDA", 106.0, *eod_bar())  # first +1R close, at 15:59
+    assert action is not None and action.kind == "eod"
+
+
+def test_trail_eod_short_measures_gain_downward() -> None:
+    tr = TrailTracker()
+    tr.track("TSLA", entry=100.0, stop=105.0)
+    tr.on_close("TSLA", 95.0, bar_time(0))
+    check("short +2.2R held", tr.on_close("TSLA", 89.0, *eod_bar()), None)
+    tr2 = TrailTracker()
+    tr2.track("TSLA", entry=100.0, stop=105.0)
+    tr2.on_close("TSLA", 95.0, bar_time(0))
+    action = tr2.on_close("TSLA", 92.0, *eod_bar())  # +1.6R
+    assert action is not None and action.kind == "eod"
+
+
+def test_trail_eod_off_when_disabled() -> None:
+    tr = TrailTracker(eod_exit=None)
+    tr.track("NVDA", entry=100.0, stop=95.0)
+    check("no eod rule", tr.on_close("NVDA", 101.0, *eod_bar()), None)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

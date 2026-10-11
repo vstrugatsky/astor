@@ -30,7 +30,7 @@ from astor.core.tracking import (
     TrailTracker,
 )
 from astor.core.types import BarEvent, CapitulationAlert, SetupAlert, TouchAlert, Trigger
-from astor.drivers.orders import Outcome, TrailExecutor
+from astor.drivers.orders import EOD_ADAPTIVE_PRIORITY, Outcome, TrailExecutor
 from astor.drivers.replay import (
     ET,
     ReplayDriver,
@@ -262,6 +262,8 @@ def _format_trail_alert(action: TrailAction, trade: TrackedTrade, outcome: Outco
     so in red: it is the one line the trader has to act on."""
     if action.kind == "breakeven":
         why = f"+1R @ {action.close:.2f} (target {trade.target_1r:.2f})"
+    elif action.kind == "eod":
+        why = f"end-of-day: last close {action.close:.2f} is {trade.gain_r(action.close):+.2f}R, under 2R"
     else:
         assert trade.peak is not None
         why = (
@@ -723,6 +725,8 @@ class LiveDriver:
         try:
             if action.kind == "breakeven":
                 outcome = await self.executor.move_stop_to_breakeven(trade)
+            elif action.kind == "eod":
+                outcome = await self.executor.exit(trade, EOD_ADAPTIVE_PRIORITY)
             else:
                 outcome = await self.executor.exit(trade)
         except Exception as e:  # an exception here would otherwise vanish in a task
@@ -933,7 +937,9 @@ class LiveDriver:
                     store.commit()
                     _print_track_alert(track_alert, trade)
 
-                trail_action = self.trailer.on_close(symbol, bar_event.close, bar_event.start)
+                trail_action = self.trailer.on_close(
+                    symbol, bar_event.close, bar_event.start, bar_event.end
+                )
                 if trail_action is not None:
                     # Orders are awaited, and this callback is not async.
                     # The rule has already moved on (an exit marks the trade

@@ -19,7 +19,7 @@ nothing to convert.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 from typing import Literal
 
 State = Literal["watching", "armed", "done"]
@@ -61,6 +61,11 @@ class TrackedTrade:
 
     def is_favorable(self, close: float) -> bool:
         return close >= self.target_1r if self.direction == "long" else close <= self.target_1r
+
+    def gain_r(self, price: float) -> float:
+        """Open gain at `price` in R, negative when under water."""
+        move = price - self.entry if self.direction == "long" else self.entry - price
+        return move / self.r
 
     def more_favorable(self, a: float, b: float) -> float:
         return max(a, b) if self.direction == "long" else min(a, b)
@@ -117,7 +122,15 @@ class SellRuleTracker:
 
 # -- trail: the same trade, managed rather than announced -------------------
 
-TrailActionKind = Literal["breakeven", "exit"]
+TrailActionKind = Literal["breakeven", "exit", "eod"]
+
+# The end-of-day rule: a trailed trade still open at this time exits unless
+# it is up at least EOD_HOLD_R -- for days the trader can't get back to the
+# desk before the close. Checked on the bar *ending* at this time (the 15:58
+# bar), the last close available before it. Early-close days (13:00) are
+# not known here, so the rule does not fire on them.
+EOD_EXIT = time(15, 59)
+EOD_HOLD_R = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,8 +180,9 @@ class TrailTracker:
     Pure: says what should happen. Placing it is `astor.drivers.orders`.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, eod_exit: time | None = EOD_EXIT) -> None:
         self.trades: dict[str, TrackedTrade] = {}
+        self.eod_exit = eod_exit
 
     def track(
         self, symbol: str, entry: float, stop: float, account: str | None = None
@@ -180,12 +194,25 @@ class TrailTracker:
     def untrack(self, symbol: str) -> bool:
         return self.trades.pop(symbol, None) is not None
 
-    def on_close(self, symbol: str, close: float, bar_start: datetime) -> TrailAction | None:
+    def on_close(
+        self, symbol: str, close: float, bar_start: datetime, bar_end: datetime | None = None
+    ) -> TrailAction | None:
         trade = self.trades.get(symbol)
         if trade is None or trade.state == "done":
             return None
         assert trade.peak is not None
         trade.peak = trade.more_favorable(trade.peak, close)
+
+        # Ahead of breakeven: a trade reaching +1R on this bar still exits
+        # if it is under 2R -- there is no session left for the stop to work.
+        if (
+            self.eod_exit is not None
+            and bar_end is not None
+            and bar_end.time() >= self.eod_exit
+            and trade.gain_r(close) < EOD_HOLD_R
+        ):
+            trade.state = "done"
+            return TrailAction("eod", symbol, close, bar_start)
 
         if trade.state == "watching" and trade.is_favorable(close):
             trade.state = "armed"
