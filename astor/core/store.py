@@ -53,7 +53,7 @@ CREATE INDEX IF NOT EXISTS idx_triggers_symbol ON triggers(symbol, bar_start);
 CREATE TABLE IF NOT EXISTS alerts (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id        TEXT NOT NULL REFERENCES runs(run_id),
-    kind          TEXT NOT NULL,        -- 'capitulation' | 'breakeven' | 'sell'
+    kind          TEXT NOT NULL,        -- 'capitulation' | 'avwap_touch' | 'breakeven' | 'sell' | 'trail_breakeven' | 'trail_exit'
     symbol        TEXT NOT NULL,
     direction     TEXT NOT NULL,
     bar_start     TEXT NOT NULL,

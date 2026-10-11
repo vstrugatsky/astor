@@ -7,7 +7,8 @@
     uv run python -m astor.cli live --tickers-file watchlist.txt
         (then at the '> ' prompt: 'add TSLA,NVDA', 'remove TSLA',
         'track NVDA', 'track NVDA 137.50 130.10' or
-        'track NVDA U14555356', 'untrack NVDA', 'quit')
+        'track NVDA U14555356', 'trail NVDA', 'trail NVDA 137.50 130.10 U14555356',
+        'untrack NVDA', 'quit'; --dry-run-trail to have trail place no orders)
 
     uv run python -m astor.cli warm-cache --tickers-file broad_watchlist.txt
         (run overnight via cron so a mid-session Live 'add' hits disk, not IBKR)
@@ -986,9 +987,17 @@ async def cmd_live(args: argparse.Namespace) -> int:
     ib = IB()
     logger.info("Connecting to %s:%d...", args.host, args.port)
     await ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=15)
+    if args.client_id == 0:
+        # Binds hand-entered orders to this session, so `trail` can move and
+        # cancel the stops placed in IBKR Desktop (see astor.drivers.orders).
+        ib.reqAutoOpenOrders(True)
+    elif not args.dry_run_trail:
+        logger.warning(
+            "client ID %d is not 0: trail can't modify hand-entered stops", args.client_id
+        )
 
     try:
-        driver = LiveDriver(ib, Path(args.cache_dir), args.bar_size)
+        driver = LiveDriver(ib, Path(args.cache_dir), args.bar_size, args.dry_run_trail)
         run_id = f"{driver.session:%Y%m%d}-live-{uuid.uuid4().hex[:8]}"
         logger.info("Live session target: %s (run_id=%s)", driver.session, run_id)
 
@@ -1050,6 +1059,29 @@ async def cmd_live(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_trade_args(rest: str) -> tuple[str, float | None, float | None, str | None] | None:
+    """'SYM [ENTRY STOP] [ACCOUNT]' -> (symbol, entry, stop, account), or
+    None if malformed. Both prices or neither; IBKR account IDs are letters
+    then digits (U14555356), so a lone price is a half-given ENTRY STOP.
+    """
+    parts = rest.split()
+    if not parts:
+        return None
+    symbol = parts[0].upper().replace(".", " ")
+    args = parts[1:]
+    account = None
+    if args and args[-1][0].isalpha():
+        account = args.pop().upper()
+    if not args:
+        return symbol, None, None, account
+    if len(args) != 2:
+        return None
+    try:
+        return symbol, float(args[0]), float(args[1]), account
+    except ValueError:
+        return None
+
+
 async def _live_console(
     driver: LiveDriver,
     scanner: Scanner,
@@ -1065,8 +1097,8 @@ async def _live_console(
     print(
         f"Live scan running (session {driver.session}). "
         f"Tracking {driver.symbol_count()}/{cap or '∞'}. "
-        "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'track SYM [ENTRY STOP | ACCOUNT]', "
-        "'untrack SYM', 'list', 'quit'."
+        "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'track SYM [ENTRY STOP] [ACCOUNT]', "
+        "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrack SYM', 'list', 'quit'."
     )
     while True:
         try:
@@ -1107,37 +1139,19 @@ async def _live_console(
             for sym, status in results.items():
                 print(f"  {sym}: {status}")
             print(f"Tracking {driver.symbol_count()}/{cap or '∞'}")
-        elif cmd == "track":
-            parts = rest.split()
-            if not parts:
-                print("Usage: track SYM [ENTRY STOP | ACCOUNT] -- both prices, or neither for an IBKR lookup")
+        elif cmd in ("track", "trail"):
+            parsed = _parse_trade_args(rest)
+            if parsed is None:
+                print(f"Usage: {cmd} SYM [ENTRY STOP] [ACCOUNT] -- both prices, or neither for an IBKR lookup")
                 continue
-            symbol = parts[0].upper().replace(".", " ")
-            entry = stop = account = None
-            if len(parts) == 1:
-                pass
-            elif len(parts) == 2:
-                # IBKR account IDs are letters then digits (U14555356); a
-                # lone price would have been a half-given ENTRY STOP.
-                account = parts[1].upper()
-                if not account[0].isalpha():
-                    print("Usage: track SYM [ENTRY STOP | ACCOUNT] -- both prices, or neither for an IBKR lookup")
-                    continue
-            elif len(parts) == 3:
-                try:
-                    entry, stop = float(parts[1]), float(parts[2])
-                except ValueError:
-                    print("ENTRY and STOP must be numbers.")
-                    continue
-            else:
-                print("Usage: track SYM [ENTRY STOP | ACCOUNT] -- both prices, or neither for an IBKR lookup")
-                continue
+            symbol, entry, stop, account = parsed
             if symbol not in driver.status()["live"] and symbol not in driver.status()["pending"]:
                 room = cap - driver.symbol_count() if cap else None
                 if room is not None and room < 1:
-                    print(f"No room to track {symbol} (cap {cap}, currently {driver.symbol_count()}).")
+                    print(f"No room to {cmd} {symbol} (cap {cap}, currently {driver.symbol_count()}).")
                     continue
-            msg = await driver.track(scanner, symbol, entry, stop, run_id, store, account)
+            start = driver.track if cmd == "track" else driver.trail
+            msg = await start(scanner, symbol, entry, stop, run_id, store, account)
             print(f"  {msg}")
         elif cmd == "untrack":
             symbols = split_symbols(rest)
@@ -1145,7 +1159,7 @@ async def _live_console(
                 print("Usage: untrack SYM1,SYM2,...")
                 continue
             for sym in symbols:
-                removed = driver.tracker.untrack(sym)
+                removed = driver.untrack(sym)
                 print(f"  {sym}: {'untracked' if removed else 'not tracked'}")
         elif cmd in ("list", "status", "tickers"):
             tracked = driver.status()
@@ -1169,10 +1183,20 @@ async def _live_console(
                         f"    {sym:<6} {trade.direction:<5} {trade.state:<8} "
                         f"entry {trade.entry:.2f} stop {trade.stop:.2f} R {trade.r:.2f}{peak}{where}"
                     )
+            if driver.trailer.trades:
+                dry = ", dry run" if driver.executor.dry_run else ""
+                print(f"  trail ({len(driver.trailer.trades)}{dry}):")
+                for sym, trade in sorted(driver.trailer.trades.items()):
+                    print(
+                        f"    {sym:<6} {trade.direction:<5} {trade.state:<8} "
+                        f"entry {trade.entry:.2f} stop {trade.stop:.2f} R {trade.r:.2f}"
+                        f" peak {trade.peak:.2f} [{trade.account}]"
+                    )
         else:
             print(
                 "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', "
-                "'track SYM [ENTRY STOP | ACCOUNT]', 'untrack SYM', 'list', 'quit'."
+                "'track SYM [ENTRY STOP] [ACCOUNT]', 'trail SYM [ENTRY STOP] [ACCOUNT]', "
+                "'untrack SYM', 'list', 'quit'."
             )
 
 
@@ -1542,9 +1566,17 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument("--cache-dir", default="data/bars")
     lv.add_argument("--host", default="127.0.0.1")
     lv.add_argument("--port", type=int, default=4001)
-    # Different default from replay's so a live run and a replay backtest
-    # can point at the same IB Gateway/TWS at once without a clientId clash.
-    lv.add_argument("--client-id", type=int, default=22)
+    # 0, not a number of its own like every other command: client 0 is the
+    # one IBKR binds hand-entered orders to, and `trail` has to modify and
+    # cancel those stops. Still distinct from replay's, so a live run and a
+    # replay backtest can share one gateway.
+    lv.add_argument("--client-id", type=int, default=0)
+    lv.add_argument(
+        "--dry-run-trail",
+        action="store_true",
+        help="trail reads stops and positions but places, moves and cancels "
+        "nothing -- it prints what it would have done",
+    )
 
     ex = sub.add_parser(
         "explain",
