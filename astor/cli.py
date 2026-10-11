@@ -301,6 +301,47 @@ def report(scanner, fed, levels, bars, run_id, args) -> None:
     print(f"\nStored in {args.db}  (run_id={run_id})")
 
 
+def _alert_timeline(replay: list, received: list[dict]) -> list[dict]:
+    """Alert lines for `explain`'s timeline, in the same {time, text} shape
+    as the trace, flagged `alert` so they sort after the decision point of
+    the same bar.
+
+    A replay alert is matched to a live one by bar: same bar_start means
+    the trader got it, and when; one with no live match was not received
+    (live was not watching the symbol, or saw different data). A live alert
+    the replay does not reproduce is listed too -- IBKR revises intraday
+    volume after the fact, so live and a later replay can disagree, and live
+    is what was actually seen.
+    """
+    by_bar = {r["bar_start"]: r for r in received}
+    out = []
+
+    def ticket(target, stop, shares, rr) -> str:
+        t = f"{target:.2f}" if target is not None else "n/a"
+        rr_s = f" R:R {rr:.1f}" if rr is not None else ""
+        sh = f" {shares} sh" if shares is not None else ""
+        return f"target {t} stop {stop:.2f}{sh}{rr_s}"
+
+    for a in replay:
+        line = f"ALERT {ticket(a.target, a.stop, a.shares, a.rr)}"
+        got = by_bar.pop(a.bar_start, None)
+        if got is not None:
+            line += f"  <- RECEIVED {got['detection_ts']:%H:%M:%S}"
+        else:
+            line += f"  <- not received; would have come ~{a.bar_end:%H:%M:%S}"
+        out.append({"time": a.bar_start, "text": line, "alert": True})
+
+    for r in by_bar.values():
+        x = r["extras"]
+        line = (
+            f"ALERT {ticket(x.get('target'), x.get('stop'), x.get('level_stop_shares'), x.get('rr'))}"
+            f"  <- RECEIVED {r['detection_ts']:%H:%M:%S} (live only: the replay does not "
+            "reproduce it -- likely IBKR's revised volume)"
+        )
+        out.append({"time": r["bar_start"], "text": line, "alert": True})
+    return out
+
+
 async def cmd_explain(args: argparse.Namespace) -> int:
     """Why did (or didn't) one setup fire for one symbol on one day.
 
@@ -341,8 +382,20 @@ async def cmd_explain(args: argparse.Namespace) -> int:
 
     trace: dict[str, list[dict]] = {}
     fired = []
+    replay_alerts = []
     for b in bars_by_symbol.get(symbol, []):
         fired.extend(scanner.on_bar(b, trace=trace))
+        replay_alerts.extend(scanner.pop_alerts())
+
+    # What live actually sent, to set against what the replay says it would
+    # have. Read-only: explain never writes to the store.
+    alert_kind = "avwap_touch" if setup_cls.name.startswith("AVT-") else "capitulation"
+    store = TriggerStore(Path(args.db))
+    try:
+        received = store.live_alerts(symbol, session, alert_kind, setup_cls.direction)
+    finally:
+        store.close()
+    alert_lines = _alert_timeline(replay_alerts, received)
 
     print("\n" + "=" * 78)
     print(f"EXPLAIN {args.setup} {symbol} {session}")
@@ -371,7 +424,9 @@ async def cmd_explain(args: argparse.Namespace) -> int:
         f"(dropped zero-volume: {scanner.skipped_zero_volume})"
     )
 
-    lines = trace.get(setup_cls.name, [])
+    lines = sorted(
+        trace.get(setup_cls.name, []) + alert_lines, key=lambda e: (e["time"], e.get("alert", False))
+    )
     if not lines:
         print(
             f"\nNo decision points at all -- {args.setup} never even armed or "
@@ -382,7 +437,11 @@ async def cmd_explain(args: argparse.Namespace) -> int:
             "\nEach filter reads value/threshold; leg reads "
             "size (xADR/min xADR, percent move)."
         )
-        print(f"\n{len(lines)} decision point(s):")
+        n_alerts = sum(1 for e in lines if e.get("alert"))
+        print(
+            f"\n{len(lines) - n_alerts} decision point(s), {n_alerts} alert line(s) "
+            f"({len(received)} received live):"
+        )
         for entry in lines:
             print(f"  {entry['time']:%H:%M}  {entry['text']}")
 
@@ -1624,6 +1683,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ex.add_argument("--max-loss", type=float, default=100.0)
     _add_avt_args(ex)
+    ex.add_argument(
+        "--db", default="data/astor.db", help="Read only, for the alerts live actually sent"
+    )
     ex.add_argument("--cache-dir", default="data/bars")
     ex.add_argument("--host", default="127.0.0.1")
     ex.add_argument("--port", type=int, default=4001)

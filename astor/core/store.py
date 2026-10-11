@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from astor.core.types import Trigger
@@ -473,6 +473,28 @@ class TriggerStore:
                 json.dumps(extras, default=str),
             ),
         )
+
+    def live_alerts(self, symbol: str, session: date, kind: str, direction: str) -> list[dict]:
+        """Alerts a live run actually sent for `symbol` on `session`, oldest
+        first -- what the trader received, to set against what a replay
+        says would have been sent."""
+        rows = self.conn.execute(
+            "SELECT a.bar_start, a.detection_ts, a.price, a.extras_json, a.run_id"
+            " FROM alerts a JOIN runs r USING (run_id)"
+            " WHERE r.mode = 'live' AND a.symbol = ? AND a.kind = ? AND a.direction = ?"
+            " AND substr(a.bar_start, 1, 10) = ? ORDER BY a.bar_start, a.detection_ts",
+            (symbol, kind, direction, session.isoformat()),
+        ).fetchall()
+        return [
+            {
+                "bar_start": datetime.fromisoformat(b),
+                "detection_ts": datetime.fromisoformat(d),
+                "price": price,
+                "extras": json.loads(x),
+                "run_id": run_id,
+            }
+            for b, d, price, x, run_id in rows
+        ]
 
     def purge_runs(self, keep: str | None = None) -> int:
         """Delete stored runs in place, leaving the database file itself alone.
