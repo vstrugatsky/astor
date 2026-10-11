@@ -42,6 +42,9 @@ class TrackedTrade:
     state: State = "watching"
     peak: float | None = None
     armed_at: datetime | None = None
+    # trail only: when the end-of-day rule fires for this trade -- one
+    # minute before its own session's close (see TrailTracker.track)
+    eod_exit: time | None = None
 
     def __post_init__(self) -> None:
         if self.stop == self.entry:
@@ -124,11 +127,12 @@ class SellRuleTracker:
 
 TrailActionKind = Literal["breakeven", "exit", "eod"]
 
-# The end-of-day rule: a trailed trade still open at this time exits unless
-# it is up at least EOD_HOLD_R -- for days the trader can't get back to the
-# desk before the close. Checked on the bar *ending* at this time (the 15:58
-# bar), the last close available before it. Early-close days (13:00) are
-# not known here, so the rule does not fire on them.
+# The end-of-day rule: a trailed trade still open one minute before the
+# close exits unless it is up at least EOD_HOLD_R -- for days the trader
+# can't get back to the desk. Checked on the bar *ending* at that time (the
+# 15:58 bar on a normal day), the last close available before it. The close
+# comes from IBKR's schedule per trade, so an early close (13:00) moves the
+# exit to 12:59; EOD_EXIT is the fallback when the schedule can't be read.
 EOD_EXIT = time(15, 59)
 EOD_HOLD_R = 2.0
 
@@ -185,9 +189,18 @@ class TrailTracker:
         self.eod_exit = eod_exit
 
     def track(
-        self, symbol: str, entry: float, stop: float, account: str | None = None
+        self,
+        symbol: str,
+        entry: float,
+        stop: float,
+        account: str | None = None,
+        eod_exit: time | None = None,
     ) -> TrackedTrade:
-        trade = TrackedTrade(symbol, entry, stop, account, peak=entry)
+        """`eod_exit` is this trade's own cutoff, from its session's close;
+        None takes the tracker's default."""
+        trade = TrackedTrade(
+            symbol, entry, stop, account, peak=entry, eod_exit=eod_exit or self.eod_exit
+        )
         self.trades[symbol] = trade
         return trade
 
@@ -206,9 +219,9 @@ class TrailTracker:
         # Ahead of breakeven: a trade reaching +1R on this bar still exits
         # if it is under 2R -- there is no session left for the stop to work.
         if (
-            self.eod_exit is not None
+            trade.eod_exit is not None
             and bar_end is not None
-            and bar_end.time() >= self.eod_exit
+            and bar_end.time() >= trade.eod_exit
             and trade.gain_r(close) < EOD_HOLD_R
         ):
             trade.state = "done"

@@ -465,6 +465,10 @@ async def position_pnl(ib: IB, pos: Position, timeout: float = 3.0) -> PnLSingle
         ib.cancelPnLSingle(pos.account, "", pos.contract.conId)
 
 
+def _minute_before(session, close: time) -> time:
+    return (datetime.combine(session, close) - timedelta(minutes=1)).time()
+
+
 class LiveDriver:
     def __init__(
         self, ib: IB, cache_dir: Path, bar_size: str = "1 min", dry_run_trail: bool = False
@@ -705,13 +709,39 @@ class LiveDriver:
             )
 
         self.tracker.untrack(symbol)
-        trade = self.trailer.track(symbol, entry, stop, account)
+        close = await self._session_close(symbol)
+        eod_exit = _minute_before(self.session, close) if close else None
+        trade = self.trailer.track(symbol, entry, stop, account, eod_exit)
         mode = " (dry run -- no orders)" if self.executor.dry_run else ""
+        eod = f"exits at {trade.eod_exit:%H:%M} ET if under 2R"
+        if close is None:
+            eod += _accent(" (IBKR schedule unavailable -- assuming a 16:00 close)", _ANSI_RED)
         return (
             f"{_ANSI_BLACK}{_accent('TRAIL', _ANSI_BROWN)} {_bold(symbol)} "
             f"{trade.direction}: entry {entry:.2f} stop {stop:.2f} "
-            f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}) [{account}]{mode}{_ANSI_RESET}"
+            f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}) [{account}]; "
+            f"{eod}{mode}{_ANSI_RESET}"
         )
+
+    async def _session_close(self, symbol: str) -> time | None:
+        """Today's regular-hours close for `symbol`, from IBKR's own
+        schedule (ContractDetails.liquidHours) -- 13:00 on an early-close
+        day. None if it can't be read, or the session isn't on it.
+
+        Needs "Expose entire trading schedule to API" in the gateway's API
+        settings. The schedule runs about six days ahead (2026-10-11).
+        """
+        try:
+            contract = (await self._ref.qualify([symbol])).get(symbol)
+            if contract is None:
+                return None
+            details = await asyncio.wait_for(self.ib.reqContractDetailsAsync(contract), 10)
+            for s in details[0].liquidSessions() if details else []:
+                if s.start.astimezone(ET).date() == self.session:
+                    return s.end.astimezone(ET).time()
+        except Exception:
+            logger.exception("Could not read the trading schedule for %s", symbol)
+        return None
 
     def untrack(self, symbol: str) -> bool:
         """Stop `track` and `trail` alike -- the position goes back to the

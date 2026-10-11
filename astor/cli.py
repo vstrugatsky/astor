@@ -1190,7 +1190,7 @@ async def _live_console(
                     print(
                         f"    {sym:<6} {trade.direction:<5} {trade.state:<8} "
                         f"entry {trade.entry:.2f} stop {trade.stop:.2f} R {trade.r:.2f}"
-                        f" peak {trade.peak:.2f} [{trade.account}]"
+                        f" peak {trade.peak:.2f} eod {trade.eod_exit:%H:%M} [{trade.account}]"
                     )
         else:
             print(

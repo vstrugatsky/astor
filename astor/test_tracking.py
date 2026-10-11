@@ -260,6 +260,21 @@ def test_trail_eod_off_when_disabled() -> None:
     check("no eod rule", tr.on_close("NVDA", 101.0, *eod_bar()), None)
 
 
+def test_trail_eod_follows_an_early_close() -> None:
+    from datetime import time
+
+    tr = TrailTracker()
+    tr.track("NVDA", entry=100.0, stop=95.0, eod_exit=time(12, 59))  # 13:00 close
+    check("12:57 bar, no action", tr.on_close("NVDA", 101.0, *eod_bar(207)), None)
+    action = tr.on_close("NVDA", 101.0, *eod_bar(208))  # 12:58 bar, ends 12:59
+    assert action is not None and action.kind == "eod", action
+
+
+def test_trail_eod_default_is_1559() -> None:
+    tr = TrailTracker()
+    check("default cutoff", tr.track("NVDA", 100.0, 95.0).eod_exit.strftime("%H:%M"), "15:59")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
