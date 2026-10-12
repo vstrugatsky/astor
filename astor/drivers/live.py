@@ -15,11 +15,23 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
-from ib_async import IB, PnLSingle, Position
+from ib_async import IB, Contract, Order, PnLSingle, Position, Trade
 
+from astor.core.order_entry import (
+    CommandError,
+    EnterRequest,
+    StopRequest,
+    SymbolRequest,
+    entry_problems,
+    is_ira,
+    resolve_account,
+    stop_problems,
+    tranche_sizes,
+)
 from astor.core.scanner import Scanner
 from astor.core.store import TriggerStore
 from astor.core.tracking import (
@@ -29,8 +41,24 @@ from astor.core.tracking import (
     TrailAction,
     TrailTracker,
 )
-from astor.core.types import BarEvent, CapitulationAlert, SetupAlert, TouchAlert, Trigger
-from astor.drivers.orders import EOD_ADAPTIVE_PRIORITY, Outcome, TrailExecutor
+from astor.core.types import (
+    BarEvent,
+    CapitulationAlert,
+    SetupAlert,
+    TouchAlert,
+    Trigger,
+)
+from astor.drivers.orders import (
+    EOD_ADAPTIVE_PRIORITY,
+    OrderDesk,
+    Outcome,
+    TrailExecutor,
+    describe_order,
+    entry_orders,
+    exit_order,
+    protective_stops,
+    working_orders,
+)
 from astor.drivers.replay import (
     ET,
     ReplayDriver,
@@ -278,6 +306,28 @@ def _print_trail_notice(symbol: str, text: str) -> None:
     _print_alert(f"{_trail_header(symbol)} {text}")
 
 
+def _order_line(symbol: str, outcome: Outcome) -> str:
+    stamp = f"[{datetime.now(ET):%H:%M:%S} ET]"
+    done = outcome.text if outcome.ok else _accent(outcome.text, _ANSI_RED)
+    return f"{stamp} {_accent('ORDER', _ANSI_BROWN)} {_symbol(symbol)} {done}"
+
+
+def _print_order_notice(symbol: str, text: str) -> None:
+    _print_alert(_order_line(symbol, Outcome(True, text)))
+
+
+@dataclass
+class EntryTicket:
+    """An `enter` checked and built, waiting on the trader's go-ahead."""
+
+    req: EnterRequest
+    account: str
+    contract: Contract
+    parent: Order
+    child: Order | None
+    summary: str
+
+
 # How much worse a fill has to be before the position shrinks by a whole
 # share. Walked in order until one of them costs at least one share, so a
 # $3 stock with a 15c stop reports in cents and a $700 one reports in
@@ -488,6 +538,10 @@ class LiveDriver:
         self.tracker = SellRuleTracker()
         self.trailer = TrailTracker()
         self.executor = TrailExecutor(ib, dry_run_trail, _print_trail_notice)
+        # The console's enter/stop/cancel/exit. Same dry-run switch as trail:
+        # a session that shouldn't place trail's orders shouldn't place these.
+        self.desk = OrderDesk(ib, dry_run_trail, _print_order_notice)
+        self._entry_tasks: set[asyncio.Task] = set()
         self._trail_tasks: set[asyncio.Task] = set()
 
     @property
@@ -786,6 +840,281 @@ class LiveDriver:
         )
         store.commit()
         _print_alert(_format_trail_alert(action, trade, outcome))
+
+    # -- order commands: enter / stop / cancel / exit -----------------------
+
+    async def _contract(self, symbol: str) -> Contract | None:
+        return (await self._ref.qualify([symbol])).get(symbol)
+
+    async def _market_price(self, contract: Contract) -> float | None:
+        """The current price for the side checks: last if it's inside the
+        quote, else the midpoint. None when neither arrives -- the checks
+        that need it are then skipped rather than blocking the order."""
+        try:
+            [t] = await asyncio.wait_for(self.ib.reqTickersAsync(contract), 5)
+        except Exception:
+            logger.exception("No market snapshot for %s", contract.symbol)
+            return None
+        for p in (t.marketPrice(), t.last, t.midpoint()):
+            if p is not None and math.isfinite(p) and p > 0:
+                return p
+        return None
+
+    async def _in_rth(self, symbol: str) -> bool:
+        now = datetime.now(ET)
+        if now.date() != self.session:
+            return False
+        close = await self._session_close(symbol) or time(16, 0)
+        return RTH_OPEN <= now.time() < close
+
+    def _held(self, symbol: str, account: str) -> float:
+        return sum(p.position for p in held_positions(self.ib, symbol) if p.account == account)
+
+    def _account_for(self, token: str | None, symbol: str, open_trades: list[Trade]) -> str:
+        """The account a stop/cancel/exit is about: the one named, else the
+        one account holding `symbol` or with orders working in it."""
+        managed = self.ib.managedAccounts()
+        if token is not None:
+            return resolve_account(token, managed)
+        involved = {p.account for p in held_positions(self.ib, symbol)} | {
+            a for a in managed if working_orders(open_trades, symbol, a)
+        }
+        if len(involved) != 1:
+            raise CommandError(
+                f"{symbol}: nothing held or working in any account" if not involved
+                else f"{symbol} is in {', '.join(sorted(involved))} -- name one (ira/reg/ID)"
+            )
+        return involved.pop()
+
+    def _unbound(self, trades: list[Trade]) -> str | None:
+        if self.desk.dry_run or all(t.order.orderId != 0 for t in trades):
+            return None
+        return "an order is not bound to this session (connect as client ID 0)"
+
+    def _record_order(
+        self, store: TriggerStore, run_id: str, kind: str, symbol: str,
+        direction: str, price: float, outcome: Outcome, extras: dict,
+    ) -> None:
+        now = datetime.now(ET)
+        store.record_alert(
+            run_id, kind, symbol, direction, now, price, now,
+            extras | {"dry_run": self.desk.dry_run, "ok": outcome.ok, "result": outcome.text}
+            | outcome.extras,
+        )
+        store.commit()
+
+    async def prepare_entry(self, req: EnterRequest) -> EntryTicket | str:
+        """Check an `enter` and build its orders, without sending them.
+        Returns the ticket to confirm, or why it can't be sent."""
+        managed = self.ib.managedAccounts()
+        try:
+            account = resolve_account(
+                req.account or ("ira" if req.direction == "long" else "reg"), managed
+            )
+        except CommandError as e:
+            return str(e)
+        if req.direction == "short" and is_ira(account):
+            return f"{account} is the IRA -- no shorts there. Use 'reg'."
+        contract = await self._contract(req.symbol)
+        if contract is None:
+            return f"IBKR doesn't know {req.symbol}."
+        in_rth = await self._in_rth(req.symbol)
+        if req.order_type == "ALG" and not in_rth:
+            return "Adaptive is regular-hours only; outside them use lmt or stp."
+        market = await self._market_price(contract)
+        held = self._held(req.symbol, account)
+        problems = entry_problems(req, market, held)
+        if problems:
+            return "NOT sent: " + "; ".join(problems)
+
+        parent, child = entry_orders(req, account)
+        notes = []
+        if market is None:
+            notes.append("no market price -- side checks skipped")
+        if held:
+            notes.append(f"adds to {abs(held):g} held")
+        if not in_rth:
+            notes.append("queued for the open" if req.order_type == "MKT" else "works from the open")
+        ref = req.price or market
+        size = f", ~${req.qty * ref:,.0f}" if ref else ""
+        stop = (
+            f", stop {child.auxPrice:.2f} GTC (risk ${req.qty * abs(ref - child.auxPrice):,.0f})"
+            if child is not None and ref else
+            f", stop {child.auxPrice:.2f} GTC" if child is not None else ", NO stop"
+        )
+        mkt = f"  [market {market:.2f}]" if market is not None else ""
+        summary = (
+            f"{_bold(req.symbol)} {req.direction} {describe_order(parent)}{stop}{size}"
+            f"  [{account}]{mkt}" + (f"  ({'; '.join(notes)})" if notes else "")
+        )
+        return EntryTicket(req, account, contract, parent, child, summary)
+
+    async def send_entry(
+        self, ticket: EntryTicket, scanner: Scanner, run_id: str, store: TriggerStore
+    ) -> str:
+        req = ticket.req
+        outcome, pt, ct = await self.desk.enter(ticket.contract, ticket.parent, ticket.child)
+        self._record_order(
+            store, run_id, "order_enter", req.symbol, req.direction, req.price or 0.0, outcome,
+            {"account": ticket.account, "qty": req.qty, "order_type": req.order_type,
+             "price": req.price, "stop": req.stop},
+        )
+        if pt is not None:
+            task = asyncio.create_task(self._watch_entry(ticket, pt, ct, scanner, run_id, store))
+            self._entry_tasks.add(task)
+            task.add_done_callback(self._entry_tasks.discard)
+        return _order_line(req.symbol, outcome)
+
+    async def _watch_entry(
+        self, ticket: EntryTicket, pt: Trade, ct: Trade | None,
+        scanner: Scanner, run_id: str, store: TriggerStore,
+    ) -> None:
+        """Wait out the entry; on a fill with a stop, start `track` on it --
+        entry at the fill, R to wherever the stop is by then. Never `trail`:
+        that stays the trader's call."""
+        sym = ticket.req.symbol
+        try:
+            while not pt.isDone():
+                await asyncio.sleep(0.5)
+            s = pt.orderStatus
+            if s.status != "Filled":
+                part = f" after {s.filled:g} filled -- not tracked" if s.filled else ""
+                _print_order_notice(sym, f"entry {s.status.lower()}{part}")
+                return
+            fill = s.avgFillPrice
+            self._record_order(
+                store, run_id, "order_fill", sym, ticket.req.direction, fill, Outcome(True, "filled"),
+                {"account": ticket.account, "qty": s.filled},
+            )
+            head = f"entry filled: {s.filled:g} @ {fill:.4f}"
+            stop = ct.order.auxPrice if ct is not None and ct.orderStatus.status in ("PreSubmitted", "Submitted") else None
+            if stop is None:
+                _print_order_notice(sym, f"{head}; no working stop -- not tracked")
+                return
+            if sym in self.tracker.trades or sym in self.trailer.trades:
+                _print_order_notice(sym, f"{head}; already tracked/trailed -- left as is")
+                return
+            long = ticket.req.direction == "long"
+            if (stop >= fill) if long else (stop <= fill):
+                _print_order_notice(sym, f"{head}; stop {stop:.2f} is past the fill -- not tracked")
+                return
+            msg = await self.track(scanner, sym, fill, stop, run_id, store, ticket.account)
+            _print_order_notice(sym, f"{head}; {msg}")
+        except Exception as e:
+            logger.exception("watching the %s entry failed", sym)
+            _print_order_notice(sym, f"lost track of the entry ({e!r}) -- CHECK ORDERS")
+
+    async def set_stop(self, req: StopRequest, run_id: str, store: TriggerStore) -> str:
+        """Make the position's protective stops exactly what `req` says --
+        one price, or tranches. Before the entry fills, its attached stop
+        can be moved, but not split."""
+        sym = req.symbol
+        open_trades = await self.ib.reqAllOpenOrdersAsync()
+        try:
+            account = self._account_for(req.account, sym, open_trades)
+        except CommandError as e:
+            return str(e)
+        working = working_orders(open_trades, sym, account)
+        held = self._held(sym, account)
+        prices = [p for _, p in req.tranches]
+        if held:
+            long = held > 0
+            exit_side = "SELL" if long else "BUY"
+            stops = protective_stops(working, exit_side)
+            try:
+                sizes = tranche_sizes([p for p, _ in req.tranches], int(abs(held)))
+            except CommandError as e:
+                return f"{sym}: {e}"
+            tranches = list(zip(sizes, prices, strict=True))
+        else:
+            ids = {t.order.orderId for t in working if t.order.orderId}
+            stops = [t for t in working if t.order.parentId in ids and t.order.orderType == "STP"]
+            if not stops:
+                return f"No {sym} position, and no pending entry with a stop, in {account}."
+            if len(req.tranches) != 1 or len(stops) != 1:
+                return f"{sym} isn't filled yet: its stop can be moved, but split only once held."
+            exit_side = stops[0].order.action
+            long = exit_side == "SELL"
+            tranches = [(stops[0].order.totalQuantity, prices[0])]
+        if why := self._unbound(stops):
+            return why
+        contract = stops[0].contract if stops else await self._contract(sym)
+        if contract is None:
+            return f"IBKR doesn't know {sym}."
+        problems = stop_problems(prices, long, await self._market_price(contract))
+        if problems:
+            return "NOT changed: " + "; ".join(problems)
+        outcome = await self.desk.set_stops(contract, account, exit_side, stops, tranches)
+        self._record_order(
+            store, run_id, "order_stop", sym, "long" if long else "short", prices[0], outcome,
+            {"account": account, "tranches": tranches},
+        )
+        return _order_line(sym, outcome)
+
+    async def cancel(self, req: SymbolRequest, run_id: str, store: TriggerStore) -> str:
+        """Cancel `symbol`'s working entries -- everything but the stops
+        protecting what's held. An entry's attached stop goes with it."""
+        sym = req.symbol
+        open_trades = await self.ib.reqAllOpenOrdersAsync()
+        try:
+            account = self._account_for(req.account, sym, open_trades)
+        except CommandError as e:
+            return str(e)
+        working = working_orders(open_trades, sym, account)
+        held = self._held(sym, account)
+        keep = protective_stops(working, "SELL" if held > 0 else "BUY") if held else []
+        targets = [t for t in working if t not in keep]
+        ids = {t.order.orderId for t in targets if t.order.orderId}
+        targets = [t for t in targets if t.order.parentId not in ids]
+        if not targets:
+            return f"Nothing to cancel for {sym} in {account}" + (
+                f" -- only the stop on {abs(held):g} held ('exit {sym}' to close it)." if keep else "."
+            )
+        if why := self._unbound(targets):
+            return why
+        outcome = await self.desk.cancel(targets)
+        self._record_order(
+            store, run_id, "order_cancel", sym, "", 0.0, outcome,
+            {"account": account, "orders": [describe_order(t.order) for t in targets]},
+        )
+        return _order_line(sym, outcome)
+
+    async def exit_position(self, req: SymbolRequest, run_id: str, store: TriggerStore) -> str:
+        """Close the whole position: cancel its stops, then send the exit.
+        Ends any track/trail on the symbol once the exit is in."""
+        sym = req.symbol
+        open_trades = await self.ib.reqAllOpenOrdersAsync()
+        try:
+            account = self._account_for(req.account, sym, open_trades)
+        except CommandError as e:
+            return str(e)
+        held = self._held(sym, account)
+        if not held:
+            return f"No {sym} position in {account}."
+        if req.order_type != "LMT" and not await self._in_rth(sym):
+            return f"Outside regular hours only an LMT exit works: 'exit {sym} lmt PRICE'."
+        long = held > 0
+        working = working_orders(open_trades, sym, account)
+        stops = protective_stops(working, "SELL" if long else "BUY")
+        if why := self._unbound(stops):
+            return why
+        contract = stops[0].contract if stops else await self._contract(sym)
+        if contract is None:
+            return f"IBKR doesn't know {sym}."
+        order = exit_order(
+            "SELL" if long else "BUY", abs(held), account, req.order_type, req.price
+        )
+        outcome = await self.desk.exit(sym, contract, stops, order)
+        if outcome.ok and not self.desk.dry_run and self.untrack(sym):
+            outcome.text += "; tracking ended"
+        others = [t for t in working if t not in stops]
+        if others:
+            outcome.text += f"; {len(others)} other order(s) still working -- 'cancel {sym}'"
+        self._record_order(
+            store, run_id, "order_exit", sym, "long" if long else "short", req.price or 0.0,
+            outcome, {"account": account},
+        )
+        return _order_line(sym, outcome)
 
     # -- open transition --------------------------------------------------
 

@@ -9,6 +9,9 @@
         'track NVDA', 'track NVDA 137.50 130.10' or
         'track NVDA U14555356', 'trail NVDA', 'trail NVDA 137.50 130.10 U14555356',
         'untrack NVDA', 'quit'; --dry-run-trail to have trail place no orders)
+        orders: 'enter SPCX short 20 stp 170.10 stop 172.01', 'stop SPCX 170.10',
+        'stop SPCX 1/2 168.05 1/2 170.01', 'cancel SPCX', 'exit SPCX [lmt 168.20]'
+        (--dry-run-trail covers these too)
 
     uv run python -m astor.cli warm-cache --tickers-file broad_watchlist.txt
         (run overnight via cron so a mid-session Live 'add' hits disk, not IBKR)
@@ -41,6 +44,13 @@ from pathlib import Path
 from ib_async import IB
 
 from astor.core.indicators import SessionIndicators, compute_interval_rvol, compute_rvol
+from astor.core.order_entry import (
+    CommandError,
+    parse_cancel,
+    parse_enter,
+    parse_exit,
+    parse_stop,
+)
 from astor.core.scanner import Scanner
 from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME, rev_rvol_threshold
 from astor.core.store import TriggerStore
@@ -1118,6 +1128,23 @@ async def cmd_live(args: argparse.Namespace) -> int:
     return 0
 
 
+_CONSOLE_COMMANDS = (
+    "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'track SYM [ENTRY STOP] [ACCOUNT]', "
+    "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrack SYM', 'list', 'quit'.\n"
+    "Orders ([ACCOUNT] = ira/reg/ID): "
+    "'enter SYM [ACCOUNT] l|s QTY mkt|alg|lmt P|stp P [stop P]', "
+    "'stop SYM [ACCOUNT] P' or 'stop SYM 1/2 P1 1/2 P2', "
+    "'cancel SYM [ACCOUNT]', 'exit SYM [ACCOUNT] [alg|mkt|lmt P]'."
+)
+
+_ORDER_PARSERS = {
+    "enter": parse_enter,
+    "stop": parse_stop,
+    "cancel": parse_cancel,
+    "exit": parse_exit,
+}
+
+
 def _parse_trade_args(rest: str) -> tuple[str, float | None, float | None, str | None] | None:
     """'SYM [ENTRY STOP] [ACCOUNT]' -> (symbol, entry, stop, account), or
     None if malformed. Both prices or neither; IBKR account IDs are letters
@@ -1156,8 +1183,7 @@ async def _live_console(
     print(
         f"Live scan running (session {driver.session}). "
         f"Tracking {driver.symbol_count()}/{cap or '∞'}. "
-        "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'track SYM [ENTRY STOP] [ACCOUNT]', "
-        "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrack SYM', 'list', 'quit'."
+        + _CONSOLE_COMMANDS
     )
     while True:
         try:
@@ -1170,8 +1196,35 @@ async def _live_console(
         cmd, _, rest = line.partition(" ")
         cmd = cmd.lower()
 
-        if cmd in ("quit", "exit"):
+        # 'exit' closes a position now, so only 'quit' leaves -- a bare
+        # 'exit' typed out of habit must not take the session down with it.
+        if cmd == "quit":
             break
+
+        if cmd in ("enter", "stop", "cancel", "exit"):
+            try:
+                req = _ORDER_PARSERS[cmd](rest)
+            except CommandError as e:
+                print(f"  {e}")
+                continue
+            if cmd == "enter":
+                ticket = await driver.prepare_entry(req)
+                if isinstance(ticket, str):
+                    print(f"  {ticket}")
+                    continue
+                print(f"  {ticket.summary}")
+                answer = await loop.run_in_executor(None, input, "  send? [Y/n] ")
+                if answer.strip().lower() not in ("", "y", "yes"):
+                    print("  not sent")
+                    continue
+                print(f"  {await driver.send_entry(ticket, scanner, run_id, store)}")
+            elif cmd == "stop":
+                print(f"  {await driver.set_stop(req, run_id, store)}")
+            elif cmd == "cancel":
+                print(f"  {await driver.cancel(req, run_id, store)}")
+            else:
+                print(f"  {await driver.exit_position(req, run_id, store)}")
+            continue
 
         if cmd == "add":
             symbols = split_symbols(rest)
@@ -1252,11 +1305,7 @@ async def _live_console(
                         f" peak {trade.peak:.2f} eod {trade.eod_exit:%H:%M} [{trade.account}]"
                     )
         else:
-            print(
-                "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', "
-                "'track SYM [ENTRY STOP] [ACCOUNT]', 'trail SYM [ENTRY STOP] [ACCOUNT]', "
-                "'untrack SYM', 'list', 'quit'."
-            )
+            print(_CONSOLE_COMMANDS)
 
 
 def _add_avt_args(p) -> None:

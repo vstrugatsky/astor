@@ -1,6 +1,8 @@
-"""Order placement for `trail`: moving a stop to breakeven, and exiting.
+"""Order placement: `trail` moving stops to breakeven and exiting, and the
+console's own order commands -- `enter`, `stop`, `cancel`, `exit`. The one
+place that talks to IBKR orders.
 
-Two things make this work against stops the trader enters by hand, both
+Two things make this work against orders the trader enters by hand, both
 verified against the live gateway on 2026-10-11:
 
   * The session must connect as client ID 0 and call reqAutoOpenOrders(True).
@@ -11,17 +13,20 @@ verified against the live gateway on 2026-10-11:
     the order back onto the tracked one, so its auxPrice only changes when
     IBKR confirms -- mutating it in place would "confirm" instantly.
 
-Exit = cancel the stop, wait for IBKR to confirm the cancel, then send the
+Exit = cancel the stops, wait for IBKR to confirm the cancels, then send the
 exit. The same in both accounts: in the IRA a working SELL stop plus a SELL
 exit reads to IBKR as a possible short sale and is refused; in the regular
 account both could fill in a fast move and leave an unintended short. The
 position is unprotected only between the cancel confirming and the exit
 arriving, well under a second when tested.
 
-The exit is IBKR's Adaptive algo on a market order: guaranteed to fill, but
-it works the order inside the spread first rather than taking the far side
-at once -- the point on wide-spread names. Adaptive is regular-hours only,
-which is fine: trail acts on RTH 1-min closes only.
+A position's protective stop may be several orders -- `stop SYM 1/2 P1 1/2 P2`
+splits it into tranches -- so everything here works on the list of them.
+
+The trail exit is IBKR's Adaptive algo on a market order: guaranteed to fill,
+but it works the order inside the spread first rather than taking the far
+side at once -- the point on wide-spread names. Adaptive is regular-hours
+only, which is fine: trail acts on RTH 1-min closes only.
 """
 
 from __future__ import annotations
@@ -32,20 +37,22 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ib_async import IB, Order, TagValue, Trade
+from ib_async import IB, Contract, Order, TagValue, Trade
 
+from astor.core.order_entry import EnterRequest
 from astor.core.tracking import TrackedTrade
 
 # How long IBKR gets to confirm a modify, a cancel or a new order before it
 # counts as failed. Each took under a second against the gateway.
 CONFIRM_TIMEOUT = 10.0
 
-# How long an Adaptive exit gets to fill before trail says it is still
-# working. Not a deadline on the order -- it stays working either way.
+# How long an exit gets to fill before it is reported as still working.
+# Not a deadline on the order -- it stays working either way.
 FILL_REPORT_TIMEOUT = 120.0
 
 # Normal works the order inside the spread for longer than Urgent does. A
-# giveback exit is not seconds-urgent; the price on a wide spread is.
+# giveback exit is not seconds-urgent; the price on a wide spread is. An
+# `alg` entry or exit typed at the console gets the same.
 ADAPTIVE_PRIORITY = "Normal"
 
 # The 15:59 exit has about a minute before the close: a fill matters more
@@ -94,127 +101,214 @@ def _errors_since(trade: Trade, n: int) -> list[str]:
     return [f"{e.errorCode} {e.message}" for e in trade.log[n:] if e.errorCode]
 
 
-class TrailExecutor:
+def working_orders(open_trades: list[Trade], symbol: str, account: str) -> list[Trade]:
+    return [
+        t
+        for t in open_trades
+        if t.contract.symbol == symbol
+        and t.order.account == account
+        and t.orderStatus.status in _WORKING
+    ]
+
+
+def protective_stops(working: list[Trade], exit_side: str) -> list[Trade]:
+    """The stops protecting a held position: working STPs on the exit side,
+    not counting one attached to an entry that hasn't filled yet -- that
+    one protects shares not yet held."""
+    parents = {t.order.orderId for t in working if t.order.orderId}
+    return [
+        t
+        for t in working
+        if t.order.orderType == "STP"
+        and t.order.action == exit_side
+        and t.order.parentId not in parents
+    ]
+
+
+def _fmt_prices(stops: list[Trade]) -> str:
+    return ", ".join(f"{t.order.totalQuantity:g}@{t.order.auxPrice:.2f}" for t in stops)
+
+
+def entry_orders(req: EnterRequest, account: str) -> tuple[Order, Order | None]:
+    """The entry, DAY, and the stop loss attached to it, GTC. IBKR holds an
+    attached stop until the entry fills and cancels it with the entry."""
+    parent = Order(
+        action=req.action, totalQuantity=req.qty, tif="DAY", account=account
+    )
+    if req.order_type == "ALG":
+        parent.orderType = "MKT"
+        parent.algoStrategy = "Adaptive"
+        parent.algoParams = [TagValue("adaptivePriority", ADAPTIVE_PRIORITY)]
+    else:
+        parent.orderType = req.order_type
+    if req.order_type == "LMT":
+        parent.lmtPrice = req.price
+    if req.order_type == "STP":
+        parent.auxPrice = req.price
+    if req.stop is None:
+        return parent, None
+    child = Order(
+        action="SELL" if req.action == "BUY" else "BUY",
+        totalQuantity=req.qty,
+        orderType="STP",
+        auxPrice=req.stop,
+        tif="GTC",
+        account=account,
+    )
+    return parent, child
+
+
+def exit_order(
+    action: str, qty: float, account: str, order_type: str = "ALG",
+    price: float | None = None, priority: str = ADAPTIVE_PRIORITY,
+) -> Order:
+    """A DAY exit. An LMT exit is allowed outside regular hours -- the one
+    exit that can be, since MKT and Adaptive only work in them."""
+    order = Order(action=action, totalQuantity=qty, tif="DAY", account=account)
+    if order_type == "ALG":
+        order.orderType = "MKT"
+        order.algoStrategy = "Adaptive"
+        order.algoParams = [TagValue("adaptivePriority", priority)]
+    elif order_type == "LMT":
+        order.orderType = "LMT"
+        order.lmtPrice = price
+        order.outsideRth = True
+    else:
+        order.orderType = "MKT"
+    return order
+
+
+def describe_order(o: Order) -> str:
+    if o.algoStrategy == "Adaptive":
+        kind = f"Adaptive market ({o.algoParams[0].value})" if o.algoParams else "Adaptive market"
+    elif o.orderType == "LMT":
+        kind = f"LMT {o.lmtPrice:.2f}"
+    elif o.orderType == "STP":
+        kind = f"STP {o.auxPrice:.2f}"
+    else:
+        kind = o.orderType
+    return f"{o.action} {o.totalQuantity:g} {kind} {o.tif}"
+
+
+class _OrderBase:
     def __init__(self, ib: IB, dry_run: bool, notify: Callable[[str, str], None]):
         self.ib = ib
         self.dry_run = dry_run
-        # (symbol, text) -- for what happens after `exit` returns: the fill
+        # (symbol, text) -- for what happens after a call returns: the fill
         self.notify = notify
         self._tasks: set[asyncio.Task] = set()
 
     def _tag(self) -> str:
         return "[dry run] would " if self.dry_run else ""
 
-    async def _find_stop(self, trade: TrackedTrade) -> tuple[Trade | None, str]:
-        """The one working stop protecting this position, re-read from IBKR
-        every time -- the trader may have moved it by hand since the last
-        look. Same matching as `resolve_open_trade`."""
-        exit_side = "SELL" if trade.direction == "long" else "BUY"
-        stops = [
-            t
-            for t in await self.ib.reqAllOpenOrdersAsync()
-            if t.contract.symbol == trade.symbol
-            and t.order.account == trade.account
-            and t.order.orderType == "STP"
-            and t.order.action == exit_side
-            and t.orderStatus.status in _WORKING
-        ]
-        if len(stops) != 1:
-            return None, f"found {len(stops)} working {exit_side} stops, expected 1"
-        if not self.dry_run and stops[0].order.orderId == 0:
-            return None, "the stop is not bound to this session (connect as client ID 0)"
-        return stops[0], ""
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
-    def _position_size(self, trade: TrackedTrade) -> float:
-        return sum(
-            p.position
-            for p in self.ib.positions(trade.account or "")
-            if p.contract.symbol == trade.symbol
-        )
-
-    async def move_stop_to_breakeven(self, trade: TrackedTrade) -> Outcome:
-        stop, why = await self._find_stop(trade)
-        if stop is None:
-            return Outcome(False, f"stop NOT moved: {why}")
-        current = stop.order.auxPrice
-        be = breakeven_price(trade)
-        extras = {"stop_before": current, "breakeven": be}
-        # Never loosen: a stop the trader already raised past entry stays.
-        already = current >= be if trade.direction == "long" else current <= be
-        if already:
-            return Outcome(True, f"stop already at {current:.2f}, left alone", extras)
-        if self.dry_run:
-            return Outcome(True, f"{self._tag()}move stop {current:.2f} -> {be:.2f}", extras)
-
-        n = len(stop.log)
-        modified = copy.copy(stop.order)
-        modified.auxPrice = be
-        self.ib.placeOrder(stop.contract, modified)
-        ok = await _wait_for(
-            lambda: abs(stop.order.auxPrice - be) < 1e-9 or bool(_errors_since(stop, n))
-        )
-        errors = _errors_since(stop, n)
-        if ok and not errors:
-            return Outcome(True, f"stop moved {current:.2f} -> {be:.2f}", extras)
-        return Outcome(
-            False,
-            f"stop move to {be:.2f} NOT confirmed (still {stop.order.auxPrice:.2f})"
-            + (f": {'; '.join(errors)}" if errors else ""),
-            extras,
-        )
-
-    async def exit(self, trade: TrackedTrade, priority: str = ADAPTIVE_PRIORITY) -> Outcome:
-        qty = abs(self._position_size(trade))
-        if qty == 0:
-            return Outcome(True, "no position left -- the stop likely filled first")
-        stop, why = await self._find_stop(trade)
-        if stop is None:
-            return Outcome(False, f"NOT exited: {why}")
-        action = "SELL" if trade.direction == "long" else "BUY"
-        extras = {"qty": qty, "stop_cancelled": stop.order.auxPrice, "priority": priority}
-        if self.dry_run:
-            return Outcome(
-                True,
-                f"{self._tag()}cancel stop {stop.order.auxPrice:.2f}, then "
-                f"{action} {qty:g} Adaptive market ({priority})",
-                extras,
+    async def _modify(
+        self, t: Trade, price: float | None = None, qty: float | None = None
+    ) -> tuple[bool, str]:
+        """Modify a working order's stop price and/or size; True once IBKR
+        echoes both back."""
+        n = len(t.log)
+        m = copy.copy(t.order)
+        if price is not None:
+            m.auxPrice = price
+        if qty is not None:
+            m.totalQuantity = qty
+        self.ib.placeOrder(t.contract, m)
+        await _wait_for(
+            lambda: (
+                abs(t.order.auxPrice - m.auxPrice) < 1e-9
+                and t.order.totalQuantity == m.totalQuantity
             )
-
-        # 1. cancel the stop and wait for IBKR to say so
-        self.ib.cancelOrder(stop.order)
-        await _wait_for(lambda: stop.orderStatus.status in _CANCELLED + ("Filled",))
-        status = stop.orderStatus.status
-        if status == "Filled":
-            return Outcome(True, "the stop filled while being cancelled -- out", extras)
-        if status not in _CANCELLED:
-            return Outcome(False, f"stop cancel NOT confirmed (status {status}); exit not sent", extras)
-
-        # 2. the exit
-        order = Order(
-            action=action,
-            totalQuantity=qty,
-            orderType="MKT",
-            tif="DAY",
-            account=trade.account or "",
-            algoStrategy="Adaptive",
-            algoParams=[TagValue("adaptivePriority", priority)],
+            or bool(_errors_since(t, n))
         )
-        # SMART whatever the stop was routed to: Adaptive is SMART-only, so a
-        # stop directed at one exchange would otherwise get its exit refused.
-        contract = copy.copy(stop.contract)
+        errors = _errors_since(t, n)
+        done = abs(t.order.auxPrice - m.auxPrice) < 1e-9 and t.order.totalQuantity == m.totalQuantity
+        return done and not errors, "; ".join(errors)
+
+    async def _cancel(self, trades: list[Trade]) -> tuple[list[Trade], list[Trade], list[Trade]]:
+        """Cancel `trades` and wait for IBKR's answer on each. Returns
+        (cancelled, filled first, unconfirmed)."""
+        for t in trades:
+            self.ib.cancelOrder(t.order)
+        await _wait_for(
+            lambda: all(t.orderStatus.status in _CANCELLED + ("Filled",) for t in trades)
+        )
+        cancelled = [t for t in trades if t.orderStatus.status in _CANCELLED]
+        filled = [t for t in trades if t.orderStatus.status == "Filled"]
+        stuck = [t for t in trades if t not in cancelled and t not in filled]
+        return cancelled, filled, stuck
+
+    async def _place_stop(self, contract: Contract, old: Order, qty: float, price: float) -> Trade:
+        new = Order(
+            action=old.action,
+            totalQuantity=qty,
+            orderType="STP",
+            auxPrice=price,
+            tif=old.tif or "GTC",
+            outsideRth=old.outsideRth,
+            account=old.account,
+        )
+        return self.ib.placeOrder(contract, new)
+
+    async def _restore(self, stops: list[Trade]) -> bool:
+        placed = [
+            await self._place_stop(t.contract, t.order, t.order.totalQuantity, t.order.auxPrice)
+            for t in stops
+        ]
+        return await _wait_for(lambda: all(t.orderStatus.status in _WORKING for t in placed))
+
+    async def _flatten(
+        self, symbol: str, stops: list[Trade], contract: Contract, order: Order, extras: dict
+    ) -> Outcome:
+        """Cancel `stops`, then send `order`. A refused exit puts the stops
+        back; an unanswered one doesn't, since it may still be live."""
+        what = describe_order(order)
+        if self.dry_run:
+            pre = f"cancel stop(s) {_fmt_prices(stops)}, then " if stops else ""
+            return Outcome(True, f"{self._tag()}{pre}{what}", extras)
+
+        # 1. cancel the stops and wait for IBKR to say so
+        if stops:
+            cancelled, filled, stuck = await self._cancel(stops)
+            if filled:
+                if len(filled) == len(stops):
+                    return Outcome(True, "the stop filled while being cancelled -- out", extras)
+                restored = await self._restore(cancelled)
+                return Outcome(
+                    False,
+                    f"stop {_fmt_prices(filled)} filled while being cancelled; exit not sent, "
+                    + ("the other stops restored -- CHECK THE POSITION" if restored
+                       else "the other stops NOT restored -- POSITION IS UNPROTECTED"),
+                    extras,
+                )
+            if stuck:
+                return Outcome(
+                    False,
+                    f"stop cancel NOT confirmed ({_fmt_prices(stuck)}); exit not sent"
+                    + (" -- some stops ARE cancelled, CHECK THE POSITION" if cancelled else ""),
+                    extras,
+                )
+
+        # 2. the exit -- SMART whatever the stop was routed to: Adaptive is
+        # SMART-only, so a stop directed at one exchange would otherwise get
+        # its exit refused.
+        contract = copy.copy(contract)
         contract.exchange = "SMART"
         exit_trade = self.ib.placeOrder(contract, order)
         await _wait_for(
             lambda: exit_trade.orderStatus.status in _WORKING + ("Filled",)
             or exit_trade.isDone()
         )
+        lead = "stop cancelled, " if stops else ""
         if exit_trade.orderStatus.status in _WORKING + ("Filled",):
-            task = asyncio.create_task(self._report_fill(trade.symbol, exit_trade))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            self._spawn(self._report_fill(symbol, exit_trade))
             return Outcome(
                 True,
-                f"stop cancelled, {action} {qty:g} Adaptive market sent",
+                f"{lead}{what} sent",
                 extras | {"exit_order_id": exit_trade.order.orderId},
             )
 
@@ -223,36 +317,25 @@ class TrailExecutor:
         if not exit_trade.isDone():
             return Outcome(
                 False,
-                f"exit sent but NOT confirmed (status {exit_trade.orderStatus.status}); "
-                "stop is cancelled -- CHECK THE POSITION",
+                f"exit sent but NOT confirmed (status {exit_trade.orderStatus.status})"
+                + ("; stop is cancelled" if stops else "") + " -- CHECK THE POSITION",
                 extras,
             )
 
-        # 3b. the exit was refused: put the stop back rather than leave the
+        # 3b. the exit was refused: put the stops back rather than leave the
         # position naked
         errors = _errors_since(exit_trade, 0)
-        restored = await self._restore_stop(stop)
+        refused = f"exit REFUSED ({'; '.join(errors) or exit_trade.orderStatus.status})"
+        if not stops:
+            return Outcome(False, refused, extras)
+        restored = await self._restore(stops)
         return Outcome(
             False,
-            f"exit REFUSED ({'; '.join(errors) or exit_trade.orderStatus.status}); "
-            + (f"stop restored at {stop.order.auxPrice:.2f}" if restored
+            f"{refused}; "
+            + (f"stop restored at {_fmt_prices(stops)}" if restored
                else "stop NOT restored -- POSITION IS UNPROTECTED"),
             extras,
         )
-
-    async def _restore_stop(self, old: Trade) -> bool:
-        o = old.order
-        new = Order(
-            action=o.action,
-            totalQuantity=o.totalQuantity,
-            orderType="STP",
-            auxPrice=o.auxPrice,
-            tif=o.tif,
-            outsideRth=o.outsideRth,
-            account=o.account,
-        )
-        t = self.ib.placeOrder(old.contract, new)
-        return await _wait_for(lambda: t.orderStatus.status in _WORKING)
 
     async def _report_fill(self, symbol: str, t: Trade) -> None:
         filled = await _wait_for(lambda: t.orderStatus.status == "Filled", FILL_REPORT_TIMEOUT)
@@ -265,3 +348,203 @@ class TrailExecutor:
                 f"exit still {s.status} after {FILL_REPORT_TIMEOUT:.0f}s "
                 f"({s.filled:g} of {t.order.totalQuantity:g} filled)",
             )
+
+
+class TrailExecutor(_OrderBase):
+    async def _find_stops(self, trade: TrackedTrade) -> tuple[list[Trade], str]:
+        """The working stops protecting this position -- one, or several
+        tranches -- re-read from IBKR every time: the trader may have moved
+        them since the last look."""
+        exit_side = "SELL" if trade.direction == "long" else "BUY"
+        working = working_orders(
+            await self.ib.reqAllOpenOrdersAsync(), trade.symbol, trade.account or ""
+        )
+        stops = protective_stops(working, exit_side)
+        if not stops:
+            return [], f"found no working {exit_side} stop"
+        if not self.dry_run and any(t.order.orderId == 0 for t in stops):
+            return [], "a stop is not bound to this session (connect as client ID 0)"
+        return stops, ""
+
+    def _position_size(self, trade: TrackedTrade) -> float:
+        return sum(
+            p.position
+            for p in self.ib.positions(trade.account or "")
+            if p.contract.symbol == trade.symbol
+        )
+
+    async def move_stop_to_breakeven(self, trade: TrackedTrade) -> Outcome:
+        """Every stop tranche still short of breakeven goes to breakeven."""
+        stops, why = await self._find_stops(trade)
+        if not stops:
+            return Outcome(False, f"stop NOT moved: {why}")
+        be = breakeven_price(trade)
+        before = [t.order.auxPrice for t in stops]
+        extras = {"stop_before": before[0] if len(before) == 1 else before, "breakeven": be}
+        # Never loosen: a stop the trader already raised past entry stays.
+        loose = [
+            t for t in stops
+            if (t.order.auxPrice < be if trade.direction == "long" else t.order.auxPrice > be)
+        ]
+        if not loose:
+            return Outcome(True, f"stop already at {_fmt_prices(stops)}, left alone", extras)
+        moving = ", ".join(f"{t.order.auxPrice:.2f}" for t in loose)
+        if self.dry_run:
+            return Outcome(True, f"{self._tag()}move stop {moving} -> {be:.2f}", extras)
+
+        failed = []
+        for t in loose:
+            current = t.order.auxPrice
+            ok, errors = await self._modify(t, price=be)
+            if not ok:
+                failed.append(f"{current:.2f} (still {t.order.auxPrice:.2f}{': ' + errors if errors else ''})")
+        if not failed:
+            return Outcome(True, f"stop moved {moving} -> {be:.2f}", extras)
+        return Outcome(False, f"stop move to {be:.2f} NOT confirmed for {'; '.join(failed)}", extras)
+
+    async def exit(self, trade: TrackedTrade, priority: str = ADAPTIVE_PRIORITY) -> Outcome:
+        qty = abs(self._position_size(trade))
+        if qty == 0:
+            return Outcome(True, "no position left -- the stop likely filled first")
+        stops, why = await self._find_stops(trade)
+        if not stops:
+            return Outcome(False, f"NOT exited: {why}")
+        action = "SELL" if trade.direction == "long" else "BUY"
+        extras = {
+            "qty": qty,
+            "stop_cancelled": stops[0].order.auxPrice if len(stops) == 1
+            else [t.order.auxPrice for t in stops],
+            "priority": priority,
+        }
+        order = exit_order(action, qty, trade.account or "", "ALG", priority=priority)
+        return await self._flatten(trade.symbol, stops, stops[0].contract, order, extras)
+
+
+class OrderDesk(_OrderBase):
+    """The console's `enter`, `stop`, `cancel` and `exit`. The caller has
+    already resolved the account, the position and the orders involved;
+    this sends and confirms."""
+
+    async def enter(
+        self, contract: Contract, parent: Order, child: Order | None
+    ) -> tuple[Outcome, Trade | None, Trade | None]:
+        what = describe_order(parent) + (
+            f", stop {describe_order(child)}" if child else ""
+        )
+        if self.dry_run:
+            return Outcome(True, f"{self._tag()}send {what}"), None, None
+        if child is not None:
+            # Held back until the child is sent, so the entry can't fill
+            # without its stop attached.
+            parent.orderId = self.ib.client.getReqId()
+            parent.transmit = False
+            child.parentId = parent.orderId
+            child.transmit = True
+        pt = self.ib.placeOrder(contract, parent)
+        ct = self.ib.placeOrder(contract, child) if child is not None else None
+        sent = [pt] + ([ct] if ct else [])
+
+        def settled() -> bool:
+            return all(t.orderStatus.status in _WORKING + ("Filled",) or t.isDone() for t in sent)
+
+        await _wait_for(settled)
+        extras = {"entry_order_id": pt.order.orderId}
+        if ct is not None:
+            extras["stop_order_id"] = ct.order.orderId
+        errors = [e for t in sent for e in _errors_since(t, 0)]
+        live = [t.orderStatus.status in _WORKING + ("Filled",) for t in sent]
+        if all(live):
+            note = f" ({'; '.join(errors)})" if errors else ""
+            return Outcome(True, f"sent {what}{note}", extras), pt, ct
+        if any(t.isDone() for t in sent):
+            # a refused child takes the parent with it at IBKR; cancel the
+            # parent too in case it didn't
+            if not pt.isDone():
+                self.ib.cancelOrder(pt.order)
+            return Outcome(
+                False,
+                f"REFUSED: {'; '.join(errors) or ', '.join(t.orderStatus.status for t in sent)}",
+                extras,
+            ), None, None
+        return Outcome(
+            False,
+            f"sent but NOT confirmed ({', '.join(t.orderStatus.status for t in sent)})"
+            " -- CHECK ORDERS",
+            extras,
+        ), pt, ct
+
+    async def set_stops(
+        self, contract: Contract, account: str, exit_side: str,
+        existing: list[Trade], tranches: list[tuple[int, float]],
+    ) -> Outcome:
+        """Make the working stops exactly `tranches` (size, price): existing
+        orders are modified where they can be, surplus ones cancelled, the
+        rest created GTC. Shrinking goes first, so the stops never add up to
+        more shares than are held -- the IRA reads that as a short sale."""
+        plan_existing = existing[: len(tranches)]
+        surplus = existing[len(tranches):]
+        to_create = tranches[len(existing):]
+        mods = sorted(
+            zip(plan_existing, tranches[: len(plan_existing)], strict=True),
+            key=lambda pair: pair[1][0] - pair[0].order.totalQuantity,
+        )
+        target = ", ".join(f"{q:g}@{p:.2f}" for q, p in tranches)
+        before = _fmt_prices(existing) or "none"
+        extras = {"before": before, "after": target}
+        if self.dry_run:
+            return Outcome(True, f"{self._tag()}set stops {before} -> {target}", extras)
+
+        problems = []
+        if surplus:
+            _, filled, stuck = await self._cancel(surplus)
+            if filled or stuck:
+                problems.append(f"cancel of {_fmt_prices(filled + stuck)} not confirmed")
+        for t, (qty, price) in mods:
+            if t.order.totalQuantity == qty and abs(t.order.auxPrice - price) < 1e-9:
+                continue
+            ok, errors = await self._modify(t, price=price, qty=qty)
+            if not ok:
+                problems.append(
+                    f"modify to {qty:g}@{price:.2f} NOT confirmed"
+                    f" (still {t.order.totalQuantity:g}@{t.order.auxPrice:.2f}"
+                    + (f": {errors}" if errors else "") + ")"
+                )
+        template = existing[0].order if existing else Order(
+            action=exit_side, tif="GTC", account=account
+        )
+        created = [await self._place_stop(contract, template, q, p) for q, p in to_create]
+        if created:
+            await _wait_for(lambda: all(t.orderStatus.status in _WORKING or t.isDone() for t in created))
+            for t in created:
+                if t.orderStatus.status not in _WORKING:
+                    problems.append(
+                        f"new stop {t.order.totalQuantity:g}@{t.order.auxPrice:.2f} NOT working"
+                        f" ({'; '.join(_errors_since(t, 0)) or t.orderStatus.status})"
+                    )
+        if problems:
+            return Outcome(False, f"stops {before} -> {target}: {'; '.join(problems)} -- CHECK ORDERS", extras)
+        return Outcome(True, f"stops {before} -> {target}", extras)
+
+    async def cancel(self, trades: list[Trade]) -> Outcome:
+        listed = "; ".join(describe_order(t.order) for t in trades)
+        if self.dry_run:
+            return Outcome(True, f"{self._tag()}cancel {listed}")
+        cancelled, filled, stuck = await self._cancel(trades)
+        parts = []
+        if cancelled:
+            parts.append(f"cancelled {'; '.join(describe_order(t.order) for t in cancelled)}")
+        if filled:
+            parts.append(f"FILLED before the cancel: {'; '.join(describe_order(t.order) for t in filled)}")
+        if stuck:
+            parts.append(f"cancel NOT confirmed: {'; '.join(describe_order(t.order) for t in stuck)}")
+        return Outcome(not (filled or stuck), "; ".join(parts))
+
+    async def exit(
+        self, symbol: str, contract: Contract, stops: list[Trade], order: Order
+    ) -> Outcome:
+        extras = {
+            "qty": order.totalQuantity,
+            "stops_cancelled": [t.order.auxPrice for t in stops],
+            "order": describe_order(order),
+        }
+        return await self._flatten(symbol, stops, contract, order, extras)
