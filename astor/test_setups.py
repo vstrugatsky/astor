@@ -1640,18 +1640,22 @@ def test_avt_leg_cannot_die_before_the_touch_floor() -> None:
 
 
 def test_avt_rearm_lets_the_next_interaction_fire() -> None:
-    """With rearm_adr, a leg killed by a break comes back once price leaves
-    AVWAP the trade's way again: the next touch is judged on its own. Off
-    by default, the same bars wait for a new extreme."""
+    """A leg killed by a break comes back once price leaves AVWAP the
+    trade's way again (rearm_adr, 0.15 since 2026-10-12): the next touch is
+    judged on its own. Turned off, the same bars wait for a new extreme."""
     bars = _avt_long_bars()[:4] + [
         bar(34, 102.6, 102.6, 101.0, 101.2, 30_000, symbol="AVT"),   # breaks AVWAP: dead
         bar(35, 101.2, 102.9, 101.2, 102.8, 60_000, symbol="AVT"),   # leaves it the trade's way
         bar(36, 102.8, 102.8, 101.9, 102.1, 30_000, symbol="AVT"),   # touches again
         bar(37, 102.1, 103.0, 102.1, 102.95, 60_000, symbol="AVT"),  # continues
     ]
-    check("off: waits for a new extreme", _feed(_avt_scanner(AVWAPTouchLong), bars), [])
-    fired = _feed(_avt_scanner(AVWAPTouchLong, setup_kwargs={"rearm_adr": 0.1}), bars)
+    check("current default", AVWAPTouchLong().rearm_adr, 0.15)
+    off = _avt_scanner(AVWAPTouchLong, setup_kwargs={"rearm_adr": None})
+    check("off: waits for a new extreme", _feed(off, bars), [])
+    fired = _feed(_avt_scanner(AVWAPTouchLong), bars)
     check("on: the second touch fires", [t.bar_start.strftime("%H:%M") for t in fired], ["10:07"])
+    too_close = _avt_scanner(AVWAPTouchLong, setup_kwargs={"rearm_adr": 0.5})
+    check("not re-armed when price never gets that far from AVWAP", _feed(too_close, bars), [])
 
 
 def test_avt_recovery_must_land_within_the_bar_window() -> None:

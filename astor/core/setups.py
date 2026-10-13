@@ -1566,7 +1566,7 @@ class _AVWAPTouchBase(Setup):
         recovery_adr: float = 0.05,
         max_bars_since_touch: int = 5,
         max_break_adr: float = 0.05,
-        rearm_adr: float | None = None,
+        rearm_adr: float | None = 0.15,
         stop_adr: float = 0.05,
         earliest_touch: time = time(9, 34),
         require_deeper_touch: bool = True,
@@ -1788,7 +1788,11 @@ class _AVWAPTouchBase(Setup):
                     trace, bar,
                     f"leg dead @ {bar.close:.2f}: closed {-recovery:.3f} ADR(1) the wrong "
                     f"side of AVWAP {avwap:.2f} (max {self.max_break_adr}) -- this is a "
-                    f"touch setup, not a breakdown; waiting for a new extreme",
+                    f"touch setup, not a breakdown; waiting for a new extreme"
+                    + (
+                        f" or a close {self.rearm_adr} past AVWAP the trade's way"
+                        if self.rearm_adr is not None else ""
+                    ),
                 )
             self._dead = True
             self._touch_bar = None

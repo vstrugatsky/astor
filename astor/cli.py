@@ -130,7 +130,7 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
         "recovery_adr": args.avt_recovery_adr,
         "max_bars_since_touch": args.avt_max_bars_since_touch,
         "max_break_adr": args.avt_max_break_adr,
-        "rearm_adr": args.avt_rearm_adr,
+        "rearm_adr": args.avt_rearm_adr if args.avt_rearm_adr >= 0 else None,
         "stop_adr": args.avt_stop_adr,
         "earliest_touch": parse_hhmm(args.avt_earliest_touch),
         "require_deeper_touch": args.avt_require_deeper_touch,
@@ -1420,10 +1420,10 @@ def _add_avt_args(p) -> None:
     p.add_argument(
         "--avt-rearm-adr",
         type=float,
-        default=None,
-        help="Experimental: a dead leg comes back once a close is this far past "
-        "AVWAP the trade's way, as a fraction of today's range, instead of "
-        "waiting for a new extreme. Off by default (AVT).",
+        default=0.15,
+        help="A dead leg comes back once a close is this far past AVWAP the "
+        "trade's way, as a fraction of today's range -- the next touch is a new "
+        "interaction, not waiting for a new extreme. Negative turns it off (AVT).",
     )
     p.add_argument(
         "--avt-earliest-touch",
