@@ -8,7 +8,7 @@
         (then at the '> ' prompt: 'add TSLA,NVDA', 'remove TSLA',
         'track NVDA', 'track NVDA 137.50 130.10' or
         'track NVDA U1234566', 'trail NVDA', 'trail NVDA 137.50 130.10 U1234566',
-        'untrack NVDA', 'quit'; --dry-run-trail to have trail place no orders)
+        'untrail NVDA', 'untrack NVDA', 'quit'; --dry-run-trail to have trail place no orders)
         orders: 'enter SPCX short 20 stp 170.10 stop 172.01', 'stop SPCX 170.10',
         'stop SPCX 1/2 168.05 1/2 170.01', 'cancel SPCX', 'exit SPCX [lmt 168.20]'
         (--dry-run-trail covers these too)
@@ -1132,7 +1132,8 @@ async def cmd_live(args: argparse.Namespace) -> int:
 
 _CONSOLE_COMMANDS = (
     "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'track SYM [ENTRY STOP] [ACCOUNT]', "
-    "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrack SYM [ACCOUNT]', 'list', 'quit'.\n"
+    "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
+    "'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "
     "'enter SYM [ACCOUNT] l|s QTY mkt|alg|lmt P|stp P [stop P]', "
     "'stop SYM [ACCOUNT] P' or 'stop SYM 1/2 P1 1/2 P2', "
@@ -1271,24 +1272,32 @@ async def _live_console(
             start = driver.track if cmd == "track" else driver.trail
             msg = await start(scanner, symbol, entry, stop, run_id, store, account)
             print(f"  {msg}")
-        elif cmd == "untrack":
+        elif cmd in ("untrack", "untrail"):
             # An account narrows it to that account's trade; without one,
-            # every account's trade in the symbol goes.
+            # every account's trade in the symbol goes. untrail ends trail
+            # alone; untrack ends track and trail alike.
             words = rest.split()
             account = account_token(words.pop()) if len(words) > 1 and is_account(words[-1]) else None
             symbols = split_symbols(" ".join(words))
             if not symbols:
-                print("Usage: untrack SYM1,SYM2,... [ACCOUNT]")
+                print(f"Usage: {cmd} SYM1,SYM2,... [ACCOUNT]")
                 continue
             try:
                 account = driver.resolve_account(account)
             except CommandError as e:
                 print(f"  {e}")
                 continue
+            stop = driver.untrack if cmd == "untrack" else driver.untrail
             for sym in symbols:
-                removed = driver.untrack(sym, account)
+                removed = stop(sym, account)
+                if not removed:
+                    print(f"  {sym}: not {'tracked' if cmd == 'untrack' else 'trailed'}")
+                    continue
                 where = ", ".join(t.account or "?" for t in removed)
-                print(f"  {sym}: {f'untracked ({where})' if removed else 'not tracked'}")
+                print(f"  {sym}: {cmd}ed ({where})")
+                # the rule had already fired its exit: untrailing can't recall it
+                if any(t.state == "done" for t in removed):
+                    print(f"  {sym}: trail had already sent its exit -- check the position")
         elif cmd in ("list", "status", "tickers"):
             tracked = driver.status()
             total = len(tracked["live"]) + len(tracked["pending"])

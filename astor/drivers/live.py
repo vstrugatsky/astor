@@ -933,6 +933,12 @@ class LiveDriver:
         IBKR stay as they are. Returns the trades dropped."""
         return self.tracker.untrack(symbol, account) + self.trailer.untrack(symbol, account)
 
+    def untrail(self, symbol: str, account: str | None = None) -> list[TrackedTrade]:
+        """Stop `trail` only, in `account` or in every account: no more
+        orders from it. A `track` is left alone, and so are the orders
+        already at IBKR. Returns the trades dropped."""
+        return self.trailer.untrack(symbol, account)
+
     async def _act_on_trail(self, action: TrailAction, run_id: str, store: TriggerStore) -> None:
         trade = self.trailer.trades.get((action.symbol, action.account))
         if trade is None:
