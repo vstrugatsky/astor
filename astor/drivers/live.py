@@ -361,8 +361,8 @@ def _print_order_notice(symbol: str, text: str) -> None:
 
 
 def _print_fill_notice(symbol: str, shares: float, price: float, then: str) -> None:
-    """An entry fill: shares signed by side (negative short), then what
-    astor did with it."""
+    """A fill, entry or exit: shares signed by side (negative sold), then
+    what it was or what astor did with it."""
     _print_alert(
         f"[{datetime.now(ET):%H:%M:%S} ET] {_accent('ORDER FILLED', _ANSI_BROWN)} {_symbol(symbol)} "
         f"{_bold(f'{shares:g}')} @ {_bold(f'{price:.4f}')}; {then}"
@@ -604,10 +604,16 @@ class LiveDriver:
         self._last_bar_start: dict[str, datetime] = {}
         self.tracker = SellRuleTracker()
         self.trailer = TrailTracker()
-        self.executor = TrailExecutor(ib, dry_run_trail, _print_trail_notice)
+        self.executor = TrailExecutor(
+            ib, dry_run_trail, _print_trail_notice,
+            lambda sym, shares, price: _print_fill_notice(sym, shares, price, "trail exit"),
+        )
         # The console's enter/stop/cancel/exit. Same dry-run switch as trail:
         # a session that shouldn't place trail's orders shouldn't place these.
-        self.desk = OrderDesk(ib, dry_run_trail, _print_order_notice)
+        self.desk = OrderDesk(
+            ib, dry_run_trail, _print_order_notice,
+            lambda sym, shares, price: _print_fill_notice(sym, shares, price, "exit"),
+        )
         self._entry_tasks: set[asyncio.Task] = set()
         self._trail_tasks: set[asyncio.Task] = set()
         # `mute`: setup alerts print without the bell. track, trail and

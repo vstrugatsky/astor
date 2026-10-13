@@ -191,11 +191,19 @@ def describe_order(o: Order) -> str:
 
 
 class _OrderBase:
-    def __init__(self, ib: IB, dry_run: bool, notify: Callable[[str, str], None]):
+    def __init__(
+        self,
+        ib: IB,
+        dry_run: bool,
+        notify: Callable[[str, str], None],
+        notify_fill: Callable[[str, float, float], None],
+    ):
         self.ib = ib
         self.dry_run = dry_run
-        # (symbol, text) -- for what happens after a call returns: the fill
+        # (symbol, text) -- for what happens after a call returns
         self.notify = notify
+        # (symbol, signed shares, price) -- an exit's fill
+        self.notify_fill = notify_fill
         self._tasks: set[asyncio.Task] = set()
 
     def _tag(self) -> str:
@@ -341,7 +349,9 @@ class _OrderBase:
         filled = await _wait_for(lambda: t.orderStatus.status == "Filled", FILL_REPORT_TIMEOUT)
         s = t.orderStatus
         if filled:
-            self.notify(symbol, f"exit filled: {s.filled:g} @ {s.avgFillPrice:.4f}")
+            self.notify_fill(
+                symbol, s.filled if t.order.action == "BUY" else -s.filled, s.avgFillPrice
+            )
         else:
             self.notify(
                 symbol,
