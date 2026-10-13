@@ -1077,17 +1077,25 @@ class LiveDriver:
             notes.append(f"adds to {abs(held):g} held")
         if not in_rth:
             notes.append("queued for the open" if req.order_type == "MKT" else "works from the open")
+        # Pared to what is decided at the prompt: side, size, how, the stop,
+        # what is at risk. SELL/BUY repeats long/short, DAY and GTC never
+        # vary (entries DAY, stops GTC), and Adaptive's priority is fixed.
         ref = req.price or market
-        size = f", ~${req.qty * ref:,.0f}" if ref else ""
+        size = f", {_bold(f'~${req.qty * ref:,.0f}')}" if ref else ""
         stop = (
-            f", stop {child.auxPrice:.2f} GTC (risk ${req.qty * abs(ref - child.auxPrice):,.0f})"
+            f", stop {child.auxPrice:.2f} (risk {_bold(f'${req.qty * abs(ref - child.auxPrice):,.0f}')})"
             if child is not None and ref else
-            f", stop {child.auxPrice:.2f} GTC" if child is not None else ", NO stop"
+            f", stop {child.auxPrice:.2f}" if child is not None else ", NO stop"
         )
+        kind = {
+            "ALG": "Adaptive",
+            "LMT": f"LMT {parent.lmtPrice:.2f}",
+            "STP": f"STP {parent.auxPrice:.2f}",
+        }.get(req.order_type, req.order_type)
         mkt = f"  [market {market:.2f}]" if market is not None else ""
         summary = (
-            f"{_bold(req.symbol)} {req.direction} {describe_order(parent)}{stop}{size}"
-            f"  [{account}]{mkt}" + (f"  ({'; '.join(notes)})" if notes else "")
+            f"{_bold(req.symbol)} {req.direction} {_bold(f'{req.qty:g}')} {kind}{stop}{size}"
+            f"  [{_account_tag(account).strip(' []')}]{mkt}" + (f"  ({'; '.join(notes)})" if notes else "")
         )
         return EntryTicket(req, account, contract, parent, child, summary)
 
