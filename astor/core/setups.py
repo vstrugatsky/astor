@@ -1566,6 +1566,7 @@ class _AVWAPTouchBase(Setup):
         recovery_adr: float = 0.05,
         max_bars_since_touch: int = 5,
         max_break_adr: float = 0.05,
+        rearm_adr: float | None = None,
         stop_adr: float = 0.05,
         earliest_touch: time = time(9, 34),
         require_deeper_touch: bool = True,
@@ -1581,6 +1582,7 @@ class _AVWAPTouchBase(Setup):
         self.recovery_adr = recovery_adr
         self.max_bars_since_touch = max_bars_since_touch
         self.max_break_adr = max_break_adr
+        self.rearm_adr = rearm_adr
         self.stop_adr = stop_adr
         self.earliest_touch = earliest_touch
         self.require_deeper_touch = require_deeper_touch
@@ -1601,8 +1603,10 @@ class _AVWAPTouchBase(Setup):
         self._touch_adr: float | None = None
         self._touch_depth_adr: float | None = None
         # Set when a close lands too far the wrong side of AVWAP: this is a
-        # touch setup, not an AVWAP-breakdown setup, so the leg is done until
-        # a fresh extreme starts a new one.
+        # touch setup, not an AVWAP-breakdown setup, so this interaction with
+        # AVWAP is done. A fresh extreme starts a new leg; with `rearm_adr`
+        # set, so does price leaving AVWAP again the trade's way -- the next
+        # interaction is judged on its own, not on the one that broke.
         self._dead = False
         self._prev_extreme: float | None = None
         # Whether the previous evaluated bar already closed beyond the
@@ -1761,7 +1765,24 @@ class _AVWAPTouchBase(Setup):
         recovery = self._beyond(bar.close, avwap) / yard
         prev_close, self._prev_close = self._prev_close, bar.close
 
-        if -recovery > self.max_break_adr:
+        # Before the touch floor AVWAP is an average of a few bars and today's
+        # range is a bar or two wide, so a "break" is noise -- and a leg dead
+        # from 09:32 stays dead all day when the extreme was set at the open
+        # (TMUS 2026-10-09). No touch can count before the floor anyway.
+        after_floor = bar.start.time() >= self.earliest_touch
+        if self._dead and self.rearm_adr is not None and recovery >= self.rearm_adr:
+            # Back past AVWAP the trade's way, clear of it: whatever touches
+            # AVWAP next is a new interaction. This bar is the departure, not
+            # a touch, so evaluation starts with the next one.
+            _trace(
+                trace, bar,
+                f"leg re-armed @ {bar.close:.2f}: closed {recovery:.3f} ADR(1) past AVWAP "
+                f"{avwap:.2f} the trade's way (min {self.rearm_adr}) -- the next touch is "
+                f"a new interaction",
+            )
+            self._dead = False
+            return None
+        if after_floor and -recovery > self.max_break_adr:
             if not self._dead:
                 _trace(
                     trace, bar,
@@ -1799,7 +1820,6 @@ class _AVWAPTouchBase(Setup):
         # 2026-10-02 qualified at 09:34 on 0.91x ADR of which 0.63x was the
         # overnight gap, and waiting on an intraday range it had no need to
         # build just meant missing it.
-        after_floor = bar.start.time() >= self.earliest_touch
         # What counts as "the move" for deciding the day is worth joining.
         # An overnight gap is part of the move: a name that gapped 0.4x ADR
         # and has added 0.4x since the open has travelled 0.8x from where it

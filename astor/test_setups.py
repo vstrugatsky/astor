@@ -1622,6 +1622,38 @@ def test_avt_close_through_avwap_kills_the_leg() -> None:
     check("no trigger after a real break of AVWAP", _feed(sc, bars), [])
 
 
+def test_avt_leg_cannot_die_before_the_touch_floor() -> None:
+    """Before the floor AVWAP is a few bars' average and the day's range a
+    bar or two wide, so a "break" then is noise. TMUS 2026-10-09 died at
+    09:32 off a low set at the open, and stayed dead all day."""
+    bars = _avt_long_bars()
+    # 10:03 closes well under AVWAP, then 10:04 touches and 10:05 continues
+    bars[3] = bar(33, 103.8, 103.9, 100.9, 101.0, 50_000, symbol="AVT")
+    check(
+        "a break after the floor kills the leg",
+        _feed(_avt_scanner(AVWAPTouchLong, setup_kwargs={"earliest_touch": time(9, 34)}), bars),
+        [],
+    )
+    fired = _feed(_avt_scanner(AVWAPTouchLong, setup_kwargs={"earliest_touch": time(10, 4)}), bars)
+    check("the same break before the floor does not",
+          [t.bar_start.strftime("%H:%M") for t in fired], ["10:05"])
+
+
+def test_avt_rearm_lets_the_next_interaction_fire() -> None:
+    """With rearm_adr, a leg killed by a break comes back once price leaves
+    AVWAP the trade's way again: the next touch is judged on its own. Off
+    by default, the same bars wait for a new extreme."""
+    bars = _avt_long_bars()[:4] + [
+        bar(34, 102.6, 102.6, 101.0, 101.2, 30_000, symbol="AVT"),   # breaks AVWAP: dead
+        bar(35, 101.2, 102.9, 101.2, 102.8, 60_000, symbol="AVT"),   # leaves it the trade's way
+        bar(36, 102.8, 102.8, 101.9, 102.1, 30_000, symbol="AVT"),   # touches again
+        bar(37, 102.1, 103.0, 102.1, 102.95, 60_000, symbol="AVT"),  # continues
+    ]
+    check("off: waits for a new extreme", _feed(_avt_scanner(AVWAPTouchLong), bars), [])
+    fired = _feed(_avt_scanner(AVWAPTouchLong, setup_kwargs={"rearm_adr": 0.1}), bars)
+    check("on: the second touch fires", [t.bar_start.strftime("%H:%M") for t in fired], ["10:07"])
+
+
 def test_avt_recovery_must_land_within_the_bar_window() -> None:
     sc = _avt_scanner(AVWAPTouchLong, setup_kwargs={"max_bars_since_touch": 1})
     bars = _avt_long_bars()
