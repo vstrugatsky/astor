@@ -1255,6 +1255,57 @@ class LiveDriver:
         )
         return _order_line(sym, outcome)
 
+    async def position_lines(self) -> list[str]:
+        """The console's `positions`: every open position in every account
+        this login sees -- the one place both accounts show side by side,
+        since IBKR Desktop can only reach one of them. Per position: shares,
+        entry (IBKR's average cost), IB's own mark, gain/loss, the stops
+        protecting it, and whether track or trail has it."""
+        held = sorted(
+            (p for p in self.ib.positions() if p.position),
+            key=lambda p: (p.contract.symbol, p.account),
+        )
+        if not held:
+            return ["No open positions."]
+        pnls, open_trades = await asyncio.gather(
+            asyncio.gather(*(position_pnl(self.ib, p) for p in held)),
+            self.ib.reqAllOpenOrdersAsync(),
+        )
+        lines = [
+            f"  {'SYM':<6} {'ACCT':<4} {'SHARES':>7} {'ENTRY':>9} {'MARK':>9} "
+            f"{'G/L %':>7} {'G/L $':>9}  STOPS"
+        ]
+        for p, pnl in zip(held, pnls, strict=True):
+            sym, long = p.contract.symbol, p.position > 0
+            mark = pnl.value / p.position if pnl is not None and pnl.position else None
+            if mark is not None:
+                pct = (mark - p.avgCost) / p.avgCost * (1 if long else -1) * 100
+                color = _ANSI_GREEN if pct >= 0 else _ANSI_RED
+                gl = _accent(f"{pct:+.2f}%".rjust(7), color)
+                dollars = f"{pnl.unrealizedPnL:>+9,.0f}"
+            else:
+                gl, dollars = f"{'n/a':>7}", f"{'':>9}"
+            stops = protective_stops(
+                working_orders(open_trades, sym, p.account), "SELL" if long else "BUY"
+            )
+            covered = sum(t.order.totalQuantity for t in stops)
+            stop_text = ", ".join(
+                f"{t.order.totalQuantity:g}@{t.order.auxPrice:.2f}" for t in stops
+            ) or _accent("NONE", _ANSI_RED)
+            if stops and covered < abs(p.position):
+                stop_text += _accent(f" ({abs(p.position) - covered:g} unprotected)", _ANSI_RED)
+            rules = [
+                name for name, book in (("trail", self.trailer), ("track", self.tracker))
+                if (sym, p.account) in book.trades
+            ]
+            lines.append(
+                f"  {_symbol(sym)} {_account_tag(p.account).strip(' []') or p.account:<4} "
+                f"{p.position:>+7g} {p.avgCost:>9.2f} "
+                f"{f'{mark:.2f}' if mark is not None else 'n/a':>9} {gl} {dollars}  {stop_text}"
+                + (f"  [{', '.join(rules)}]" if rules else "")
+            )
+        return lines
+
     # -- open transition --------------------------------------------------
 
     async def run_open_transition(
