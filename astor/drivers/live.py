@@ -360,6 +360,15 @@ def _print_order_notice(symbol: str, text: str) -> None:
     _print_alert(_order_line(symbol, Outcome(True, text)))
 
 
+def _print_fill_notice(symbol: str, shares: float, price: float, then: str) -> None:
+    """An entry fill: shares signed by side (negative short), then what
+    astor did with it."""
+    _print_alert(
+        f"[{datetime.now(ET):%H:%M:%S} ET] {_accent('ORDER FILLED', _ANSI_BROWN)} {_symbol(symbol)} "
+        f"{_bold(f'{shares:g}')} @ {_bold(f'{price:.4f}')}; {then}"
+    )
+
+
 @dataclass
 class EntryTicket:
     """An `enter` checked and built, waiting on the trader's go-ahead."""
@@ -1136,22 +1145,26 @@ class LiveDriver:
                 store, run_id, "order_fill", sym, ticket.req.direction, fill, Outcome(True, "filled"),
                 {"account": ticket.account, "qty": s.filled},
             )
-            head = f"entry filled: {s.filled:g} @ {fill:.4f}"
+            shares = s.filled if ticket.req.direction == "long" else -s.filled
+
+            def filled(then: str) -> None:
+                _print_fill_notice(sym, shares, fill, then)
+
             stop = ct.order.auxPrice if ct is not None and ct.orderStatus.status in ("PreSubmitted", "Submitted") else None
             if stop is None:
-                _print_order_notice(sym, f"{head}; no working stop -- not tracked")
+                filled("no working stop -- not tracked")
                 return
             key = (sym, ticket.account)
             if key in self.tracker.trades or key in self.trailer.trades:
-                _print_order_notice(sym, f"{head}; already tracked/trailed in {ticket.account} -- left as is")
+                filled(f"already tracked/trailed in {ticket.account} -- left as is")
                 return
             long = ticket.req.direction == "long"
             if (stop >= fill) if long else (stop <= fill):
-                _print_order_notice(sym, f"{head}; stop {stop:.2f} is past the fill -- not tracked")
+                filled(f"stop {stop:.2f} is past the fill -- not tracked")
                 return
             opened_at = pt.fills[0].time.astimezone(ET) if pt.fills else datetime.now(ET)
             msg = await self.track(scanner, sym, fill, stop, run_id, store, ticket.account, opened_at)
-            _print_order_notice(sym, f"{head}; {msg}")
+            filled(msg)
         except Exception as e:
             logger.exception("watching the %s entry failed", sym)
             _print_order_notice(sym, f"lost track of the entry ({e!r}) -- CHECK ORDERS")
