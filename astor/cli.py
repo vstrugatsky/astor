@@ -8,7 +8,7 @@
         (then at the '> ' prompt: 'add TSLA,NVDA', 'remove TSLA',
         'track NVDA', 'track NVDA 137.50 130.10' or
         'track NVDA U1234566', 'trail NVDA', 'trail NVDA 137.50 130.10 U1234566',
-        'untrail NVDA', 'untrack NVDA', 'positions', 'quit'; --dry-run-trail to have trail place no orders)
+        'untrail NVDA', 'untrack NVDA', 'positions', 'mute', 'unmute', 'quit'; --dry-run-trail to have trail place no orders)
         orders: 'enter SPCX short 20 stp 170.10 stop 172.01', 'stop SPCX 170.10',
         'stop SPCX 1/2 168.05 1/2 170.01', 'cancel SPCX', 'exit SPCX [lmt 168.20]'
         (--dry-run-trail covers these too)
@@ -1133,7 +1133,7 @@ async def cmd_live(args: argparse.Namespace) -> int:
 _CONSOLE_COMMANDS = (
     "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'track SYM [ENTRY STOP] [ACCOUNT]', "
     "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
-    "'positions', 'list', 'quit'.\n"
+    "'positions', 'mute', 'unmute', 'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "
     "'enter SYM [ACCOUNT] l|s QTY mkt|alg|lmt P|stp P [stop P]', "
     "'stop SYM [ACCOUNT] P' or 'stop SYM 1/2 P1 1/2 P2', "
@@ -1298,13 +1298,19 @@ async def _live_console(
                 # the rule had already fired its exit: untrailing can't recall it
                 if any(t.state == "done" for t in removed):
                     print(f"  {sym}: trail had already sent its exit -- check the position")
+        elif cmd in ("mute", "unmute"):
+            driver.muted = cmd == "mute"
+            print(
+                "  Setup alerts muted: still shown, no bell. track/trail/orders still ring."
+                if driver.muted else "  Setup alerts unmuted."
+            )
         elif cmd in ("positions", "pos"):
             for line in await driver.position_lines():
                 print(line)
         elif cmd in ("list", "status", "tickers"):
             tracked = driver.status()
             total = len(tracked["live"]) + len(tracked["pending"])
-            print(f"Tracking {total}/{cap or '∞'}")
+            print(f"Tracking {total}/{cap or '∞'}" + ("  (setup alerts muted)" if driver.muted else ""))
             if tracked["live"]:
                 print(f"  live    ({len(tracked['live'])}): {', '.join(tracked['live'])}")
             if tracked["pending"]:

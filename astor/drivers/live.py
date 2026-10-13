@@ -258,14 +258,15 @@ def _format_metrics(t: Trigger) -> str:
     )
 
 
-def _print_alert(text: str) -> None:
+def _print_alert(text: str, bell: bool = True) -> None:
     """Bell + explicit black, not just a plain print -- an alert scrolling by
-    silently in a wall of other output is exactly what this is for."""
-    print(f"{_BELL}{_ANSI_BLACK}{text}{_ANSI_RESET}")
+    silently in a wall of other output is exactly what this is for. Only
+    setup alerts ever go without the bell (`mute`)."""
+    print(f"{_BELL if bell else ''}{_ANSI_BLACK}{text}{_ANSI_RESET}")
 
 
-def _print_trigger_alert(t: Trigger) -> None:
-    _print_alert(_format_trigger_line(t))
+def _print_trigger_alert(t: Trigger, bell: bool = True) -> None:
+    _print_alert(_format_trigger_line(t), bell)
 
 
 def _account_tag(account: str | None) -> str:
@@ -450,13 +451,14 @@ def _format_order_alert(label: str, a: SetupAlert, held: bool = False) -> str:
     )
 
 
-def _print_setup_alert(a: SetupAlert, held: bool = False) -> None:
+def _print_setup_alert(a: SetupAlert, held: bool = False, bell: bool = True) -> None:
     """One entry point for every setup-produced alert; the only thing that
     differs by kind is what it is called."""
     _print_alert(
         _format_order_alert(
             "AVWAP TOUCH" if isinstance(a, TouchAlert) else "CAPITULATION", a, held
-        )
+        ),
+        bell,
     )
 
 
@@ -599,6 +601,9 @@ class LiveDriver:
         self.desk = OrderDesk(ib, dry_run_trail, _print_order_notice)
         self._entry_tasks: set[asyncio.Task] = set()
         self._trail_tasks: set[asyncio.Task] = set()
+        # `mute`: setup alerts print without the bell. track, trail and
+        # order notices always ring -- they are about money already in.
+        self.muted = False
 
     @property
     def positions(self) -> set[str]:
@@ -1446,7 +1451,7 @@ class LiveDriver:
                     # setup -- only the terminal alert is gated, so a look
                     # back at the full session never has gaps to explain.
                     if _should_notify(trigger):
-                        _print_trigger_alert(trigger)
+                        _print_trigger_alert(trigger, not self.muted)
 
                 for alert in scanner.pop_alerts():
                     store.record_alert(
@@ -1461,7 +1466,7 @@ class LiveDriver:
                         bar_end=alert.bar_end,
                     )
                     store.commit()
-                    _print_setup_alert(alert, alert.symbol in self.positions)
+                    _print_setup_alert(alert, alert.symbol in self.positions, not self.muted)
 
                 for track_alert in self.tracker.on_close(symbol, bar_event.close, bar_event.start):
                     trade = self.tracker.trades[symbol, track_alert.account]
