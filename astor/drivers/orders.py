@@ -387,7 +387,12 @@ class TrailExecutor(_OrderBase):
             if (t.order.auxPrice < be if trade.direction == "long" else t.order.auxPrice > be)
         ]
         if not loose:
-            return Outcome(True, f"stop already at {_fmt_prices(stops)}, left alone", extras)
+            return Outcome(
+                True,
+                f"{'stop' if len(stops) == 1 else 'stops'} already at or past breakeven "
+                f"({_fmt_prices(stops)}) -- not moved",
+                extras,
+            )
         moving = ", ".join(f"{t.order.auxPrice:.2f}" for t in loose)
         if self.dry_run:
             return Outcome(True, f"{self._tag()}move stop {moving} -> {be:.2f}", extras)

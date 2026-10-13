@@ -7,7 +7,7 @@
     uv run python -m astor.cli live --tickers-file watchlist.txt
         (then at the '> ' prompt: 'add TSLA,NVDA', 'remove TSLA',
         'track NVDA', 'track NVDA 137.50 130.10' or
-        'track NVDA U14555356', 'trail NVDA', 'trail NVDA 137.50 130.10 U14555356',
+        'track NVDA U1234566', 'trail NVDA', 'trail NVDA 137.50 130.10 U1234566',
         'untrack NVDA', 'quit'; --dry-run-trail to have trail place no orders)
         orders: 'enter SPCX short 20 stp 170.10 stop 172.01', 'stop SPCX 170.10',
         'stop SPCX 1/2 168.05 1/2 170.01', 'cancel SPCX', 'exit SPCX [lmt 168.20]'
@@ -46,6 +46,8 @@ from ib_async import IB
 from astor.core.indicators import SessionIndicators, compute_interval_rvol, compute_rvol
 from astor.core.order_entry import (
     CommandError,
+    account_token,
+    is_account,
     parse_cancel,
     parse_enter,
     parse_exit,
@@ -1130,7 +1132,7 @@ async def cmd_live(args: argparse.Namespace) -> int:
 
 _CONSOLE_COMMANDS = (
     "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'track SYM [ENTRY STOP] [ACCOUNT]', "
-    "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrack SYM', 'list', 'quit'.\n"
+    "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrack SYM [ACCOUNT]', 'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "
     "'enter SYM [ACCOUNT] l|s QTY mkt|alg|lmt P|stp P [stop P]', "
     "'stop SYM [ACCOUNT] P' or 'stop SYM 1/2 P1 1/2 P2', "
@@ -1145,10 +1147,14 @@ _ORDER_PARSERS = {
 }
 
 
+def _by_symbol(trades: dict) -> list:
+    return sorted(trades.values(), key=lambda t: (t.symbol, t.account or ""))
+
+
 def _parse_trade_args(rest: str) -> tuple[str, float | None, float | None, str | None] | None:
     """'SYM [ENTRY STOP] [ACCOUNT]' -> (symbol, entry, stop, account), or
     None if malformed. Both prices or neither; IBKR account IDs are letters
-    then digits (U14555356), so a lone price is a half-given ENTRY STOP.
+    then digits (U1234566), so a lone price is a half-given ENTRY STOP.
     """
     parts = rest.split()
     if not parts:
@@ -1157,7 +1163,7 @@ def _parse_trade_args(rest: str) -> tuple[str, float | None, float | None, str |
     args = parts[1:]
     account = None
     if args and args[-1][0].isalpha():
-        account = args.pop().upper()
+        account = account_token(args.pop())
     if not args:
         return symbol, None, None, account
     if len(args) != 2:
@@ -1266,13 +1272,23 @@ async def _live_console(
             msg = await start(scanner, symbol, entry, stop, run_id, store, account)
             print(f"  {msg}")
         elif cmd == "untrack":
-            symbols = split_symbols(rest)
+            # An account narrows it to that account's trade; without one,
+            # every account's trade in the symbol goes.
+            words = rest.split()
+            account = account_token(words.pop()) if len(words) > 1 and is_account(words[-1]) else None
+            symbols = split_symbols(" ".join(words))
             if not symbols:
-                print("Usage: untrack SYM1,SYM2,...")
+                print("Usage: untrack SYM1,SYM2,... [ACCOUNT]")
+                continue
+            try:
+                account = driver.resolve_account(account)
+            except CommandError as e:
+                print(f"  {e}")
                 continue
             for sym in symbols:
-                removed = driver.untrack(sym)
-                print(f"  {sym}: {'untracked' if removed else 'not tracked'}")
+                removed = driver.untrack(sym, account)
+                where = ", ".join(t.account or "?" for t in removed)
+                print(f"  {sym}: {f'untracked ({where})' if removed else 'not tracked'}")
         elif cmd in ("list", "status", "tickers"):
             tracked = driver.status()
             total = len(tracked["live"]) + len(tracked["pending"])
@@ -1288,7 +1304,8 @@ async def _live_console(
                 print("  (none yet)")
             if driver.tracker.trades:
                 print(f"  sell-rule tracking ({len(driver.tracker.trades)}):")
-                for sym, trade in sorted(driver.tracker.trades.items()):
+                for trade in _by_symbol(driver.tracker.trades):
+                    sym = trade.symbol
                     peak = f" peak {trade.peak:.2f}" if trade.peak is not None else ""
                     where = f" [{trade.account}]" if trade.account else ""
                     print(
@@ -1298,7 +1315,8 @@ async def _live_console(
             if driver.trailer.trades:
                 dry = ", dry run" if driver.executor.dry_run else ""
                 print(f"  trail ({len(driver.trailer.trades)}{dry}):")
-                for sym, trade in sorted(driver.trailer.trades.items()):
+                for trade in _by_symbol(driver.trailer.trades):
+                    sym = trade.symbol
                     print(
                         f"    {sym:<6} {trade.direction:<5} {trade.state:<8} "
                         f"entry {trade.entry:.2f} stop {trade.stop:.2f} R {trade.r:.2f}"

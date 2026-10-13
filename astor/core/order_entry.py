@@ -55,8 +55,8 @@ def _symbol(tok: str) -> str:
     return tok.upper().replace(".", " ")
 
 
-def _is_account(tok: str) -> bool:
-    """`ira`, `reg`, or an IBKR account ID -- letters then digits (U14555356).
+def is_account(tok: str) -> bool:
+    """`ira`, `reg`, or an IBKR account ID -- letters then digits (U1234566).
     Nothing else the commands take looks like that."""
     t = tok.lower()
     return t in ACCOUNT_SUFFIX or (
@@ -64,13 +64,13 @@ def _is_account(tok: str) -> bool:
     )
 
 
-def _account_token(tok: str) -> str:
+def account_token(tok: str) -> str:
     return tok.lower() if tok.lower() in ACCOUNT_SUFFIX else tok.upper()
 
 
 def _split_account(tokens: list[str]) -> tuple[str | None, list[str]]:
-    if tokens and _is_account(tokens[0]):
-        return _account_token(tokens[0]), tokens[1:]
+    if tokens and is_account(tokens[0]):
+        return account_token(tokens[0]), tokens[1:]
     return None, tokens
 
 

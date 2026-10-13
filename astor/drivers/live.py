@@ -19,9 +19,19 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
-from ib_async import IB, Contract, Order, PnLSingle, Position, Trade
+from ib_async import (
+    IB,
+    Contract,
+    ExecutionFilter,
+    Fill,
+    Order,
+    PnLSingle,
+    Position,
+    Trade,
+)
 
 from astor.core.order_entry import (
+    ACCOUNT_SUFFIX,
     CommandError,
     EnterRequest,
     StopRequest,
@@ -40,6 +50,7 @@ from astor.core.tracking import (
     TrackedTrade,
     TrailAction,
     TrailTracker,
+    giveback_limit,
 )
 from astor.core.types import (
     BarEvent,
@@ -257,6 +268,14 @@ def _print_trigger_alert(t: Trigger) -> None:
     _print_alert(_format_trigger_line(t))
 
 
+def _account_tag(account: str | None) -> str:
+    """ira/reg rather than the ID: it is there to tell apart two trades of
+    one symbol, and those can only be in these two accounts."""
+    if account is None:
+        return ""
+    return f"  [{'ira' if is_ira(account) else 'reg' if account.endswith(ACCOUNT_SUFFIX['reg']) else account}]"
+
+
 def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
     header = (
         f"[{alert.bar_start:%H:%M:%S} ET] {_accent('TRACKING', _ANSI_BROWN)} "
@@ -266,13 +285,14 @@ def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
         return (
             f"{header} {_accent('+1R reached', _ANSI_BROWN)} @ {alert.close:.2f}"
             f" (target {trade.target_1r:.2f})"
-            f"  ->  move stop to breakeven ({trade.entry:.2f})"
+            f"  ->  move stop to breakeven ({trade.entry:.2f}){_account_tag(trade.account)}"
         )
     assert trade.peak is not None
     return (
         f"{header} SELL -- {_accent('gave back 0.5R', _ANSI_BROWN)}"
         f" from peak {trade.peak:.2f} to {alert.close:.2f}"
         f"  (entry {trade.entry:.2f}, stop {trade.stop:.2f}, R {trade.r:.2f})"
+        f"{_account_tag(trade.account)}"
     )
 
 
@@ -299,7 +319,30 @@ def _format_trail_alert(action: TrailAction, trade: TrackedTrade, outcome: Outco
             f"to {action.close:.2f} (limit {action.limit / trade.r:.2f}R)"
         )
     done = outcome.text if outcome.ok else _accent(outcome.text, _ANSI_RED)
-    return f"{_trail_header(action.symbol, action.bar_start)} {trade.direction:<5} {why}  ->  {done}"
+    return (
+        f"{_trail_header(action.symbol, action.bar_start)} {trade.direction:<5} {why}  ->  {done}"
+        f"{_account_tag(trade.account)}"
+    )
+
+
+def _trail_start_state(trade: TrackedTrade, closes: list[float]) -> str:
+    """Where a just-started trail stands: what it counts the giveback
+    from, and whether the next close exits already."""
+    if trade.opened_at is None:
+        return "entry time unknown (no fill today that opened it) -- giveback counts from the next close"
+    if not closes:
+        return f"opened {trade.opened_at:%H:%M} ET -- giveback counts from entry"
+    assert trade.peak is not None
+    last = closes[-1]
+    given, limit = abs(trade.peak - last) / trade.r, giveback_limit(trade) / trade.r
+    state = (
+        f"best close since {trade.opened_at:%H:%M} ET {trade.peak:.2f} "
+        f"({trade.gain_r(trade.peak):+.2f}R); last close {last:.2f} gave back "
+        f"{given:.2f}R of {limit:.2f}R allowed"
+    )
+    if round(given, 6) >= round(limit, 6):
+        state += " -- " + _accent("exits on the next close unless it recovers", _ANSI_RED)
+    return state
 
 
 def _print_trail_notice(symbol: str, text: str) -> None:
@@ -474,6 +517,19 @@ async def resolve_open_trade(
     return entry, stop, pos.account
 
 
+def opening_fill_time(held: float, fills: list[Fill]) -> datetime | None:
+    """The time of the fill that opened a position now `held` shares
+    (negative short), walking back from the latest fill until the size
+    reaches zero -- or crosses it, a single fill that flipped the position.
+    None if `fills` never get it there."""
+    remaining = held
+    for f in sorted(fills, key=lambda f: f.time, reverse=True):
+        remaining -= f.execution.shares if f.execution.side == "BOT" else -f.execution.shares
+        if round(remaining, 6) == 0 or (remaining > 0) != (held > 0):
+            return f.time.astimezone(ET)
+    return None
+
+
 def held_positions(ib: IB, symbol: str) -> list[Position]:
     """Every open position in `symbol`, one per account holding it."""
     return [p for p in ib.positions() if p.contract.symbol == symbol and p.position != 0]
@@ -640,6 +696,24 @@ class LiveDriver:
 
     # -- sell-rule tracking -------------------------------------------------
 
+    def resolve_account(self, token: str | None) -> str | None:
+        """The account an ira/reg/ID token names; None for no token."""
+        return resolve_account(token, self.ib.managedAccounts())
+
+    def _known_trade(self, symbol: str, account: str | None) -> TrackedTrade | None:
+        """The trade astor already has on `symbol` in `account` -- trailed
+        or tracked, the latter including every fill of an `enter` -- or the
+        single one on `symbol` when `account` is None. Its entry and stop
+        are the original ones: neither rule set ever changes them."""
+        for book in (self.trailer, self.tracker):
+            trades = [
+                t for t in book.for_symbol(symbol)
+                if account is None or t.account in (account, None)
+            ]
+            if len(trades) == 1:
+                return trades[0]
+        return None
+
     async def _open_trade(
         self,
         scanner: Scanner,
@@ -650,24 +724,43 @@ class LiveDriver:
         store: TriggerStore,
         account: str | None,
         verb: str,
-    ) -> tuple[float, float, str | None] | str:
+    ) -> tuple[float, float, str | None, TrackedTrade | None] | str:
         """Entry, stop and account for `track`/`trail`, with `symbol`
-        subscribed for bars -- or a message saying why not."""
+        subscribed for bars -- or a message saying why not. Also the trade
+        astor already had on the position, if any.
+
+        Without ENTRY STOP, a position astor already tracks keeps its own
+        entry and original stop; anything else is looked up at IBKR, which
+        only works while the one stop there is still the original.
+        """
+        try:
+            account = self.resolve_account(account)
+        except CommandError as e:
+            return str(e)
+        holders = sorted(p.account for p in held_positions(self.ib, symbol))
+        if account is None and len(holders) > 1:
+            return (
+                f"{symbol} is held in more than one account ({', '.join(holders)}). "
+                f"Name one: '{verb} {symbol} [ENTRY STOP] ira|reg'."
+            )
+        if account is None and holders:
+            account = holders[0]
+
+        known = self._known_trade(symbol, account)
         if entry is None and stop is None:
-            resolved = await resolve_open_trade(self.ib, symbol, account)
-            if resolved is None:
-                holders = sorted(p.account for p in held_positions(self.ib, symbol))
-                if account is None and len(holders) > 1:
+            if known is not None:
+                entry, stop = known.entry, known.stop
+                account = account or known.account
+            else:
+                resolved = await resolve_open_trade(self.ib, symbol, account)
+                if resolved is None:
                     return (
-                        f"{symbol} is held in more than one account "
-                        f"({', '.join(holders)}). Name one: '{verb} {symbol} ACCOUNT'."
+                        f"astor isn't tracking {symbol}, and IBKR doesn't show a single "
+                        f"working stop for it to take R from (none, or split into "
+                        f"tranches). Give entry and the original stop: "
+                        f"'{verb} {symbol} ENTRY STOP'."
                     )
-                return (
-                    f"Could not resolve a single open position + matching stop "
-                    f"order for {symbol} from IBKR. Give both explicitly: "
-                    f"'{verb} {symbol} ENTRY STOP'."
-                )
-            entry, stop, account = resolved
+                entry, stop, account = resolved
 
         if symbol not in self._subs and symbol not in self._pending:
             results = await self.add_symbols(scanner, [symbol], run_id, store)
@@ -679,7 +772,7 @@ class LiveDriver:
                 f"{symbol}: stop equals entry, so R is zero -- the stop is probably "
                 f"at breakeven already. Give the original risk: '{verb} {symbol} ENTRY STOP'."
             )
-        return entry, stop, account
+        return entry, stop, account, known
 
     async def track(
         self,
@@ -690,13 +783,14 @@ class LiveDriver:
         run_id: str,
         store: TriggerStore,
         account: str | None = None,
+        opened_at: datetime | None = None,
     ) -> str:
         """Start sell-rule tracking for a position in `symbol`. `entry` and
         `stop` are either both given (trusted as-is, no IBKR lookup -- the
         only path that works for an account this login can't see) or both
-        None, in which case both are resolved from IBKR -- from `account`
-        only, if given, which is required when more than one account holds
-        `symbol`.
+        None, in which case both come from the trade astor already has on
+        it, or else from IBKR -- from `account` only, if given, which is
+        required when more than one account holds `symbol`.
 
         Ensures `symbol` has a live bar subscription, same as `add_symbols`
         -- tracking needs the same 1-min closes a scanned symbol gets.
@@ -704,10 +798,12 @@ class LiveDriver:
         opened = await self._open_trade(scanner, symbol, entry, stop, run_id, store, account, "track")
         if isinstance(opened, str):
             return opened
-        entry, stop, account = opened
-        self.trailer.untrack(symbol)
+        entry, stop, account, known = opened
+        if opened_at is None and known is not None:
+            opened_at = known.opened_at
+        self.trailer.untrack(symbol, account)
 
-        trade = self.tracker.track(symbol, entry, stop, account)
+        trade = self.tracker.track(symbol, entry, stop, account, opened_at)
         where = f" [{account}]" if account else ""
         # Styled like the TRACKING alerts this turns on, so the confirmation
         # and the alerts that follow it read as one thing.
@@ -730,28 +826,26 @@ class LiveDriver:
         """Hand a position to `trail`: the trail rules (`TrailTracker`) on
         its 1-min closes, acted on at IBKR by `TrailExecutor` -- the stop
         moved to breakeven at +1R, the exit sent on the giveback. Replaces
-        any `track` of the same symbol; one rule set per position.
+        any `track` of the same position; one rule set per position.
 
         Same lookup as `track`, but it always needs the account: orders go
         to one. With ENTRY STOP given it comes from whichever single account
         holds `symbol`.
+
+        A trade already under way starts from its best close since entry,
+        not from the close after this command: a giveback that happened
+        before trail was started counts, and exits on the next close.
         """
         opened = await self._open_trade(scanner, symbol, entry, stop, run_id, store, account, "trail")
         if isinstance(opened, str):
             return opened
-        entry, stop, account = opened
+        entry, stop, account, known = opened
         if account is None:
-            holders = sorted(p.account for p in held_positions(self.ib, symbol))
-            if len(holders) != 1:
-                return (
-                    f"{symbol} is held in {len(holders)} accounts ({', '.join(holders) or 'none'}); "
-                    f"name one: 'trail {symbol} ACCOUNT' or 'trail {symbol} ENTRY STOP ACCOUNT'."
-                )
-            account = holders[0]
+            return f"No {symbol} position in any account; trail not started."
         # Direction is inferred from stop vs. entry, and orders go the way it
         # says -- so it has to match what is actually held. It won't when the
         # stop has already been raised past entry (looks like a short).
-        held = sum(p.position for p in held_positions(self.ib, symbol) if p.account == account)
+        held = self._held(symbol, account)
         if held == 0:
             return f"No {symbol} position in {account}; trail not started."
         if (held > 0) != (stop < entry):
@@ -762,10 +856,15 @@ class LiveDriver:
                 f"risk: 'trail {symbol} ENTRY STOP'."
             )
 
-        self.tracker.untrack(symbol)
+        opened_at = known.opened_at if known is not None else None
+        opened_at = opened_at or await self._opened_at(symbol, account)
+        closes = self._closes_since(symbol, opened_at)
+        best = (max if stop < entry else min)(closes) if closes else None
+
+        self.tracker.untrack(symbol, account)
         close = await self._session_close(symbol)
         eod_exit = _minute_before(self.session, close) if close else None
-        trade = self.trailer.track(symbol, entry, stop, account, eod_exit)
+        trade = self.trailer.track(symbol, entry, stop, account, eod_exit, opened_at, best)
         mode = " (dry run -- no orders)" if self.executor.dry_run else ""
         eod = f"exits at {trade.eod_exit:%H:%M} ET if under 2R"
         if close is None:
@@ -774,8 +873,39 @@ class LiveDriver:
             f"{_ANSI_BLACK}{_accent('TRAIL', _ANSI_BROWN)} {_bold(symbol)} "
             f"{trade.direction}: entry {entry:.2f} stop {stop:.2f} "
             f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}) [{account}]; "
-            f"{eod}{mode}{_ANSI_RESET}"
+            f"{eod}{mode}{_ANSI_RESET}\n  {_trail_start_state(trade, closes)}"
         )
+
+    async def _opened_at(self, symbol: str, account: str) -> datetime | None:
+        """When today's fills opened the position now held in `account`:
+        walking back from its current size to the fill that took it off
+        zero. None when today's fills don't account for all of it -- held
+        from an earlier day, or filled where this login can't see."""
+        held = self._held(symbol, account)
+        try:
+            fills = await asyncio.wait_for(
+                self.ib.reqExecutionsAsync(ExecutionFilter(acctCode=account, symbol=symbol)), 10
+            )
+        except Exception:
+            logger.exception("Could not read today's %s fills", symbol)
+            return None
+        return opening_fill_time(
+            held,
+            [f for f in fills if f.contract.symbol == symbol and f.execution.acctNumber == account],
+        )
+
+    def _closes_since(self, symbol: str, since: datetime | None) -> list[float]:
+        """Today's completed 1-min closes ending after `since`, from the
+        bar subscription's own history. Empty when `since` is unknown."""
+        bars = self._subs.get(symbol)
+        if since is None or not bars:
+            return []
+        closes = []
+        for b in list(bars)[:-1]:  # the last bar is still forming
+            ev = self._to_bar_event(symbol, b)
+            if ev is not None and ev.end > since:
+                closes.append(ev.close)
+        return closes
 
     async def _session_close(self, symbol: str) -> time | None:
         """Today's regular-hours close for `symbol`, from IBKR's own
@@ -797,13 +927,14 @@ class LiveDriver:
             logger.exception("Could not read the trading schedule for %s", symbol)
         return None
 
-    def untrack(self, symbol: str) -> bool:
-        """Stop `track` and `trail` alike -- the position goes back to the
-        trader's hands. Orders already at IBKR stay as they are."""
-        return self.tracker.untrack(symbol) | self.trailer.untrack(symbol)
+    def untrack(self, symbol: str, account: str | None = None) -> list[TrackedTrade]:
+        """Stop `track` and `trail` alike, in `account` or in every account
+        -- the position goes back to the trader's hands. Orders already at
+        IBKR stay as they are. Returns the trades dropped."""
+        return self.tracker.untrack(symbol, account) + self.trailer.untrack(symbol, account)
 
     async def _act_on_trail(self, action: TrailAction, run_id: str, store: TriggerStore) -> None:
-        trade = self.trailer.trades.get(action.symbol)
+        trade = self.trailer.trades.get((action.symbol, action.account))
         if trade is None:
             return
         try:
@@ -991,14 +1122,16 @@ class LiveDriver:
             if stop is None:
                 _print_order_notice(sym, f"{head}; no working stop -- not tracked")
                 return
-            if sym in self.tracker.trades or sym in self.trailer.trades:
-                _print_order_notice(sym, f"{head}; already tracked/trailed -- left as is")
+            key = (sym, ticket.account)
+            if key in self.tracker.trades or key in self.trailer.trades:
+                _print_order_notice(sym, f"{head}; already tracked/trailed in {ticket.account} -- left as is")
                 return
             long = ticket.req.direction == "long"
             if (stop >= fill) if long else (stop <= fill):
                 _print_order_notice(sym, f"{head}; stop {stop:.2f} is past the fill -- not tracked")
                 return
-            msg = await self.track(scanner, sym, fill, stop, run_id, store, ticket.account)
+            opened_at = pt.fills[0].time.astimezone(ET) if pt.fills else datetime.now(ET)
+            msg = await self.track(scanner, sym, fill, stop, run_id, store, ticket.account, opened_at)
             _print_order_notice(sym, f"{head}; {msg}")
         except Exception as e:
             logger.exception("watching the %s entry failed", sym)
@@ -1105,7 +1238,7 @@ class LiveDriver:
             "SELL" if long else "BUY", abs(held), account, req.order_type, req.price
         )
         outcome = await self.desk.exit(sym, contract, stops, order)
-        if outcome.ok and not self.desk.dry_run and self.untrack(sym):
+        if outcome.ok and not self.desk.dry_run and self.untrack(sym, account):
             outcome.text += "; tracking ended"
         others = [t for t in working if t not in stops]
         if others:
@@ -1273,9 +1406,8 @@ class LiveDriver:
                     store.commit()
                     _print_setup_alert(alert, alert.symbol in self.positions)
 
-                track_alert = self.tracker.on_close(symbol, bar_event.close, bar_event.start)
-                if track_alert is not None:
-                    trade = self.tracker.trades[symbol]
+                for track_alert in self.tracker.on_close(symbol, bar_event.close, bar_event.start):
+                    trade = self.tracker.trades[symbol, track_alert.account]
                     store.record_alert(
                         run_id,
                         track_alert.kind,
@@ -1296,10 +1428,9 @@ class LiveDriver:
                     store.commit()
                     _print_track_alert(track_alert, trade)
 
-                trail_action = self.trailer.on_close(
+                for trail_action in self.trailer.on_close(
                     symbol, bar_event.close, bar_event.start, bar_event.end
-                )
-                if trail_action is not None:
+                ):
                     # Orders are awaited, and this callback is not async.
                     # The rule has already moved on (an exit marks the trade
                     # done), so a second close can't send a second order.

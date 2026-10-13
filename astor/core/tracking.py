@@ -45,6 +45,9 @@ class TrackedTrade:
     # trail only: when the end-of-day rule fires for this trade -- one
     # minute before its own session's close (see TrailTracker.track)
     eod_exit: time | None = None
+    # When the position was opened, if known -- `trail` measures its best
+    # close from here rather than from the moment it was started
+    opened_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.stop == self.entry:
@@ -73,6 +76,50 @@ class TrackedTrade:
     def more_favorable(self, a: float, b: float) -> float:
         return max(a, b) if self.direction == "long" else min(a, b)
 
+    @property
+    def key(self) -> TradeKey:
+        return self.symbol, self.account
+
+
+# One trade per symbol *per account*: the same symbol can be short in one
+# account and long in another, and each is its own trade. None is an account
+# this login can't see (ENTRY STOP given by hand).
+TradeKey = tuple[str, str | None]
+
+
+class _Book:
+    """The trades a tracker owns, keyed by (symbol, account).
+
+    A trade with no account stands for the symbol in whatever single
+    account holds it, so it and an account-specific trade of the same
+    symbol never coexist: tracking either replaces the other.
+    """
+
+    def __init__(self) -> None:
+        self.trades: dict[TradeKey, TrackedTrade] = {}
+
+    def _add(self, trade: TrackedTrade) -> TrackedTrade:
+        if trade.account is None:
+            self.untrack(trade.symbol)
+        else:
+            self.trades.pop((trade.symbol, None), None)
+        self.trades[trade.key] = trade
+        return trade
+
+    def for_symbol(self, symbol: str) -> list[TrackedTrade]:
+        return [t for (s, _), t in self.trades.items() if s == symbol]
+
+    def untrack(self, symbol: str, account: str | None = None) -> list[TrackedTrade]:
+        """Drop `symbol`'s trade in `account`, or in every account when
+        `account` is None. Returns what was dropped."""
+        gone = [
+            t for t in self.for_symbol(symbol)
+            if account is None or t.account in (account, None)
+        ]
+        for t in gone:
+            del self.trades[t.key]
+        return gone
+
 
 @dataclass(frozen=True, slots=True)
 class TrackAlert:
@@ -80,30 +127,33 @@ class TrackAlert:
     symbol: str
     close: float
     bar_start: datetime
+    account: str | None = None
 
 
-class SellRuleTracker:
-    """Owns every trade currently being tracked, keyed by symbol -- one
-    tracked trade per symbol at a time; re-tracking a symbol replaces it.
+class SellRuleTracker(_Book):
+    """Owns every trade currently being tracked -- one per symbol and
+    account; re-tracking one replaces it.
     """
 
-    def __init__(self) -> None:
-        self.trades: dict[str, TrackedTrade] = {}
-
     def track(
-        self, symbol: str, entry: float, stop: float, account: str | None = None
+        self,
+        symbol: str,
+        entry: float,
+        stop: float,
+        account: str | None = None,
+        opened_at: datetime | None = None,
     ) -> TrackedTrade:
-        trade = TrackedTrade(symbol, entry, stop, account)
-        self.trades[symbol] = trade
-        return trade
+        return self._add(TrackedTrade(symbol, entry, stop, account, opened_at=opened_at))
 
-    def untrack(self, symbol: str) -> bool:
-        return self.trades.pop(symbol, None) is not None
+    def on_close(self, symbol: str, close: float, bar_start: datetime) -> list[TrackAlert]:
+        """Every alert `symbol`'s close sets off, one per account at most."""
+        alerts = [self._step(t, close, bar_start) for t in self.for_symbol(symbol)]
+        return [a for a in alerts if a is not None]
 
-    def on_close(self, symbol: str, close: float, bar_start: datetime) -> TrackAlert | None:
-        trade = self.trades.get(symbol)
-        if trade is None or trade.state == "done":
+    def _step(self, trade: TrackedTrade, close: float, bar_start: datetime) -> TrackAlert | None:
+        if trade.state == "done":
             return None
+        symbol, account = trade.key
 
         if trade.state == "watching":
             if not trade.is_favorable(close):
@@ -111,7 +161,7 @@ class SellRuleTracker:
             trade.state = "armed"
             trade.peak = close
             trade.armed_at = bar_start
-            return TrackAlert("breakeven", symbol, close, bar_start)
+            return TrackAlert("breakeven", symbol, close, bar_start, account)
 
         # armed: track the running peak, fire once giveback from it hits 0.5R
         assert trade.peak is not None
@@ -119,7 +169,7 @@ class SellRuleTracker:
         giveback = abs(trade.peak - close)
         if giveback >= 0.5 * trade.r:
             trade.state = "done"
-            return TrackAlert("sell", symbol, close, bar_start)
+            return TrackAlert("sell", symbol, close, bar_start, account)
         return None
 
 
@@ -147,6 +197,7 @@ class TrailAction:
     symbol: str
     close: float
     bar_start: datetime
+    account: str | None = None
     giveback: float = 0.0
     limit: float = 0.0
 
@@ -171,7 +222,7 @@ def giveback_limit(trade: TrackedTrade) -> float:
     return trade.r
 
 
-class TrailTracker:
+class TrailTracker(_Book):
     """The trail rules, on 1-min closes like `SellRuleTracker` but with a
     different giveback rule (`giveback_limit`) that applies from the start,
     not only after +1R: a trade that runs +0.5R and closes back at -0.5R has
@@ -179,13 +230,16 @@ class TrailTracker:
 
     `peak` starts at entry, so a trade that never trades in its favor
     measures giveback from entry -- which puts the 1R exit at the original
-    stop, where the stop order already is.
+    stop, where the stop order already is. A trail started on a trade
+    already under way is handed the best close since entry instead
+    (`track(peak=...)`), so a giveback that happened before the command
+    still counts.
 
     Pure: says what should happen. Placing it is `astor.drivers.orders`.
     """
 
     def __init__(self, eod_exit: time | None = EOD_EXIT) -> None:
-        self.trades: dict[str, TrackedTrade] = {}
+        super().__init__()
         self.eod_exit = eod_exit
 
     def track(
@@ -195,24 +249,31 @@ class TrailTracker:
         stop: float,
         account: str | None = None,
         eod_exit: time | None = None,
+        opened_at: datetime | None = None,
+        peak: float | None = None,
     ) -> TrackedTrade:
         """`eod_exit` is this trade's own cutoff, from its session's close;
-        None takes the tracker's default."""
+        None takes the tracker's default. `peak` is the best close already
+        seen since entry, if any -- never worse than entry itself."""
         trade = TrackedTrade(
-            symbol, entry, stop, account, peak=entry, eod_exit=eod_exit or self.eod_exit
+            symbol, entry, stop, account, eod_exit=eod_exit or self.eod_exit, opened_at=opened_at
         )
-        self.trades[symbol] = trade
-        return trade
-
-    def untrack(self, symbol: str) -> bool:
-        return self.trades.pop(symbol, None) is not None
+        trade.peak = entry if peak is None else trade.more_favorable(entry, peak)
+        return self._add(trade)
 
     def on_close(
         self, symbol: str, close: float, bar_start: datetime, bar_end: datetime | None = None
+    ) -> list[TrailAction]:
+        """Every action `symbol`'s close calls for, one per account at most."""
+        actions = [self._step(t, close, bar_start, bar_end) for t in self.for_symbol(symbol)]
+        return [a for a in actions if a is not None]
+
+    def _step(
+        self, trade: TrackedTrade, close: float, bar_start: datetime, bar_end: datetime | None
     ) -> TrailAction | None:
-        trade = self.trades.get(symbol)
-        if trade is None or trade.state == "done":
+        if trade.state == "done":
             return None
+        symbol, account = trade.key
         assert trade.peak is not None
         trade.peak = trade.more_favorable(trade.peak, close)
 
@@ -225,18 +286,25 @@ class TrailTracker:
             and trade.gain_r(close) < EOD_HOLD_R
         ):
             trade.state = "done"
-            return TrailAction("eod", symbol, close, bar_start)
+            return TrailAction("eod", symbol, close, bar_start, account)
 
-        if trade.state == "watching" and trade.is_favorable(close):
-            trade.state = "armed"
-            trade.armed_at = bar_start
-            return TrailAction("breakeven", symbol, close, bar_start)
-
+        # The exit is checked before breakeven: on a trade that ran past +1R
+        # before trail was started, the first close may already have given
+        # back too much, and the exit takes the stops with it anyway. On a
+        # trade trailed from entry the two can't land on the same close --
+        # the close that first reaches +1R is the peak, with nothing given back.
         giveback = abs(trade.peak - close)
         limit = giveback_limit(trade)
         # Rounded first: closes and R are cent prices, and a giveback of
         # exactly the limit must not miss it on float noise.
         if round(giveback, 6) >= round(limit, 6):
             trade.state = "done"
-            return TrailAction("exit", symbol, close, bar_start, giveback, limit)
+            return TrailAction("exit", symbol, close, bar_start, account, giveback, limit)
+
+        # Off the peak, not this close: a trade handed a peak already past
+        # +1R gets its breakeven on the first close, wherever that is.
+        if trade.state == "watching" and trade.is_favorable(trade.peak):
+            trade.state = "armed"
+            trade.armed_at = bar_start
+            return TrailAction("breakeven", symbol, close, bar_start, account)
         return None
