@@ -365,7 +365,7 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     with the real one; it is the real one, just narrated.
     """
     symbol = args.ticker.upper().replace(".", " ")
-    setup_cls = SETUPS_BY_NAME.get(args.setup)
+    setup_cls = SETUPS_BY_NAME.get(args.setup.upper())  # rev-s == REV-S
     if setup_cls is None:
         logger.error("Unknown setup %r. Choices: %s", args.setup, ", ".join(SETUPS_BY_NAME))
         return 2
@@ -411,7 +411,7 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     alert_lines = _alert_timeline(replay_alerts, received)
 
     print("\n" + "=" * 78)
-    print(f"EXPLAIN {args.setup} {symbol} {session}")
+    print(f"EXPLAIN {setup_cls.name} {symbol} {session}")
     print("=" * 78)
     print(
         f"PDH {lv.pdh:.2f}  PDL {lv.pdl:.2f}  ADR({args.adr_sessions}) {lv.adr_pct:.2f}% "
@@ -442,7 +442,7 @@ async def cmd_explain(args: argparse.Namespace) -> int:
     )
     if not lines:
         print(
-            f"\nNo decision points at all -- {args.setup} never even armed or "
+            f"\nNo decision points at all -- {setup_cls.name} never even armed or "
             f"tracked a leg for {symbol} on {session}."
         )
     else:
