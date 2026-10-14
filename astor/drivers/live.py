@@ -30,6 +30,7 @@ from ib_async import (
     Trade,
 )
 
+from astor.core.commissions import shares_for_risk, trade_risk
 from astor.core.order_entry import (
     ACCOUNT_SUFFIX,
     CommandError,
@@ -401,8 +402,7 @@ def _overshoot_cost(
     falls. None when the sizing is meaningless anyway (no risk, no budget).
     """
     def shares_at(entry: float) -> int:
-        risk = abs(entry - stop)
-        return int(max_loss / risk) if risk > 0 else 0
+        return shares_for_risk(entry, stop, max_loss)
 
     base = shares_at(target)
     if base <= 0:
@@ -1095,10 +1095,11 @@ class LiveDriver:
         # Pared to what is decided at the prompt: side, size, how, the stop,
         # what is at risk. SELL/BUY repeats long/short, DAY and GTC never
         # vary (entries DAY, stops GTC), and Adaptive's priority is fixed.
+        # Risk counts the commission in and out, not just the distance.
         ref = req.price or market
         size = f", {_bold(f'~${req.qty * ref:,.0f}')}" if ref else ""
         stop = (
-            f", stop {child.auxPrice:.2f} (risk {_bold(f'${req.qty * abs(ref - child.auxPrice):,.0f}')})"
+            f", stop {child.auxPrice:.2f} (risk {_bold(f'${trade_risk(req.qty, ref, child.auxPrice):,.0f}')})"
             if child is not None and ref else
             f", stop {child.auxPrice:.2f}" if child is not None else ", NO stop"
         )

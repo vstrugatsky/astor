@@ -478,8 +478,10 @@ def test_position_size() -> None:
     from astor.core.setups import _position_size
 
     shares, dollars = _position_size(entry=100.0, stop=98.0, max_loss=100.0)
-    check("shares = floor(100 / 2)", shares, 50)
-    check("dollars = 50 * entry", dollars, 5000.0)
+    # 50 shares is $100 of distance alone; the $1 commission each way
+    # leaves room for 49 ($98 + $2).
+    check("shares = what $100 buys after commissions", shares, 49)
+    check("dollars = 49 * entry", dollars, 4900.0)
 
     check("zero risk per share -> no size", _position_size(100.0, 100.0, 100.0), (None, None))
     check(
@@ -838,6 +840,29 @@ def test_alert_line_is_an_order_ticket() -> None:
     # Everything that explains *why* it fired is deliberately absent.
     for gone in ("move_rvol", "accel", "ema9_ext", "leg "):
         check(f"{gone!r} omitted", gone in line, False)
+
+
+def test_commissions_fixed_pricing() -> None:
+    """IBKR Fixed: $0.005 a share, $1 minimum, 1% of value maximum."""
+    from astor.core.commissions import commission, shares_for_risk, trade_risk
+
+    check("30 SKHY: the $1 minimum", commission(30, 156.11), 1.0)
+    check("4,000 shares: per share", round(commission(-4000, 2.50), 2), 20.0)
+    check("10 shares of a $5 stock: 1% cap", round(commission(10, 5.0), 2), 0.5)
+    check("no shares, no commission", commission(0, 10.0), 0.0)
+    check("risk = distance + both sides",
+          round(trade_risk(4000, 2.50, 2.47), 2), 120.0 + 20.0 + 20.0)
+
+    # A low-priced stock bought by the thousand: a 3c stop and $100 of risk
+    # was 3,333 shares on distance alone; 1c a share in commissions makes
+    # it 2,500 ($75 + $12.50 + $12.50).
+    check("cheap stock sized down by commissions", shares_for_risk(2.50, 2.47, 100.0), 2500)
+    for entry, stop, budget in [(2.5, 2.47, 100.0), (156.11, 157.89, 100.0), (7.35, 7.2, 37.0)]:
+        n = shares_for_risk(entry, stop, budget)
+        check(f"{n} fits, {n + 1} doesn't",
+              (trade_risk(n, entry, stop) <= budget, trade_risk(n + 1, entry, stop) > budget),
+              (True, True))
+    check("too wide for one share", shares_for_risk(100.0, 50.0, 10.0), 0)
 
 
 def test_overshoot_cost_scales_with_the_stock() -> None:

@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from typing import ClassVar
 
+from astor.core.commissions import shares_for_risk
 from astor.core.grading import rvol_threshold
 from astor.core.indicators import SessionIndicators, compute_rvol
 from astor.core.types import (
@@ -155,15 +156,13 @@ def _position_size(
     entry: float, stop: float, max_loss: float
 ) -> tuple[int | None, float | None]:
     """Shares and notional dollars sized so that a stop-out at `stop` loses
-    at most `max_loss`, entering at `entry`. (None, None) if that can't be
-    done meaningfully: no distance between entry and stop (division by zero,
-    or the setup and the stop reference happen to coincide), or the risk per
-    share is too large to buy even one share within the budget.
+    at most `max_loss`, entering at `entry` -- commissions in and out
+    included. (None, None) if that can't be done meaningfully: no distance
+    between entry and stop (division by zero, or the setup and the stop
+    reference happen to coincide), or the risk per share is too large to buy
+    even one share within the budget.
     """
-    risk_per_share = abs(entry - stop)
-    if risk_per_share <= 0 or max_loss <= 0:
-        return None, None
-    shares = int(max_loss / risk_per_share)
+    shares = shares_for_risk(entry, stop, max_loss)
     if shares <= 0:
         return None, None
     return shares, round(shares * entry, 2)
