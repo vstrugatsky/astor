@@ -147,7 +147,7 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
 
 def _setups_and_kwargs(args: argparse.Namespace):
     setups = (
-        [SETUPS_BY_NAME[n] for n in args.setups.split(",")]
+        [SETUPS_BY_NAME[n.strip().upper()] for n in args.setups.split(",")]
         if args.setups
         else ALL_SETUPS
     )
