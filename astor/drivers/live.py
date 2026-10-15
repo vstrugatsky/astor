@@ -1193,6 +1193,16 @@ class LiveDriver:
             notes.append("no quote -- risk without slippage")
         if held:
             notes.append(f"adds to {abs(held):g} held")
+        # 'sell' reads as closing a long, but it opens a short -- say so
+        # whenever the other side is held, in either account.
+        sign = 1 if req.direction == "long" else -1
+        for p in held_positions(self.ib, req.symbol):
+            if p.position * sign < 0:
+                side = "long" if p.position > 0 else "short"
+                notes.append(_bold(
+                    f"you are {side} {abs(p.position):g} in {_account_tag(p.account).strip(' []')}"
+                    f" -- this opens a {req.direction}; 'exit {req.symbol}' closes"
+                ))
         if not in_rth:
             notes.append("queued for the open" if req.order_type == "MKT" else "works from the open")
         # Pared to what is decided at the prompt: side, size, how, the stop,

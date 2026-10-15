@@ -90,32 +90,49 @@ class EnterRequest:
 
 
 ENTER_USAGE = (
-    "enter SYM [ACCOUNT] l|s QTY mkt|alg|lmt PRICE|stp PRICE [stop PRICE]"
-    "  e.g. 'enter SPCX short 20 stp 170.10 stop 172.01'"
+    "enter SYM [ACCOUNT] l|s QTY [mkt|alg|lmt PRICE|stp PRICE] [stop PRICE]"
+    "  e.g. 'enter SPCX short 20 stp 170.10 stop 172.01'; the type defaults to alg"
+)
+BUY_SELL_USAGE = (
+    "buy|sell SYM [ACCOUNT] QTY [mkt|alg|lmt PRICE|stp PRICE] [stop PRICE]"
+    "  e.g. 'buy NVDA 100 stop 35.99' -- Adaptive unless a type is given"
 )
 
 
-def parse_enter(rest: str) -> EnterRequest:
+def parse_enter(rest: str, direction: str | None = None) -> EnterRequest:
+    """`enter SYM [ACCOUNT] l|s QTY ...`, or with `direction` given --
+    `buy`/`sell`, the same order with the direction in the verb -- without
+    the l|s. The order type is optional: none means Adaptive."""
+    usage = ENTER_USAGE if direction is None else BUY_SELL_USAGE
     tokens = rest.split()
     if not tokens:
-        raise CommandError(ENTER_USAGE)
+        raise CommandError(usage)
     symbol = _symbol(tokens[0])
     account, tokens = _split_account(tokens[1:])
-    if len(tokens) < 3:
-        raise CommandError(ENTER_USAGE)
-    direction = DIRECTIONS.get(tokens[0].lower())
     if direction is None:
-        raise CommandError(f"direction '{tokens[0]}' is not l/long/s/short")
+        if len(tokens) < 2:
+            raise CommandError(usage)
+        direction = DIRECTIONS.get(tokens[0].lower())
+        if direction is None:
+            raise CommandError(f"direction '{tokens[0]}' is not l/long/s/short")
+        tokens = tokens[1:]
+    if not tokens:
+        raise CommandError(usage)
     try:
-        qty = int(tokens[1])
+        qty = int(tokens[0])
     except ValueError:
-        raise CommandError(f"share count '{tokens[1]}' is not a whole number") from None
+        raise CommandError(f"share count '{tokens[0]}' is not a whole number") from None
     if qty <= 0:
         raise CommandError("share count must be positive")
-    order_type = ENTRY_TYPES.get(tokens[2].lower())
+    tokens = tokens[1:]
+    order_type = ENTRY_TYPES.get(tokens[0].lower()) if tokens else None
     if order_type is None:
-        raise CommandError(f"order type '{tokens[2]}' is not mkt/alg/lmt/stp")
-    tokens = tokens[3:]
+        # No type given: Adaptive. Anything else here is a mistyped type.
+        if tokens and tokens[0].lower() != "stop":
+            raise CommandError(f"'{tokens[0]}' is not an order type (mkt/alg/lmt/stp) or 'stop PRICE'")
+        order_type = "ALG"
+    else:
+        tokens = tokens[1:]
 
     price = None
     if order_type in PRICED:

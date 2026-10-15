@@ -9,7 +9,8 @@
         'track NVDA', 'track NVDA 137.50 130.10' or
         'track NVDA U1234566', 'trail NVDA', 'trail NVDA 137.50 130.10 U1234566',
         'untrail NVDA', 'untrack NVDA', 'positions', 'mute', 'unmute', 'quit'; --dry-run-trail to have trail place no orders)
-        orders: 'enter SPCX short 20 stp 170.10 stop 172.01', 'stop SPCX 170.10',
+        orders: 'buy NVDA 100 stop 35.99' (Adaptive), 'sell SPCX 20 stp 170.10 stop 172.01',
+        'enter SPCX short 20 stp 170.10 stop 172.01', 'stop SPCX 170.10',
         'stop SPCX 1/2 168.05 1/2 170.01', 'cancel SPCX', 'exit SPCX [lmt 168.20]'
         (--dry-run-trail covers these too)
 
@@ -1136,13 +1137,16 @@ _CONSOLE_COMMANDS = (
     "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
     "'positions', 'mute', 'unmute', 'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "
-    "'enter SYM [ACCOUNT] l|s QTY mkt|alg|lmt P|stp P [stop P]', "
+    "'buy|sell SYM [ACCOUNT] QTY [mkt|lmt P|stp P] [stop P]' (Adaptive by default), "
+    "'enter SYM [ACCOUNT] l|s QTY ...' (the same, direction spelled out), "
     "'stop SYM [ACCOUNT] P' or 'stop SYM 1/2 P1 1/2 P2', "
     "'cancel SYM [ACCOUNT]', 'exit SYM [ACCOUNT] [alg|mkt|lmt P]'."
 )
 
 _ORDER_PARSERS = {
     "enter": parse_enter,
+    "buy": lambda rest: parse_enter(rest, "long"),
+    "sell": lambda rest: parse_enter(rest, "short"),
     "stop": parse_stop,
     "cancel": parse_cancel,
     "exit": parse_exit,
@@ -1209,13 +1213,13 @@ async def _live_console(
         if cmd == "quit":
             break
 
-        if cmd in ("enter", "stop", "cancel", "exit"):
+        if cmd in _ORDER_PARSERS:
             try:
                 req = _ORDER_PARSERS[cmd](rest)
             except CommandError as e:
                 print(f"  {e}")
                 continue
-            if cmd == "enter":
+            if cmd in ("enter", "buy", "sell"):
                 ticket = await driver.prepare_entry(req)
                 if isinstance(ticket, str):
                     print(f"  {ticket}")

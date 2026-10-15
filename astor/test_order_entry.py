@@ -58,7 +58,11 @@ def test_enter_malformed() -> None:
     raises("bad direction", parse_enter, "SPCX x 20 mkt")
     raises("fractional qty", parse_enter, "SPCX s 2.5 mkt")
     raises("split stop not on enter", parse_enter, "SPCX s 20 mkt stop 1/2 172 1/2 173")
-    raises("missing type", parse_enter, "SPCX s 20")
+    r = parse_enter("SPCX s 20")
+    check("no type -> Adaptive", (r.order_type, r.stop), ("ALG", None))
+    r = parse_enter("SPCX s 20 stop 172")
+    check("no type, with stop", (r.order_type, r.stop), ("ALG", 172.0))
+    raises("mistyped type", parse_enter, "SPCX s 20 lmit 170")
 
 
 def test_price_rounds_to_tick() -> None:
@@ -131,6 +135,17 @@ def test_stop_problems() -> None:
     check("one wrong", len(stop_problems([95, 101], True, 100.0)), 1)
     check("short above", stop_problems([105], False, 100.0), [])
     check("no market", stop_problems([1], False, None), [])
+
+
+def test_buy_sell_put_the_direction_in_the_verb() -> None:
+    r = parse_enter("nvda 100 stop 35.99", "long")
+    check("buy: compact", (r.symbol, r.direction, r.qty, r.order_type, r.stop),
+          ("NVDA", "long", 100, "ALG", 35.99))
+    r = parse_enter("SPCX reg 20 stp 170.10 stop 172.01", "short")
+    check("sell: account, type, stop", (r.account, r.direction, r.order_type, r.price, r.stop),
+          ("reg", "short", "STP", 170.10, 172.01))
+    raises("sell takes no direction", parse_enter, "SPCX s 20", "short")
+    raises("needs a count", parse_enter, "SPCX", "long")
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
