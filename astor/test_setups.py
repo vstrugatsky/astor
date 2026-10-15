@@ -865,6 +865,42 @@ def test_commissions_fixed_pricing() -> None:
     check("too wide for one share", shares_for_risk(100.0, 50.0, 10.0), 0)
 
 
+def test_slippage_widens_the_risk() -> None:
+    """Half the spread at the stop counts like extra stop distance."""
+    from astor.core.commissions import shares_for_risk, trade_risk
+
+    # CCXI 2026-10-14: in at 10.83, stop 10.70, 1c half spread -- 14c a
+    # share where the distance says 13c.
+    check("slip adds per share", round(trade_risk(500, 10.83, 10.70, 0.01), 2), 70.0 + 2.5 + 2.5)
+    check("no slip, no change", trade_risk(500, 10.83, 10.70), trade_risk(500, 10.83, 10.70, 0.0))
+    check("sized down for the slip", shares_for_risk(10.83, 10.70, 100.0, 0.01) < shares_for_risk(10.83, 10.70, 100.0), True)
+    n = shares_for_risk(10.83, 10.70, 100.0, 0.01)
+    check(f"{n} fits with slip, {n + 1} doesn't",
+          (trade_risk(n, 10.83, 10.70, 0.01) <= 100.0, trade_risk(n + 1, 10.83, 10.70, 0.01) > 100.0),
+          (True, True))
+
+
+def test_alert_line_sizes_for_the_spread() -> None:
+    from astor.core.types import CapitulationAlert
+    from astor.drivers.live import _format_order_alert
+
+    a = CapitulationAlert(
+        symbol="ABAT", direction="short", bar_start=OPEN,
+        bar_end=OPEN + timedelta(minutes=1), price=2.40,
+        leg_extreme=2.62, anchor=2.95, leg_size_adr=1.25, move_rvol=2.5,
+        ema9_extension_adr=0.6723, accel_price=4.6667, accel_vol=1.0,
+        target=2.55, target_basis="retrace", stop=2.62, shares=1228,
+        dollars=3131.4, max_loss_dollars=100.0,
+        exit_target=2.20, rr=5.0, pace_adr1=0.004, pace_adr=0.011,
+    )
+    # 7c of distance + 1c of half spread + 1c a share in commissions
+    sized = _format_order_alert("C", a, slip=0.01)
+    check("resized with the quote", ("1111" in sized, "1228" in sized, "no quote" in sized), (True, False, False))
+    no_quote = _format_order_alert("C", a)
+    check("no quote: the setup's own size", "1228" in no_quote, True)
+    check("and says so", "(no quote, no slippage)" in no_quote, True)
+
+
 def test_overshoot_cost_scales_with_the_stock() -> None:
     """The step size is found, not assumed: a cheap stock on a tight stop
     loses shares by the cent, an expensive one by the dime."""

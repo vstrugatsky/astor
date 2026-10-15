@@ -27,6 +27,7 @@ from ib_async import (
     Order,
     PnLSingle,
     Position,
+    Ticker,
     Trade,
 )
 
@@ -390,7 +391,7 @@ _OVERSHOOT_STEPS = (0.01, 0.02, 0.05, 0.10, 0.25, 0.50, 1.00, 2.50, 5.00)
 
 
 def _overshoot_cost(
-    target: float, stop: float, max_loss: float, direction: str
+    target: float, stop: float, max_loss: float, direction: str, slip: float = 0.0
 ) -> tuple[float, int] | None:
     """(price step, shares lost) -- the first step size that costs a whole
     share if the fill comes in past the target.
@@ -402,7 +403,7 @@ def _overshoot_cost(
     falls. None when the sizing is meaningless anyway (no risk, no budget).
     """
     def shares_at(entry: float) -> int:
-        return shares_for_risk(entry, stop, max_loss)
+        return shares_for_risk(entry, stop, max_loss, slip)
 
     base = shares_at(target)
     if base <= 0:
@@ -415,7 +416,9 @@ def _overshoot_cost(
     return None
 
 
-def _format_order_alert(label: str, a: SetupAlert, held: bool = False) -> str:
+def _format_order_alert(
+    label: str, a: SetupAlert, held: bool = False, slip: float | None = None
+) -> str:
     """One line, sized to be acted on rather than studied.
 
     Everything that describes *why* the alert fired -- the leg, the touch,
@@ -425,13 +428,22 @@ def _format_order_alert(label: str, a: SetupAlert, held: bool = False) -> str:
     allows, and how fast that size decays if the fill overshoots.
     """
     color = _ANSI_GREEN if a.direction == "long" else _ANSI_RED
-    if a.shares is None or a.target is None:
+    # `slip` is half the live spread, paid at the stop (astor.core.
+    # commissions); the setup sized from bars alone, which have no quote.
+    # None: no quote came, so the setup's own size stands, and says so.
+    shares, dollars = a.shares, a.dollars
+    if slip is not None and a.target is not None:
+        shares = shares_for_risk(a.target, a.stop, a.max_loss_dollars, slip) or None
+        dollars = shares * a.target if shares else None
+    if shares is None or a.target is None:
         sized = "no size (risk too wide)"
     else:
-        sized = f"sh: {_bold(str(a.shares))} (${a.dollars:,.0f})"
+        sized = f"sh: {_bold(str(shares))} (${dollars:,.0f})"
+        if slip is None:
+            sized += " (no quote, no slippage)"
     tail = ""
-    if a.target is not None and a.shares:
-        cost = _overshoot_cost(a.target, a.stop, a.max_loss_dollars, a.direction)
+    if a.target is not None and shares:
+        cost = _overshoot_cost(a.target, a.stop, a.max_loss_dollars, a.direction, slip or 0.0)
         if cost is not None:
             step, lost = cost
             beyond = "above" if a.direction == "long" else "below"
@@ -460,12 +472,14 @@ def _format_order_alert(label: str, a: SetupAlert, held: bool = False) -> str:
     )
 
 
-def _print_setup_alert(a: SetupAlert, held: bool = False, bell: bool = True) -> None:
+def _print_setup_alert(
+    a: SetupAlert, held: bool = False, bell: bool = True, slip: float | None = None
+) -> None:
     """One entry point for every setup-produced alert; the only thing that
     differs by kind is what it is called."""
     _print_alert(
         _format_order_alert(
-            "AVWAP TOUCH" if isinstance(a, TouchAlert) else "CAPITULATION", a, held
+            "AVWAP TOUCH" if isinstance(a, TouchAlert) else "CAPITULATION", a, held, slip
         ),
         bell,
     )
@@ -538,6 +552,24 @@ def opening_fill_time(held: float, fills: list[Fill]) -> datetime | None:
         remaining -= f.execution.shares if f.execution.side == "BOT" else -f.execution.shares
         if round(remaining, 6) == 0 or (remaining > 0) != (held > 0):
             return f.time.astimezone(ET)
+    return None
+
+
+def _price_of(t: Ticker | None) -> float | None:
+    """Last if it's inside the quote, else the midpoint; None if neither."""
+    for p in (t.marketPrice(), t.last, t.midpoint()) if t is not None else ():
+        if p is not None and math.isfinite(p) and p > 0:
+            return p
+    return None
+
+
+def _half_spread_of(t: Ticker | None) -> float | None:
+    """Half the bid/ask spread, once both sides are in."""
+    if t is None:
+        return None
+    bid, ask = t.bid, t.ask
+    if bid is not None and ask is not None and math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask:
+        return (ask - bid) / 2
     return None
 
 
@@ -616,6 +648,8 @@ class LiveDriver:
         )
         self._entry_tasks: set[asyncio.Task] = set()
         self._trail_tasks: set[asyncio.Task] = set()
+        self._alert_tasks: set[asyncio.Task] = set()
+        self._spreads: dict[str, asyncio.Task] = {}  # symbol -> quote in flight
         # `mute`: setup alerts print without the bell. track, trail and
         # order notices always ring -- they are about money already in.
         self.muted = False
@@ -1029,19 +1063,59 @@ class LiveDriver:
     async def _contract(self, symbol: str) -> Contract | None:
         return (await self._ref.qualify([symbol])).get(symbol)
 
+    async def _snapshot(self, contract: Contract) -> Ticker | None:
+        try:
+            [t] = await asyncio.wait_for(self.ib.reqTickersAsync(contract), 5)
+            return t
+        except Exception:
+            logger.exception("No market snapshot for %s", contract.symbol)
+            return None
+
     async def _market_price(self, contract: Contract) -> float | None:
         """The current price for the side checks: last if it's inside the
         quote, else the midpoint. None when neither arrives -- the checks
         that need it are then skipped rather than blocking the order."""
+        return _price_of(await self._snapshot(contract))
+
+    async def _half_spread(self, contract: Contract, timeout: float = 1.0) -> float | None:
+        """Half the bid/ask spread right now, from a brief streaming
+        subscription -- quicker than a snapshot, which waits for every
+        tick type. None if no two-sided quote arrives in `timeout`. Two
+        alerts on one symbol share the one subscription."""
+        sym = contract.symbol
+        if sym not in self._spreads:
+            task = asyncio.create_task(self._stream_half_spread(contract, timeout))
+            self._spreads[sym] = task
+            task.add_done_callback(lambda _: self._spreads.pop(sym, None))
+        return await asyncio.shield(self._spreads[sym])
+
+    async def _stream_half_spread(self, contract: Contract, timeout: float) -> float | None:
+        ticker = self.ib.reqMktData(contract)
         try:
-            [t] = await asyncio.wait_for(self.ib.reqTickersAsync(contract), 5)
-        except Exception:
-            logger.exception("No market snapshot for %s", contract.symbol)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while loop.time() < deadline:
+                if (half := _half_spread_of(ticker)) is not None:
+                    return half
+                await asyncio.sleep(0.05)
             return None
-        for p in (t.marketPrice(), t.last, t.midpoint()):
-            if p is not None and math.isfinite(p) and p > 0:
-                return p
-        return None
+        except Exception:
+            logger.exception("No quote for %s", contract.symbol)
+            return None
+        finally:
+            self.ib.cancelMktData(contract)
+
+    async def _print_setup_alert_sized(self, alert: SetupAlert, held: bool, bell: bool) -> None:
+        """The alert, its size cut for slippage at the stop. Waits at most
+        a second for the quote; the alert prints either way."""
+        slip = None
+        try:
+            bars = self._subs.get(alert.symbol)
+            contract = getattr(bars, "contract", None)
+            if contract is not None:
+                slip = await self._half_spread(contract)
+        finally:
+            _print_setup_alert(alert, held, bell, slip)
 
     async def _in_rth(self, symbol: str) -> bool:
         now = datetime.now(ET)
@@ -1104,7 +1178,8 @@ class LiveDriver:
         in_rth = await self._in_rth(req.symbol)
         if req.order_type == "ALG" and not in_rth:
             return "Adaptive is regular-hours only; outside them use lmt or stp."
-        market = await self._market_price(contract)
+        snapshot = await self._snapshot(contract)
+        market, half = _price_of(snapshot), _half_spread_of(snapshot)
         held = self._held(req.symbol, account)
         problems = entry_problems(req, market, held)
         if problems:
@@ -1114,6 +1189,8 @@ class LiveDriver:
         notes = []
         if market is None:
             notes.append("no market price -- side checks skipped")
+        if half is None:
+            notes.append("no quote -- risk without slippage")
         if held:
             notes.append(f"adds to {abs(held):g} held")
         if not in_rth:
@@ -1121,11 +1198,15 @@ class LiveDriver:
         # Pared to what is decided at the prompt: side, size, how, the stop,
         # what is at risk. SELL/BUY repeats long/short, DAY and GTC never
         # vary (entries DAY, stops GTC), and Adaptive's priority is fixed.
-        # Risk counts the commission in and out, not just the distance.
+        # Risk counts the commission in and out, and slippage: half the
+        # spread at the stop, and again at the entry when it goes in as a
+        # market order (STP, MKT). Adaptive fills at or inside the mid, and
+        # a limit can't fill past its price (astor.core.commissions).
+        slip = (half or 0.0) * (2 if req.order_type in ("STP", "MKT") else 1)
         ref = req.price or market
         size = f", {_bold(f'~${req.qty * ref:,.0f}')}" if ref else ""
         stop = (
-            f", stop {child.auxPrice:.2f} (risk {_bold(f'${trade_risk(req.qty, ref, child.auxPrice):,.0f}')})"
+            f", stop {child.auxPrice:.2f} (risk {_bold(f'${trade_risk(req.qty, ref, child.auxPrice, slip):,.0f}')})"
             if child is not None and ref else
             f", stop {child.auxPrice:.2f}" if child is not None else ", NO stop"
         )
@@ -1526,7 +1607,12 @@ class LiveDriver:
                         bar_end=alert.bar_end,
                     )
                     store.commit()
-                    _print_setup_alert(alert, alert.symbol in self.positions, not self.muted)
+                    # The quote for slippage is awaited; this callback isn't async.
+                    task = asyncio.create_task(self._print_setup_alert_sized(
+                        alert, alert.symbol in self.positions, not self.muted
+                    ))
+                    self._alert_tasks.add(task)
+                    task.add_done_callback(self._alert_tasks.discard)
 
                 for track_alert in self.tracker.on_close(symbol, bar_event.close, bar_event.start):
                     trade = self.tracker.trades[symbol, track_alert.account]
