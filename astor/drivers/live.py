@@ -619,6 +619,32 @@ class LiveDriver:
         # `mute`: setup alerts print without the bell. track, trail and
         # order notices always ring -- they are about money already in.
         self.muted = False
+        ib.positionEvent += self._on_position
+
+    def _on_position(self, pos: Position) -> None:
+        """A position gone flat ends its trade -- stopped out, sold in TWS,
+        or exited by trail. Without this the trade lingers: `track` keeps
+        alerting on it, and a re-entry reads as an add to it (CCXI
+        2026-10-14, stopped out and re-entered)."""
+        if pos.position != 0:
+            return
+        try:
+            sym = pos.contract.symbol
+            # A trade with no account stands for whichever account holds
+            # the symbol, so it ends only when none does.
+            accounts = [pos.account] + ([None] if not held_positions(self.ib, sym) else [])
+            gone = [
+                t for book in (self.tracker, self.trailer) for a in accounts
+                if (t := book.trades.pop((sym, a), None)) is not None
+            ]
+            # One trail or `exit` already closed is quiet; anything else is news.
+            if any(t.state != "done" for t in gone):
+                _print_order_notice(
+                    sym, f"position closed {_account_tag(pos.account).strip()} -- no longer tracked/trailed"
+                )
+        except Exception:
+            # ib_async event dispatch: log rather than lose it
+            logger.exception("handling a position update failed")
 
     @property
     def positions(self) -> set[str]:
@@ -1163,8 +1189,14 @@ class LiveDriver:
                 return
             key = (sym, ticket.account)
             if key in self.tracker.trades or key in self.trailer.trades:
-                filled(f"already tracked/trailed in {ticket.account} -- left as is")
-                return
+                # Nothing held beyond this fill (or IBKR's count not caught
+                # up yet): the old trade is over -- stopped out, then
+                # re-entered -- even if its flat position was never seen.
+                if self._held(sym, ticket.account) not in (0, shares):
+                    filled(f"adds to the trade tracked/trailed {_account_tag(ticket.account).strip()} -- left as is")
+                    return
+                self.tracker.trades.pop(key, None)
+                self.trailer.trades.pop(key, None)
             long = ticket.req.direction == "long"
             if (stop >= fill) if long else (stop <= fill):
                 filled(f"stop {stop:.2f} is past the fill -- not tracked")

@@ -355,6 +355,46 @@ def test_opening_fill_time_walks_back_to_zero() -> None:
     check("held from before today", opening_fill_time(-8, fills[2:]), None)
 
 
+def _driver_holding(*held: tuple[str, str, float]):
+    """A LiveDriver with only its books and a fake IB holding `held`
+    (symbol, account, shares) -- enough for `_on_position`."""
+    from types import SimpleNamespace as NS
+
+    from astor.drivers.live import LiveDriver
+
+    d = LiveDriver.__new__(LiveDriver)
+    d.tracker, d.trailer = SellRuleTracker(), TrailTracker()
+    positions = [NS(contract=NS(symbol=s), account=a, position=n) for s, a, n in held]
+    d.ib = NS(positions=lambda: positions)
+    return d
+
+
+def _flat(symbol: str, account: str):
+    from types import SimpleNamespace as NS
+
+    return NS(contract=NS(symbol=symbol), account=account, position=0)
+
+
+def test_flat_position_ends_its_trade() -> None:
+    d = _driver_holding(("CCXI", "U7654329", -50))
+    d.tracker.track("CCXI", 10.77, 10.50, account="U1234566")
+    d.trailer.track("CCXI", 10.77, 11.00, account="U7654329")
+    d._on_position(_flat("CCXI", "U1234566"))
+    check("stopped-out trade dropped", ("CCXI", "U1234566") in d.tracker.trades, False)
+    check("other account's trade kept", ("CCXI", "U7654329") in d.trailer.trades, True)
+
+
+def test_flat_position_ends_an_unnamed_trade_only_when_nothing_is_held() -> None:
+    d = _driver_holding(("CCXI", "U7654329", -50))
+    d.tracker.track("CCXI", 10.77, 10.50)
+    d._on_position(_flat("CCXI", "U1234566"))
+    check("still held elsewhere -> kept", ("CCXI", None) in d.tracker.trades, True)
+    d = _driver_holding()
+    d.tracker.track("CCXI", 10.77, 10.50)
+    d._on_position(_flat("CCXI", "U1234566"))
+    check("held nowhere -> dropped", d.tracker.trades, {})
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
