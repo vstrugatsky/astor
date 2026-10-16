@@ -1077,20 +1077,25 @@ class LiveDriver:
         that need it are then skipped rather than blocking the order."""
         return _price_of(await self._snapshot(contract))
 
-    async def _half_spread(self, contract: Contract, timeout: float = 1.0) -> float | None:
-        """Half the bid/ask spread right now, from a brief streaming
-        subscription -- quicker than a snapshot, which waits for every
-        tick type. None if no two-sided quote arrives in `timeout`. Two
-        alerts on one symbol share the one subscription."""
+    async def _half_spread(self, contract: Contract, timeout: float = 1.5) -> float | None:
+        """Half the bid/ask spread right now, from a snapshot request --
+        read as soon as bid and ask are in, not when the snapshot ends
+        (it waits on every tick type). Not streaming: the API's US stock
+        quotes in regular hours are snapshot-only on this login, and a
+        streaming request is refused with error 354 (2026-10-15). None if
+        no two-sided quote arrives in `timeout`. Two alerts on one symbol
+        share the one request."""
         sym = contract.symbol
         if sym not in self._spreads:
-            task = asyncio.create_task(self._stream_half_spread(contract, timeout))
+            task = asyncio.create_task(self._snapshot_half_spread(contract, timeout))
             self._spreads[sym] = task
             task.add_done_callback(lambda _: self._spreads.pop(sym, None))
         return await asyncio.shield(self._spreads[sym])
 
-    async def _stream_half_spread(self, contract: Contract, timeout: float) -> float | None:
-        ticker = self.ib.reqMktData(contract)
+    async def _snapshot_half_spread(self, contract: Contract, timeout: float) -> float | None:
+        # A snapshot ends itself; cancelling one that already has is an
+        # error at IBKR, so it is never cancelled here.
+        ticker = self.ib.reqMktData(contract, "", True, False)
         try:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + timeout
@@ -1102,12 +1107,10 @@ class LiveDriver:
         except Exception:
             logger.exception("No quote for %s", contract.symbol)
             return None
-        finally:
-            self.ib.cancelMktData(contract)
 
     async def _print_setup_alert_sized(self, alert: SetupAlert, held: bool, bell: bool) -> None:
         """The alert, its size cut for slippage at the stop. Waits at most
-        a second for the quote; the alert prints either way."""
+        1.5s for the quote; the alert prints either way."""
         slip = None
         try:
             bars = self._subs.get(alert.symbol)
