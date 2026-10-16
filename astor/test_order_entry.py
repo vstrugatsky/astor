@@ -148,6 +148,27 @@ def test_buy_sell_put_the_direction_in_the_verb() -> None:
     raises("needs a count", parse_enter, "SPCX", "long")
 
 
+def test_shortable_file_parses() -> None:
+    from astor.drivers.shortable import ShortableList, parse
+
+    text = (
+        "#BOF|2026.10.15|22:14:18\n"
+        "#SYM|CUR|NAME|CON|ISIN|REBATERATE|FEERATE|AVAILABLE|FIGI|\n"
+        "CCXI|USD|CHURCHILL CAPITAL CORP-CL A|852646546|X|1.9785|1.9015|4300000|B|\n"
+        "NVDA|USD|NVIDIA CORP|4815747|X|3.6300|0.2500|>10000000|B|\n"
+        "3LI|EUR|LONGWEI PETROLEUM|77577663|X|2.0390|0.4000|500||\n"
+        "TINY|USD|TINY CORP|1|X|-40.0|45.0|300|B|\n"
+    )
+    as_of, available = parse(text)
+    check("as of", f"{as_of:%Y-%m-%d %H:%M}", "2026-10-15 22:14")
+    check("counts", available, {"CCXI": 4_300_000, "NVDA": 10_000_001, "TINY": 300})
+    lst = ShortableList()
+    check("unread: unknown", lst.available("BSP"), None)
+    lst.as_of, lst._available = as_of, available
+    check("missing: none to borrow", lst.available("BSP"), 0)
+    check("listed", lst.available("TINY"), 300)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

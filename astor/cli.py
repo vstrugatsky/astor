@@ -1071,6 +1071,7 @@ async def cmd_live(args: argparse.Namespace) -> int:
 
     try:
         driver = LiveDriver(ib, Path(args.cache_dir), args.bar_size, args.dry_run_trail)
+        driver.start_background()
         run_id = f"{driver.session:%Y%m%d}-live-{uuid.uuid4().hex[:8]}"
         logger.info("Live session target: %s (run_id=%s)", driver.session, run_id)
 

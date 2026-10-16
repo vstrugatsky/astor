@@ -896,6 +896,8 @@ def test_alert_line_sizes_for_the_spread() -> None:
     # 7c of distance + 1c of half spread + 1c a share in commissions
     sized = _format_order_alert("C", a, slip=0.01)
     check("resized with the quote", ("1111" in sized, "1228" in sized, "no quote" in sized), (True, False, False))
+    check("unshortable short says so",
+          "not shortable" in _format_order_alert("C", a, slip=0.01, borrow="not shortable -- none to borrow"), True)
     no_quote = _format_order_alert("C", a)
     check("no quote: the setup's own size", "1228" in no_quote, True)
     check("and says so", "(no quote, no slippage)" in no_quote, True)

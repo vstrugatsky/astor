@@ -79,6 +79,7 @@ from astor.drivers.replay import (
     parse_bar_seconds,
     to_et,
 )
+from astor.drivers.shortable import ShortableList
 
 logger = logging.getLogger(__name__)
 
@@ -417,7 +418,8 @@ def _overshoot_cost(
 
 
 def _format_order_alert(
-    label: str, a: SetupAlert, held: bool = False, slip: float | None = None
+    label: str, a: SetupAlert, held: bool = False, slip: float | None = None,
+    borrow: str | None = None,
 ) -> str:
     """One line, sized to be acted on rather than studied.
 
@@ -465,6 +467,9 @@ def _format_order_alert(
     # for.
     rr = f"R:R {_bold(f'{a.rr:.1f}')}; " if a.rr is not None else ""
     marker = f"{_accent('(position)', _ANSI_PURPLE)} " if held else ""
+    # A short IBKR can't lend for would be rejected: say so up front.
+    if borrow:
+        marker += f"{_accent(f'({borrow})', _ANSI_PURPLE)} "
     return (
         f"[{a.bar_start:%H:%M:%S} ET] {_accent(label, color)} {_bold(a.symbol)} "
         f"{marker}{a.direction}; {rr}target: {target} "
@@ -473,13 +478,14 @@ def _format_order_alert(
 
 
 def _print_setup_alert(
-    a: SetupAlert, held: bool = False, bell: bool = True, slip: float | None = None
+    a: SetupAlert, held: bool = False, bell: bool = True, slip: float | None = None,
+    borrow: str | None = None,
 ) -> None:
     """One entry point for every setup-produced alert; the only thing that
     differs by kind is what it is called."""
     _print_alert(
         _format_order_alert(
-            "AVWAP TOUCH" if isinstance(a, TouchAlert) else "CAPITULATION", a, held, slip
+            "AVWAP TOUCH" if isinstance(a, TouchAlert) else "CAPITULATION", a, held, slip, borrow
         ),
         bell,
     )
@@ -650,10 +656,29 @@ class LiveDriver:
         self._trail_tasks: set[asyncio.Task] = set()
         self._alert_tasks: set[asyncio.Task] = set()
         self._spreads: dict[str, asyncio.Task] = {}  # symbol -> quote in flight
+        # What IBKR can lend, for shorts -- see start_background
+        self.shortable = ShortableList()
+        self._background: set[asyncio.Task] = set()
         # `mute`: setup alerts print without the bell. track, trail and
         # order notices always ring -- they are about money already in.
         self.muted = False
         ib.positionEvent += self._on_position
+
+    def start_background(self) -> None:
+        """Work the session keeps doing on its own: for now, refreshing the
+        shortable list every 15 minutes. Needs the running event loop."""
+        task = asyncio.create_task(self.shortable.run())
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    def _borrow_problem(self, symbol: str, qty: int | None = None) -> str | None:
+        """Why a short in `symbol` would be refused for lack of shares to
+        borrow, if the list says so; None when it doesn't (or isn't read)."""
+        n = self.shortable.available(symbol)
+        if n is None or n >= (qty or 1):
+            return None
+        as_of = f" (IBKR list {self.shortable.as_of:%H:%M} ET)" if self.shortable.as_of else ""
+        return (f"only {n:,} to borrow" if n else "not shortable -- none to borrow") + as_of
 
     def _on_position(self, pos: Position) -> None:
         """A position gone flat ends its trade -- stopped out, sold in TWS,
@@ -1118,7 +1143,8 @@ class LiveDriver:
             if contract is not None:
                 slip = await self._half_spread(contract)
         finally:
-            _print_setup_alert(alert, held, bell, slip)
+            borrow = self._borrow_problem(alert.symbol) if alert.direction == "short" else None
+            _print_setup_alert(alert, held, bell, slip, borrow)
 
     async def _in_rth(self, symbol: str) -> bool:
         now = datetime.now(ET)
@@ -1196,6 +1222,10 @@ class LiveDriver:
             notes.append("no quote -- risk without slippage")
         if held:
             notes.append(f"adds to {abs(held):g} held")
+        # Not refused here: the list is up to 15 minutes old, and IBKR
+        # has the last word -- it rejects the short if it still can't lend.
+        if req.direction == "short" and (borrow := self._borrow_problem(req.symbol, req.qty)):
+            notes.append(_bold(borrow))
         # 'sell' reads as closing a long, but it opens a short -- say so
         # whenever the other side is held, in either account.
         sign = 1 if req.direction == "long" else -1
