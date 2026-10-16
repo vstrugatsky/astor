@@ -45,6 +45,7 @@ from astor.core.order_entry import (
     tranche_sizes,
 )
 from astor.core.scanner import Scanner
+from astor.core.setups import pace_label
 from astor.core.store import TriggerStore
 from astor.core.tracking import (
     SellRuleTracker,
@@ -417,10 +418,6 @@ def _overshoot_cost(
     return None
 
 
-# An average day's pace is one ADR over the regular session.
-SESSION_MINUTES = 390
-
-
 def _format_order_alert(
     label: str, a: SetupAlert, held: bool = False, slip: float | None = None,
     borrow: str | None = None,
@@ -476,10 +473,7 @@ def _format_order_alert(
     # an average day's, one ADR over the session's 390 minutes -- "13x"
     # is a leg built thirteen times faster than the stock's usual day.
     if isinstance(a, CapitulationAlert):
-        rr = ""
-        if a.pace_adr is not None:
-            x = a.pace_adr * SESSION_MINUTES
-            rr = f"pace {_bold(f'{x:.1f}x' if x < 10 else f'{x:.0f}x')}; "
+        rr = f"pace {_bold(pace_label(a.pace_adr))}; " if a.pace_adr is not None else ""
     else:
         rr = f"R:R {_bold(f'{a.rr:.1f}')}; " if a.rr is not None else ""
     marker = f"{_accent('(position)', _ANSI_PURPLE)} " if held else ""

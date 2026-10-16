@@ -131,13 +131,10 @@ class _FilterReadout:
                 f"ema9_ext {v(self.ema9_extension_adr, 4)}/{self.min_ema9_extension_adr:g}",
                 f"accel_price {v(self.accel_price, 4)}/{self.min_accel_price:g}",
                 f"accel_vol {v(self.accel_vol)}/{self.min_accel_vol:g}",
-                # ADR(14), spelled out: adr_pct and ADR(1) are both in play
-                # elsewhere in this output and a bare "ADR" reads ambiguously.
-                # Per *minute*, not per bar -- the divisor is
-                # leg_duration_minutes, so the two only coincide at the
-                # default --bar-size of 1 min.
-                f"pace {v(self.pace_adr, 5)} ADR(14)/min",
-                f"R:R {v(self.rr, 1)}",
+                # Against ADR(14), as a multiple of an average day's pace
+                # (pace_label). No R:R: it is 9.0 by construction here
+                # (see the live alert line).
+                f"pace {pace_label(self.pace_adr)}",
             ]
         )
 
@@ -270,6 +267,22 @@ def _pace_adr(size: float | None, minutes: float, adr: float) -> float | None:
     if size is None or minutes <= 0 or adr <= 0 or size <= 0:
         return None
     return round(size / minutes / adr, 5)
+
+
+# An average day's pace: one ADR over the regular session's minutes.
+SESSION_MINUTES = 390
+
+
+def pace_label(pace_adr: float | None) -> str:
+    """`pace_adr` (ADR(14) a minute, as stored) as a multiple of an
+    average day's pace -- "13x" is a leg built thirteen times faster than
+    the stock's usual day. A constant factor, so it ranks exactly as
+    pace_adr does; per minute is too small to compare by eye, and per hour
+    means little for a leg that lasts minutes."""
+    if pace_adr is None:
+        return "n/a"
+    x = pace_adr * SESSION_MINUTES
+    return f"{x:.1f}x" if x < 10 else f"{x:.0f}x"
 
 
 def _reward_to_risk(entry: float, stop: float, exit_price: float) -> float | None:

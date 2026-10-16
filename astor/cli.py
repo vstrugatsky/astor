@@ -55,7 +55,7 @@ from astor.core.order_entry import (
     parse_stop,
 )
 from astor.core.scanner import Scanner
-from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME, rev_rvol_threshold
+from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME, pace_label, rev_rvol_threshold
 from astor.core.store import TriggerStore
 from astor.drivers.live import LiveDriver, position_pnl
 from astor.drivers.replay import (
@@ -330,14 +330,19 @@ def _alert_timeline(replay: list, received: list[dict]) -> list[dict]:
     by_bar = {r["bar_start"]: r for r in received}
     out = []
 
-    def ticket(target, stop, shares, rr) -> str:
+    def ticket(target, stop, shares, rr, pace) -> str:
         t = f"{target:.2f}" if target is not None else "n/a"
-        rr_s = f" R:R {rr:.1f}" if rr is not None else ""
+        # Capitulation's R:R is 9.0 by construction; its pace is the
+        # number that varies, as on the live alert line.
+        if pace is not None:
+            lead = f" pace {pace_label(pace)}"
+        else:
+            lead = f" R:R {rr:.1f}" if rr is not None else ""
         sh = f" {shares} sh" if shares is not None else ""
-        return f"target {t} stop {stop:.2f}{sh}{rr_s}"
+        return f"target {t} stop {stop:.2f}{sh}{lead}"
 
     for a in replay:
-        line = f"ALERT {ticket(a.target, a.stop, a.shares, a.rr)}"
+        line = f"ALERT {ticket(a.target, a.stop, a.shares, a.rr, getattr(a, 'pace_adr', None))}"
         got = by_bar.pop(a.bar_start, None)
         if got is not None:
             line += f"  <- RECEIVED {got['detection_ts']:%H:%M:%S}"
@@ -348,7 +353,7 @@ def _alert_timeline(replay: list, received: list[dict]) -> list[dict]:
     for r in by_bar.values():
         x = r["extras"]
         line = (
-            f"ALERT {ticket(x.get('target'), x.get('stop'), x.get('level_stop_shares'), x.get('rr'))}"
+            f"ALERT {ticket(x.get('target'), x.get('stop'), x.get('level_stop_shares'), x.get('rr'), x.get('pace_adr'))}"
             f"  <- RECEIVED {r['detection_ts']:%H:%M:%S} (live only: the replay does not "
             "reproduce it -- likely IBKR's revised volume)"
         )
