@@ -417,6 +417,10 @@ def _overshoot_cost(
     return None
 
 
+# An average day's pace is one ADR over the regular session.
+SESSION_MINUTES = 390
+
+
 def _format_order_alert(
     label: str, a: SetupAlert, held: bool = False, slip: float | None = None,
     borrow: str | None = None,
@@ -468,9 +472,14 @@ def _format_order_alert(
     # 9.0 by construction: entry 10% off the leg's extreme, stop at the
     # extreme, exit back at the session's other end -- where the leg
     # started -- so 90% of the leg over 10% of it. What does vary is how
-    # violent the leg was: its pace, in ADR(14) an hour.
+    # violent the leg was: its pace (ADR(14) a minute, as stored) against
+    # an average day's, one ADR over the session's 390 minutes -- "13x"
+    # is a leg built thirteen times faster than the stock's usual day.
     if isinstance(a, CapitulationAlert):
-        rr = f"pace {_bold(f'{a.pace_adr * 60:.1f}')} ADR/h; " if a.pace_adr is not None else ""
+        rr = ""
+        if a.pace_adr is not None:
+            x = a.pace_adr * SESSION_MINUTES
+            rr = f"pace {_bold(f'{x:.1f}x' if x < 10 else f'{x:.0f}x')}; "
     else:
         rr = f"R:R {_bold(f'{a.rr:.1f}')}; " if a.rr is not None else ""
     marker = f"{_accent('(position)', _ANSI_PURPLE)} " if held else ""
