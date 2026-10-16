@@ -1717,7 +1717,10 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument(
         "--max-tickers",
         type=int,
-        default=50,
+        # IBKR's documented limit on live (keepUpToDate) bar requests is 50,
+        # but the early spike ran 70 without trouble; 55 since 2026-10-15,
+        # raised step by step while it holds.
+        default=55,
         help="Cap enforced by the add/remove console (0 = no cap)",
     )
     lv.add_argument("--db", default="data/astor.db")
