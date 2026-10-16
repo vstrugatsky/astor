@@ -832,8 +832,11 @@ def test_alert_line_is_an_order_ticket() -> None:
         exit_target=2.20, rr=5.0, pace_adr1=0.004, pace_adr=0.011,
     )
     line = _format_order_alert("CAPITULATION", a)
-    check("R:R leads, right after the direction", "short; R:R " in line, True)
-    for needed in ("CAPITULATION", "ABAT", "short", "5.0", "target: ", "2.55", "stop: ", "2.62", "1428"):
+    # R:R is 9.0 by construction here; pace (0.011 ADR/min) leads instead.
+    check("pace leads, right after the direction", "short; pace " in line, True)
+    check("in ADR(14) an hour", "0.7\x1b[0m\x1b[30m ADR/h" in line, True)
+    check("no R:R", "R:R" in line, False)
+    for needed in ("CAPITULATION", "ABAT", "short", "target: ", "2.55", "stop: ", "2.62", "1428"):
         check(f"{needed!r} present", needed in line, True)
     # A short's worse fill is a lower one.
     check("overshoot reads the short's way", "below target" in line, True)

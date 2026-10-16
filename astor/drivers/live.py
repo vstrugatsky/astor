@@ -462,10 +462,17 @@ def _format_order_alert(
         passed = a.price >= a.target if a.direction == "long" else a.price <= a.target
         if passed:
             target = f"{target} {_bold('(already through)')}"
-    # R:R leads, before any of the prices: it is the one number that says
+    # One number leads, before any of the prices: the one that says
     # whether this setup is worth the attention the rest of the line asks
-    # for.
-    rr = f"R:R {_bold(f'{a.rr:.1f}')}; " if a.rr is not None else ""
+    # for. For AVWAP TOUCH that is R:R. Not for CAPITULATION, where it is
+    # 9.0 by construction: entry 10% off the leg's extreme, stop at the
+    # extreme, exit back at the session's other end -- where the leg
+    # started -- so 90% of the leg over 10% of it. What does vary is how
+    # violent the leg was: its pace, in ADR(14) an hour.
+    if isinstance(a, CapitulationAlert):
+        rr = f"pace {_bold(f'{a.pace_adr * 60:.1f}')} ADR/h; " if a.pace_adr is not None else ""
+    else:
+        rr = f"R:R {_bold(f'{a.rr:.1f}')}; " if a.rr is not None else ""
     marker = f"{_accent('(position)', _ANSI_PURPLE)} " if held else ""
     # A short IBKR can't lend for would be rejected: say so up front.
     if borrow:
