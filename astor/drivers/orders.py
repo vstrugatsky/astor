@@ -131,6 +131,17 @@ def protective_stops(working: list[Trade], exit_side: str) -> list[Trade]:
     ]
 
 
+async def fresh_position(ib: IB, symbol: str, account: str) -> float:
+    """The position as IBKR has it now -- a round trip, not ib_async's
+    cached copy, which can trail a fill that just happened. IBKR answers in
+    order, so any fill it reported first is in this answer."""
+    positions = await asyncio.wait_for(ib.reqPositionsAsync(), CONFIRM_TIMEOUT)
+    return sum(
+        p.position for p in positions
+        if p.account == account and p.contract.symbol == symbol
+    )
+
+
 def _fmt_prices(stops: list[Trade]) -> str:
     return ", ".join(f"{t.order.totalQuantity:g}@{t.order.auxPrice:.2f}" for t in stops)
 
@@ -384,12 +395,8 @@ class TrailExecutor(_OrderBase):
             return [], "a stop is not bound to this session (connect as client ID 0)"
         return stops, ""
 
-    def _position_size(self, trade: TrackedTrade) -> float:
-        return sum(
-            p.position
-            for p in self.ib.positions(trade.account or "")
-            if p.contract.symbol == trade.symbol
-        )
+    async def _position_size(self, trade: TrackedTrade) -> float:
+        return await fresh_position(self.ib, trade.symbol, trade.account or "")
 
     async def move_stop_to_breakeven(self, trade: TrackedTrade) -> Outcome:
         """Every stop tranche still short of breakeven goes to breakeven."""
@@ -426,10 +433,13 @@ class TrailExecutor(_OrderBase):
         return Outcome(False, f"stop move to {be:.2f} NOT confirmed for {'; '.join(failed)}", extras)
 
     async def exit(self, trade: TrackedTrade, priority: str = ADAPTIVE_PRIORITY) -> Outcome:
-        qty = abs(self._position_size(trade))
+        # Stops, then the position, fresh (see exit_shares): a tranche that
+        # filled a moment ago would otherwise be sold again. One that fills
+        # after this is caught as it is cancelled -- no exit goes out.
+        stops, why = await self._find_stops(trade)
+        qty = abs(await self._position_size(trade))
         if qty == 0:
             return Outcome(True, "no position left -- the stop likely filled first")
-        stops, why = await self._find_stops(trade)
         if not stops:
             return Outcome(False, f"NOT exited: {why}")
         action = "SELL" if trade.direction == "long" else "BUY"
@@ -452,66 +462,89 @@ class TrailExecutor(_OrderBase):
         position. The cut comes off the stop furthest from the price, the
         tranche least likely to fire. All of it, or nothing left beyond
         `n`: the whole exit."""
-        held = abs(self._position_size(trade))
-        if held == 0:
-            return Outcome(True, "no position left -- the stop likely filled first")
-        if n >= held:
-            return await self.exit(trade, priority)
-        if n <= 0:
-            return Outcome(True, "no shares in this rule's part -- nothing sold")
-        stops, why = await self._find_stops(trade)
-        if not stops:
-            return Outcome(False, f"NOT sold: {why}")
-
         long = trade.direction == "long"
-        # Furthest from the price first: the lowest stop under a long.
-        order = sorted(stops, key=lambda t: t.order.auxPrice, reverse=not long)
-        excess = sum(t.order.totalQuantity for t in stops) - (held - n)
-        cuts: list[tuple[Trade, float]] = []  # (stop, its new size; 0 = cancel)
-        for t in order:
+        action = "SELL" if long else "BUY"
+        before: dict[int, float] = {}  # stop's order id -> its size before any cut
+        done: list[tuple[Trade, float]] = []  # cuts made: (stop, its new size; 0 = cancel)
+        cut_text = ""
+
+        # Cut, then look again with fresh reads, until the stops cover no
+        # more than what the sale leaves. A tranche filling between the
+        # reads and the cut would otherwise leave them covering shares no
+        # longer held -- the stop could later sell more than held and flip
+        # the position. Once it holds, a later stop fill keeps it holding:
+        # it takes as many shares off the stops as off the position.
+        #
+        # Stops first, then the position: IBKR answers in order, so a fill
+        # between the two reads shows in the position but may still count
+        # in the stops -- which overstates the stops and only cuts more.
+        # The other way round it would overstate the position: the danger.
+        for _ in range(3):
+            stops, why = await self._find_stops(trade)
+            held = abs(await self._position_size(trade))
+            if held == 0:
+                restored = await self._uncut(done, before)
+                return Outcome(True, "no position left -- the stop likely filled first"
+                               + ("" if restored else "; stops NOT restored"))
+            if n >= held:
+                return await self.exit(trade, priority)
+            if n <= 0:
+                return Outcome(True, "no shares in this rule's part -- nothing sold")
+            if not stops:
+                restored = await self._uncut(done, before)
+                return Outcome(False, f"NOT sold: {why}"
+                               + ("" if restored else " -- stops NOT restored, CHECK THE POSITION"))
+            excess = sum(t.order.totalQuantity for t in stops) - (held - n)
             if excess <= 0:
                 break
-            take = min(excess, t.order.totalQuantity)
-            cuts.append((t, t.order.totalQuantity - take))
-            excess -= take
-        before = {id(t): t.order.totalQuantity for t, _ in cuts}
-        extras = {
-            "qty": n,
-            "held": held,
-            "stops_before": _fmt_prices(stops),
-            "priority": priority,
-        }
-        action = "SELL" if long else "BUY"
+            # Furthest from the price first: the lowest stop under a long.
+            cuts: list[tuple[Trade, float]] = []
+            for t in sorted(stops, key=lambda t: t.order.auxPrice, reverse=not long):
+                if excess <= 0:
+                    break
+                take = min(excess, t.order.totalQuantity)
+                cuts.append((t, t.order.totalQuantity - take))
+                excess -= take
+            for t, _q in cuts:
+                before.setdefault(t.order.orderId, t.order.totalQuantity)
+            cut_text = ", ".join(
+                f"{t.order.totalQuantity:g}@{t.order.auxPrice:.2f} -> {'cancel' if q == 0 else f'{q:g}'}"
+                for t, q in cuts
+            )
+            if self.dry_run:
+                exit = exit_order(action, n, trade.account or "", "ADN", priority=priority)
+                return Outcome(True, f"{self._tag()}cut stop {cut_text}, then {describe_order(exit)}",
+                               {"qty": n, "held": held})
+            for t, q in cuts:
+                if q == 0:
+                    cancelled, filled, stuck = await self._cancel([t])
+                    ok = bool(cancelled)
+                    err = "filled first" if filled else "cancel not confirmed" if stuck else ""
+                else:
+                    ok, err = await self._modify(t, qty=q)
+                if not ok:
+                    restored = await self._uncut(done, before)
+                    return Outcome(
+                        False,
+                        f"stop cut NOT confirmed ({err or 'no answer'}); nothing sold"
+                        + ("" if restored else " -- stops NOT restored, CHECK THE POSITION"),
+                    )
+                done.append((t, q))
+        else:
+            restored = await self._uncut(done, before)
+            return Outcome(
+                False,
+                "position and stops kept changing; nothing sold"
+                + ("" if restored else " -- stops NOT restored, CHECK THE POSITION"),
+            )
+
+        extras = {"qty": n, "held": held, "stops_before": _fmt_prices(stops), "priority": priority}
         exit = exit_order(action, n, trade.account or "", "ADN", priority=priority)
         what = describe_order(exit)
-        cut_text = ", ".join(
-            f"{before[id(t)]:g}@{t.order.auxPrice:.2f} -> {'cancel' if q == 0 else f'{q:g}'}"
-            for t, q in cuts
-        )
         if self.dry_run:
-            pre = f"cut stop {cut_text}, then " if cuts else ""
-            return Outcome(True, f"{self._tag()}{pre}{what}", extras)
+            return Outcome(True, f"{self._tag()}{what}", extras)
 
-        # 1. cut the stops, undoing the cuts already made if one fails
-        done: list[tuple[Trade, float]] = []
-        for t, q in cuts:
-            if q == 0:
-                cancelled, filled, stuck = await self._cancel([t])
-                ok = bool(cancelled)
-                err = "filled first" if filled else "cancel not confirmed" if stuck else ""
-            else:
-                ok, err = await self._modify(t, qty=q)
-            if not ok:
-                restored = await self._uncut(done, before)
-                return Outcome(
-                    False,
-                    f"stop cut NOT confirmed ({err or 'no answer'}); nothing sold"
-                    + ("" if restored else " -- stops NOT restored, CHECK THE POSITION"),
-                    extras,
-                )
-            done.append((t, q))
-
-        # 2. the sale
+        # The sale
         contract = copy.copy(stops[0].contract)
         contract.exchange = "SMART"
         sale = self.ib.placeOrder(contract, exit)
@@ -522,7 +555,7 @@ class TrailExecutor(_OrderBase):
             self._spawn(self._report_fill(trade.symbol, sale))
             return Outcome(
                 True,
-                f"stop cut {cut_text}, {what} sent" if cuts else f"{what} sent",
+                f"stop cut {cut_text}, {what} sent" if done else f"{what} sent",
                 extras | {"exit_order_id": sale.order.orderId},
             )
         if not sale.isDone():
@@ -532,7 +565,7 @@ class TrailExecutor(_OrderBase):
                 "stop already cut -- CHECK THE POSITION",
                 extras,
             )
-        # 3. refused: the stops go back to covering the whole position
+        # Refused: the stops go back to covering the whole position
         errors = _errors_since(sale, 0)
         restored = await self._uncut(done, before)
         return Outcome(
@@ -546,10 +579,12 @@ class TrailExecutor(_OrderBase):
         """Put the stops `exit_shares` cut back to their old sizes."""
         ok = True
         for t, q in done:
+            size = before[t.order.orderId]
             if q == 0:
-                ok &= await self._restore([t])
+                placed = await self._place_stop(t.contract, t.order, size, t.order.auxPrice)
+                ok &= await _wait_for(lambda p=placed: p.orderStatus.status in _WORKING)
             else:
-                ok &= (await self._modify(t, qty=before[id(t)]))[0]
+                ok &= (await self._modify(t, qty=size))[0]
         return ok
 
 

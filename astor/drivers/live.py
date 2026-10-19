@@ -73,6 +73,7 @@ from astor.drivers.orders import (
     describe_order,
     entry_orders,
     exit_order,
+    fresh_position,
     protective_stops,
     working_orders,
 )
@@ -1606,7 +1607,10 @@ class LiveDriver:
             account = self._account_for(req.account, sym, open_trades)
         except CommandError as e:
             return str(e)
-        held = self._held(sym, account)
+        # Fresh, after the stops were read: a stop that filled before this
+        # read is gone from both; one that fills later is caught as it is
+        # cancelled, and no exit goes out.
+        held = await fresh_position(self.ib, sym, account)
         if not held:
             return f"No {sym} position in {account}."
         if req.order_type != "LMT" and not await self._in_rth(sym):

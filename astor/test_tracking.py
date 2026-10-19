@@ -525,10 +525,10 @@ def _executor_holding(held: float, stops: list[tuple[float, float]]):
     async def all_open():
         return trades
 
-    ib = NS(
-        positions=lambda account="": [NS(contract=NS(symbol="XYZ"), position=held)],
-        reqAllOpenOrdersAsync=all_open,
-    )
+    async def positions():
+        return [NS(account="U1", contract=NS(symbol="XYZ"), position=held)]
+
+    ib = NS(reqAllOpenOrdersAsync=all_open, reqPositionsAsync=positions)
     ex = TrailExecutor(ib, True, lambda *a: None, lambda *a: None)
     return ex, asyncio.run
 
@@ -543,6 +543,85 @@ def test_partial_sale_cuts_the_furthest_stop_first() -> None:
     check("70: cancels 97, cuts 98", "50@97.00 -> cancel, 50@98.00 -> 30" in out.text, True)
     out = run(ex.exit_shares(t, 100))
     check("everything: the whole exit", "cancel stop(s)" in out.text, True)
+
+
+def _live_executor(held: float, stops: list[tuple[float, float]], fill_after_stop_read: int | None = None):
+    """A TrailExecutor sending real (fake) orders: a long of `held` with SELL
+    stops of (qty, price). `fill_after_stop_read` fills that tranche (its
+    index) right after the first read of the stops -- the race."""
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from astor.drivers.orders import TrailExecutor
+
+    state = {"held": held, "stop_reads": 0}
+    trades = [
+        NS(contract=NS(symbol="XYZ"), orderStatus=NS(status="Submitted"), log=[],
+           order=NS(account="U1", action="SELL", orderType="STP", totalQuantity=q,
+                    auxPrice=p, parentId=0, orderId=-(i + 1)))
+        for i, (q, p) in enumerate(stops)
+    ]
+    sent = []
+
+    async def all_open():
+        state["stop_reads"] += 1
+        working = [t for t in trades if t.orderStatus.status == "Submitted"]
+        if state["stop_reads"] == 1 and fill_after_stop_read is not None:
+            t = trades[fill_after_stop_read]
+            t.orderStatus.status = "Filled"
+            state["held"] -= t.order.totalQuantity
+        return working
+
+    async def positions():
+        return [NS(account="U1", contract=NS(symbol="XYZ"), position=state["held"])]
+
+    def place(contract, order):
+        sent.append(order)
+        return NS(order=order, orderStatus=NS(status="Submitted"), log=[], isDone=lambda: False, contract=contract)
+
+    ib = NS(reqAllOpenOrdersAsync=all_open, reqPositionsAsync=positions, placeOrder=place)
+    ex = TrailExecutor(ib, False, lambda *a: None, lambda *a: None)
+
+    async def modify(t, price=None, qty=None):
+        if t.orderStatus.status != "Submitted":
+            return False, "order already filled"
+        t.order.totalQuantity = qty
+        return True, ""
+
+    async def cancel(ts):
+        for t in ts:
+            t.orderStatus.status = "Cancelled" if t.orderStatus.status == "Submitted" else t.orderStatus.status
+        return [t for t in ts if t.orderStatus.status == "Cancelled"], [], []
+
+    async def no_report(*a):
+        return None
+
+    ex._modify, ex._cancel, ex._report_fill = modify, cancel, no_report
+    return ex, trades, sent, state, asyncio.run
+
+
+def test_partial_sale_leaves_stops_covering_only_what_is_held() -> None:
+    ex, trades, sent, state, run = _live_executor(100, [(50, 97.0), (50, 98.0)])
+    out = run(ex.exit_shares(TrackedTrade("XYZ", 100.0, 98.0, account="U1"), 35))
+    check("sold", out.ok, True)
+    check("35 sold", [o.totalQuantity for o in sent], [35])
+    check("stops cover the 65 left", sum(t.order.totalQuantity for t in trades), 65)
+
+
+def test_partial_sale_survives_a_tranche_filling_mid_way() -> None:
+    """The 98 tranche fills between the stop read and the position read.
+    Whatever astor then does, the stops must never cover more than will be
+    held -- or a later stop fill sells shares that aren't there."""
+    ex, trades, sent, state, run = _live_executor(100, [(50, 97.0), (50, 98.0)], fill_after_stop_read=1)
+    out = run(ex.exit_shares(TrackedTrade("XYZ", 100.0, 98.0, account="U1"), 35))
+    sold = sum(o.totalQuantity for o in sent if o.orderType != "STP")
+    left = state["held"] - sold
+    covered = sum(t.order.totalQuantity for t in trades if t.orderStatus.status == "Submitted") + sum(
+        o.totalQuantity for o in sent if o.orderType == "STP"
+    )
+    check("never sells more than held", sold <= 50, True)
+    check(f"stops ({covered}) cover no more than what's left ({left})", covered <= left, True)
+    check("and says what happened", bool(out.text), True)
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
