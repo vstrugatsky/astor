@@ -13,6 +13,7 @@ and either way it ends up on the same real-time subscription.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import math
 from dataclasses import dataclass
@@ -1107,6 +1108,35 @@ class LiveDriver:
             logger.exception("No market snapshot for %s", contract.symbol)
             return None
 
+    async def _quote(self, contract: Contract, timeout: float = 2.0) -> Ticker | None:
+        """Bid and ask outside regular hours, where a full snapshot can
+        time out: a snapshot request read as soon as both sides are in,
+        then a streaming one (the overnight session streams; regular
+        hours, and likely pre-market, are snapshot-only on this login --
+        see _half_spread). The ticker, or None if neither brings a quote."""
+        loop = asyncio.get_running_loop()
+
+        async def both_sides(ticker: Ticker) -> bool:
+            deadline = loop.time() + timeout
+            while loop.time() < deadline:
+                if _half_spread_of(ticker) is not None:
+                    return True
+                await asyncio.sleep(0.05)
+            return False
+
+        try:
+            ticker = self.ib.reqMktData(contract, "", True, False)
+            if await both_sides(ticker):
+                return ticker
+            ticker = self.ib.reqMktData(contract)
+            try:
+                return ticker if await both_sides(ticker) else None
+            finally:
+                self.ib.cancelMktData(contract)
+        except Exception:
+            logger.exception("No quote for %s", contract.symbol)
+            return None
+
     async def _market_price(self, contract: Contract) -> float | None:
         """The current price for the side checks: last if it's inside the
         quote, else the midpoint. None when neither arrives -- the checks
@@ -1216,17 +1246,26 @@ class LiveDriver:
         if contract is None:
             return f"IBKR doesn't know {req.symbol}."
         in_rth = await self._in_rth(req.symbol)
-        if req.order_type in ADAPTIVE and not in_rth:
+        if req.order_type in ADAPTIVE and not in_rth and not req.type_defaulted:
             return "Adaptive is regular-hours only; outside them use lmt (works now) or stp (from the open)."
-        snapshot = await self._snapshot(contract)
-        market, half = _price_of(snapshot), _half_spread_of(snapshot)
+        quote = await (self._snapshot(contract) if in_rth else self._quote(contract))
+        market, half = _price_of(quote), _half_spread_of(quote)
+        notes = []
+        # No type typed, outside regular hours: a limit at the far side of
+        # the quote -- the price that fills now, without chasing it.
+        if req.type_defaulted and not in_rth:
+            long = req.direction == "long"
+            far = (quote.ask if long else quote.bid) if quote is not None else None
+            if far is None or not math.isfinite(far) or far <= 0:
+                return f"No {'ask' if long else 'bid'} for {req.symbol} -- give the price: '... lmt PRICE'."
+            req = dataclasses.replace(req, order_type="LMT", price=round(far, 4))
+            notes.append(f"limit at the {'ask' if long else 'bid'}")
         held = self._held(req.symbol, account)
         problems = entry_problems(req, market, held)
         if problems:
             return "NOT sent: " + "; ".join(problems)
 
         parent, child = entry_orders(req, account)
-        notes = []
         if market is None:
             notes.append("no market price -- side checks skipped")
         if half is None:
@@ -1266,7 +1305,7 @@ class LiveDriver:
         stop = (
             f", stop {child.auxPrice:.2f} (risk {_bold(f'${trade_risk(req.qty, ref, child.auxPrice, slip):,.0f}')})"
             if child is not None and ref else
-            f", stop {child.auxPrice:.2f}" if child is not None else ", NO stop"
+            f", stop {child.auxPrice:.2f}" if child is not None else f", {_accent(_bold('NO stop'), _ANSI_RED)}"
         )
         kind = {
             "ADN": "Adaptive",

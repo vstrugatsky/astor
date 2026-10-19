@@ -91,6 +91,9 @@ class EnterRequest:
     order_type: str  # ADN | ADU | MKT | LMT | STP
     price: float | None
     stop: float | None
+    # No type typed: ADN in regular hours; outside them live makes it an
+    # LMT at the ask (long) or bid (short).
+    type_defaulted: bool = False
 
     @property
     def action(self) -> str:
@@ -138,9 +141,10 @@ def parse_enter(rest: str, direction: str | None = None) -> EnterRequest:
         # No type given: Adaptive Normal. Anything else here is a mistyped type.
         if tokens and tokens[0].lower() != "stop":
             raise CommandError(f"'{tokens[0]}' is not an order type (adn/adu/mkt/lmt/stp) or 'stop PRICE'")
-        order_type = "ADN"
+        order_type, defaulted = "ADN", True
     else:
         tokens = tokens[1:]
+        defaulted = False
 
     price = None
     if order_type in PRICED:
@@ -158,7 +162,7 @@ def parse_enter(rest: str, direction: str | None = None) -> EnterRequest:
                 + "; the stop loss is 'stop PRICE'"
             )
         stop = _price(tokens[1], "stop")
-    return EnterRequest(symbol, account, direction, qty, order_type, price, stop)
+    return EnterRequest(symbol, account, direction, qty, order_type, price, stop, defaulted)
 
 
 @dataclass(frozen=True)

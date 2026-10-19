@@ -196,6 +196,12 @@ def test_lmt_entry_works_outside_regular_hours() -> None:
     check("STP entry waits for the open", parent.outsideRth, False)
 
 
+def test_untyped_entry_is_marked() -> None:
+    check("no type: defaulted", parse_enter("NVDA 100 stop 35.99", "long").type_defaulted, True)
+    check("adn typed: not", parse_enter("NVDA 100 adn stop 35.99", "long").type_defaulted, False)
+    check("lmt typed: not", parse_enter("NVDA 100 lmt 36 stop 35.99", "long").type_defaulted, False)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
