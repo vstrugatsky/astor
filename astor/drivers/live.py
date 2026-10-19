@@ -333,17 +333,19 @@ def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
             f" (target {trade.target_1r:.2f})"
             f"  ->  move stop to breakeven ({trade.entry:.2f}){_account_tag(trade.account)}"
         )
+    # A short is covered, not sold.
+    verb = "SELL" if trade.direction == "long" else "COVER"
     if alert.kind == "eod":
         hold = trade.plan.close_hold_r
         return (
-            f"{header} SELL what's left -- {_accent('the close', _ANSI_BROWN)}"
+            f"{header} {verb} what's left -- {_accent('the close', _ANSI_BROWN)}"
             f" @ {alert.close:.2f} ({trade.gain_r(alert.close):+.2f}R"
             + (f", under {hold:g}R" if hold is not None else "")
             + f"){_account_tag(trade.account)}"
         )
     part = _leg_part(trade, alert.rule) if not alert.whole else ""
-    what = f"SELL {part}" if part else (
-        "SELL the rest" if alert.whole and not trade.plan.is_default else "SELL"
+    what = f"{verb} {part}" if part else (
+        f"{verb} the rest" if alert.whole and not trade.plan.is_default else verb
     )
     if alert.rule == "avwap":
         why = f"{_accent('lost AVWAP', _ANSI_BROWN)}: close {alert.close:.2f} is {alert.giveback:.2f} past it (limit {alert.limit:.2f})"
@@ -455,6 +457,11 @@ def _order_line(symbol: str, outcome: Outcome) -> str:
 
 def _print_order_notice(symbol: str, text: str) -> None:
     _print_alert(_order_line(symbol, Outcome(True, text)))
+
+
+def _r_text(entry: float, r: float) -> str:
+    """'R=0.25 (0.8%)': R in dollars a share, and as a percent of entry."""
+    return f"R={r:.2f} ({r / entry * 100:.1f}%)"
 
 
 def _print_fill_notice(symbol: str, shares: float, price: float, then: str) -> None:
@@ -1035,8 +1042,8 @@ class LiveDriver:
         return (
             f"{_ANSI_BLACK}{_accent('TRACKING', _ANSI_BROWN)} {_bold(symbol)} "
             f"{trade.direction}: entry {entry:.2f} stop {stop:.2f} "
-            f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}){where}{how}; "
-            f"{_eod_text(trade, close, 'says to sell')}{_ANSI_RESET}"
+            f"{_r_text(entry, trade.r)} (1R target {trade.target_1r:.2f}){where}{how}; "
+            f"{_eod_text(trade, close, 'says to sell' if trade.direction == 'long' else 'says to cover')}{_ANSI_RESET}"
             f"{_start_lines(trade, closes)}"
         )
 
@@ -1102,7 +1109,7 @@ class LiveDriver:
         return (
             f"{_ANSI_BLACK}{_accent('TRAIL', _ANSI_BROWN)} {_bold(symbol)} "
             f"{trade.direction}: entry {entry:.2f} stop {stop:.2f} "
-            f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}) [{account}]; "
+            f"{_r_text(entry, trade.r)} (1R target {trade.target_1r:.2f}) [{account}]; "
             + ("" if plan.is_default else f"{_plan_text(trade)}; ")
             + f"{_eod_text(trade, close, 'exits')}{mode}{_ANSI_RESET}"
             + _start_lines(trade, closes)
@@ -1452,7 +1459,8 @@ class LiveDriver:
         ref = req.price or market
         size = f", {_bold(f'~${req.qty * ref:,.0f}')}" if ref else ""
         stop = (
-            f", stop {child.auxPrice:.2f} (risk {_bold(f'${trade_risk(req.qty, ref, child.auxPrice, slip):,.0f}')})"
+            f", stop {child.auxPrice:.2f} {_r_text(ref, abs(ref - child.auxPrice))}"
+            f" (risk {_bold(f'${trade_risk(req.qty, ref, child.auxPrice, slip):,.0f}')})"
             if child is not None and ref else
             f", stop {child.auxPrice:.2f}" if child is not None else f", {_accent(_bold('NO stop'), _ANSI_RED)}"
         )
