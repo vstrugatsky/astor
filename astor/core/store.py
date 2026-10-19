@@ -496,6 +496,35 @@ class TriggerStore:
             for b, d, price, x, run_id in rows
         ]
 
+    def stop_records(self, session: date) -> list[dict]:
+        """Every original stop astor wrote down on `session`, oldest first:
+        the stop an entry was sent with (order_enter), and the one each
+        track/trail action measured R from -- the original, never a moved
+        stop. Rows: time, symbol, account, stop, source."""
+        rows = self.conn.execute(
+            "SELECT detection_ts, symbol, kind, extras_json FROM alerts"
+            " WHERE substr(bar_start, 1, 10) = ?"
+            " AND (kind = 'order_enter' OR kind IN ('breakeven', 'sell', 'eod')"
+            "      OR kind LIKE 'trail_%')"
+            " ORDER BY detection_ts",
+            (session.isoformat(),),
+        ).fetchall()
+        out = []
+        for ts, symbol, kind, x in rows:
+            extras = json.loads(x)
+            if extras.get("stop") is None or not extras.get("account"):
+                continue
+            if kind == "order_enter" and not extras.get("ok"):
+                continue
+            out.append({
+                "time": datetime.fromisoformat(ts),
+                "symbol": symbol,
+                "account": extras["account"],
+                "stop": float(extras["stop"]),
+                "source": "enter" if kind == "order_enter" else "track/trail",
+            })
+        return out
+
     def purge_runs(self, keep: str | None = None) -> int:
         """Delete stored runs in place, leaving the database file itself alone.
 

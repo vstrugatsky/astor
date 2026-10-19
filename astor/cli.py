@@ -59,7 +59,7 @@ from astor.core.order_entry import (
 from astor.core.scanner import Scanner
 from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME, pace_label, rev_rvol_threshold
 from astor.core.store import TriggerStore
-from astor.drivers.live import LiveDriver, position_pnl
+from astor.drivers.live import _ANSI_GREEN, _ANSI_RED, LiveDriver, _accent, position_pnl
 from astor.drivers.replay import (
     ADR_SESSIONS,
     ET,
@@ -68,6 +68,7 @@ from astor.drivers.replay import (
     next_trading_session,
     run_replay,
 )
+from astor.drivers.trades_report import format_trades, todays_trades
 
 logger = logging.getLogger("astor")
 
@@ -807,6 +808,27 @@ async def cmd_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pnl_color(text: str, value: float) -> str:
+    return _accent(text, _ANSI_GREEN if value > 0 else _ANSI_RED) if value else text
+
+
+async def cmd_trades(args: argparse.Namespace) -> int:
+    """Today's trades -- or --date's, while IBKR still has its fills --
+    from the fills, with the original stops astor recorded. Read-only."""
+    ib = IB()
+    logger.info("Connecting to %s:%d...", args.host, args.port)
+    await ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=15, readonly=True)
+    try:
+        session = date.fromisoformat(args.date) if args.date else datetime.now(ET).date()
+        trades = await todays_trades(ib, TriggerStore(Path(args.db)), session)
+        print(f"Trades {session}")
+        for line in format_trades(trades, _pnl_color):
+            print(line)
+    finally:
+        ib.disconnect()
+    return 0
+
+
 async def cmd_positions(args: argparse.Namespace) -> int:
     """What IBKR thinks you are holding, from two independent sources.
 
@@ -1145,7 +1167,7 @@ _CONSOLE_COMMANDS = (
     "'trail SYM [ENTRY STOP] [ACCOUNT] [1.5R] [PCT gb|avwap|be ...] [close 2.5R|close exit]' "
     "(e.g. 'trail XYZ 1.5R 35% gb 35% avwap 30% be close exit'; track takes the same), "
     "'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
-    "'positions', 'mute', 'unmute', 'list', 'quit'.\n"
+    "'positions', 'trades', 'mute', 'unmute', 'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "
     "'buy|sell SYM [ACCOUNT] QTY [adn|adu|mkt|lmt P|stp P] [stop P]' "
     "(adn = Adaptive Normal, the default; adu = Adaptive Urgent), "
@@ -1300,6 +1322,9 @@ async def _live_console(
             )
         elif cmd in ("positions", "pos"):
             for line in await driver.position_lines():
+                print(line)
+        elif cmd == "trades":
+            for line in format_trades(await todays_trades(driver.ib, store, driver.session), _pnl_color):
                 print(line)
         elif cmd in ("list", "status", "tickers"):
             tracked = driver.status()
@@ -1816,6 +1841,18 @@ def build_parser() -> argparse.ArgumentParser:
     # Distinct from every other command's client ID.
     po.add_argument("--client-id", type=int, default=27)
 
+    tr = sub.add_parser(
+        "trades",
+        help="Today's trades from IBKR's fills -- entry/exit times and prices, "
+        "shares, the original stop, P&L -- read-only",
+    )
+    tr.add_argument("--date", default="", help="YYYY-MM-DD; IBKR keeps fills for the current day")
+    tr.add_argument("--db", default="data/astor.db")
+    tr.add_argument("--host", default="127.0.0.1")
+    tr.add_argument("--port", type=int, default=4001)
+    # Distinct from every other command's client ID.
+    tr.add_argument("--client-id", type=int, default=28)
+
     wc = sub.add_parser(
         "warm-cache",
         help="Pre-fetch PDH/PDL/ADR/ADV and RVOL curves for a watchlist into "
@@ -1914,6 +1951,7 @@ def main() -> None:
         "explain": cmd_explain,
         "profile": cmd_profile,
         "positions": cmd_positions,
+        "trades": cmd_trades,
     }[args.command]
     raise SystemExit(asyncio.run(cmd(args)))
 
