@@ -1217,7 +1217,7 @@ class LiveDriver:
             return f"IBKR doesn't know {req.symbol}."
         in_rth = await self._in_rth(req.symbol)
         if req.order_type in ADAPTIVE and not in_rth:
-            return "Adaptive is regular-hours only; outside them use lmt or stp."
+            return "Adaptive is regular-hours only; outside them use lmt (works now) or stp (from the open)."
         snapshot = await self._snapshot(contract)
         market, half = _price_of(snapshot), _half_spread_of(snapshot)
         held = self._held(req.symbol, account)
@@ -1248,7 +1248,10 @@ class LiveDriver:
                     f" -- this opens a {req.direction}; 'exit {req.symbol}' closes"
                 ))
         if not in_rth:
-            notes.append("queued for the open" if req.order_type == "MKT" else "works from the open")
+            notes.append({
+                "MKT": "queued for the open",
+                "LMT": "works now, pre/after-market; the stop from 9:30",
+            }.get(req.order_type, "works from the open"))
         # Pared to what is decided at the prompt: side, size, how, the stop,
         # what is at risk. SELL/BUY repeats long/short, DAY and GTC never
         # vary (entries DAY, stops GTC).

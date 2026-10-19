@@ -137,7 +137,11 @@ def _fmt_prices(stops: list[Trade]) -> str:
 
 def entry_orders(req: EnterRequest, account: str) -> tuple[Order, Order | None]:
     """The entry, DAY, and the stop loss attached to it, GTC. IBKR holds an
-    attached stop until the entry fills and cancels it with the entry."""
+    attached stop until the entry fills and cancels it with the entry.
+
+    An LMT entry works in extended hours too -- the way in before the open
+    for a short, which IBKR Desktop doesn't offer this trader. The stop
+    still triggers in regular hours only: pre-market prints are thin."""
     parent = Order(
         action=req.action, totalQuantity=req.qty, tif="DAY", account=account
     )
@@ -147,6 +151,7 @@ def entry_orders(req: EnterRequest, account: str) -> tuple[Order, Order | None]:
         parent.orderType = req.order_type
     if req.order_type == "LMT":
         parent.lmtPrice = req.price
+        parent.outsideRth = True
     if req.order_type == "STP":
         parent.auxPrice = req.price
     if req.stop is None:

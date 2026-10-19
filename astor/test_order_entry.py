@@ -186,6 +186,16 @@ def test_adaptive_priorities() -> None:
     check("trail's override", exit_order("SELL", 1, "U1234566", "ADN", priority="Urgent").algoParams[0].value, "Urgent")
 
 
+def test_lmt_entry_works_outside_regular_hours() -> None:
+    from astor.drivers.orders import entry_orders
+
+    parent, child = entry_orders(parse_enter("SPCX 20 lmt 170.10 stop 172.01", "short"), "U7654329")
+    check("LMT entry works pre-market", parent.outsideRth, True)
+    check("its stop waits for regular hours", child.outsideRth, False)
+    parent, _ = entry_orders(parse_enter("SPCX 20 stp 170.10", "short"), "U7654329")
+    check("STP entry waits for the open", parent.outsideRth, False)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
