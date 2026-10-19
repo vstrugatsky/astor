@@ -9,7 +9,8 @@
         'track NVDA', 'track NVDA 137.50 130.10' or
         'track NVDA U1234566', 'trail NVDA', 'trail NVDA 137.50 130.10 U1234566',
         'untrail NVDA', 'untrack NVDA', 'positions', 'mute', 'unmute', 'quit'; --dry-run-trail to have trail place no orders)
-        orders: 'buy NVDA 100 stop 35.99' (Adaptive), 'sell SPCX 20 stp 170.10 stop 172.01',
+        orders: 'buy NVDA 100 stop 35.99' (Adaptive Normal), 'buy NVDA 100 adu stop 35.99'
+        (Adaptive Urgent), 'sell SPCX 20 stp 170.10 stop 172.01',
         'enter SPCX short 20 stp 170.10 stop 172.01', 'stop SPCX 170.10',
         'stop SPCX 1/2 168.05 1/2 170.01', 'cancel SPCX', 'exit SPCX [lmt 168.20]'
         (--dry-run-trail covers these too)
@@ -1143,10 +1144,11 @@ _CONSOLE_COMMANDS = (
     "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
     "'positions', 'mute', 'unmute', 'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "
-    "'buy|sell SYM [ACCOUNT] QTY [mkt|lmt P|stp P] [stop P]' (Adaptive by default), "
+    "'buy|sell SYM [ACCOUNT] QTY [adn|adu|mkt|lmt P|stp P] [stop P]' "
+    "(adn = Adaptive Normal, the default; adu = Adaptive Urgent), "
     "'enter SYM [ACCOUNT] l|s QTY ...' (the same, direction spelled out), "
     "'stop SYM [ACCOUNT] P' or 'stop SYM 1/2 P1 1/2 P2', "
-    "'cancel SYM [ACCOUNT]', 'exit SYM [ACCOUNT] [alg|mkt|lmt P]'."
+    "'cancel SYM [ACCOUNT]', 'exit SYM [ACCOUNT] [adn|adu|mkt|lmt P]'."
 )
 
 _ORDER_PARSERS = {

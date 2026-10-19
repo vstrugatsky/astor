@@ -49,7 +49,7 @@ def test_enter_case_and_account() -> None:
     check("no stop", r.stop, None)
     r = parse_enter("nvda u1234566 l 5 alg stop 99.5")
     check("id uppered", r.account, "U1234566")
-    check("alg no price", (r.order_type, r.price, r.stop), ("ALG", None, 99.5))
+    check("alg (old name) is adn", (r.order_type, r.price, r.stop), ("ADN", None, 99.5))
 
 
 def test_enter_malformed() -> None:
@@ -59,9 +59,9 @@ def test_enter_malformed() -> None:
     raises("fractional qty", parse_enter, "SPCX s 2.5 mkt")
     raises("split stop not on enter", parse_enter, "SPCX s 20 mkt stop 1/2 172 1/2 173")
     r = parse_enter("SPCX s 20")
-    check("no type -> Adaptive", (r.order_type, r.stop), ("ALG", None))
+    check("no type -> Adaptive", (r.order_type, r.stop), ("ADN", None))
     r = parse_enter("SPCX s 20 stop 172")
-    check("no type, with stop", (r.order_type, r.stop), ("ALG", 172.0))
+    check("no type, with stop", (r.order_type, r.stop), ("ADN", 172.0))
     raises("mistyped type", parse_enter, "SPCX s 20 lmit 170")
 
 
@@ -97,7 +97,7 @@ def test_tranche_sizes() -> None:
 
 def test_cancel_and_exit() -> None:
     check("cancel", parse_cancel("spcx ira"), parse_cancel("SPCX IRA"))
-    check("exit default alg", parse_exit("SPCX").order_type, "ALG")
+    check("exit default adn", parse_exit("SPCX").order_type, "ADN")
     r = parse_exit("spcx reg lmt 168.2")
     check("exit lmt", (r.account, r.order_type, r.price), ("reg", "LMT", 168.2))
     check("exit mkt", parse_exit("SPCX mkt").order_type, "MKT")
@@ -140,7 +140,7 @@ def test_stop_problems() -> None:
 def test_buy_sell_put_the_direction_in_the_verb() -> None:
     r = parse_enter("nvda 100 stop 35.99", "long")
     check("buy: compact", (r.symbol, r.direction, r.qty, r.order_type, r.stop),
-          ("NVDA", "long", 100, "ALG", 35.99))
+          ("NVDA", "long", 100, "ADN", 35.99))
     r = parse_enter("SPCX reg 20 stp 170.10 stop 172.01", "short")
     check("sell: account, type, stop", (r.account, r.direction, r.order_type, r.price, r.stop),
           ("reg", "short", "STP", 170.10, 172.01))
@@ -167,6 +167,23 @@ def test_shortable_file_parses() -> None:
     lst.as_of, lst._available = as_of, available
     check("missing: none to borrow", lst.available("BSP"), 0)
     check("listed", lst.available("TINY"), 300)
+
+
+def test_adaptive_priorities() -> None:
+    from astor.drivers.orders import entry_orders, exit_order
+
+    check("adu entry", parse_enter("NVDA 100 adu stop 35.99", "long").order_type, "ADU")
+    check("adn entry", parse_enter("NVDA l 100 ADN").order_type, "ADN")
+    check("adu exit", parse_exit("NVDA reg adu").order_type, "ADU")
+    raises("adu takes no price", parse_enter, "NVDA 100 adu 36.10", "long")
+    for typ, priority in (("ADN", "Normal"), ("ADU", "Urgent")):
+        parent, _ = entry_orders(parse_enter(f"NVDA 100 {typ} stop 35.99", "long"), "U1234566")
+        check(f"{typ} entry is Adaptive {priority}",
+              (parent.orderType, parent.algoStrategy, parent.algoParams[0].value),
+              ("MKT", "Adaptive", priority))
+        order = exit_order("SELL", 100, "U1234566", typ)
+        check(f"{typ} exit is Adaptive {priority}", order.algoParams[0].value, priority)
+    check("trail's override", exit_order("SELL", 1, "U1234566", "ADN", priority="Urgent").algoParams[0].value, "Urgent")
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 
 from ib_async import IB, Contract, Order, TagValue, Trade
 
-from astor.core.order_entry import EnterRequest
+from astor.core.order_entry import ADAPTIVE, EnterRequest
 from astor.core.tracking import TrackedTrade
 
 # How long IBKR gets to confirm a modify, a cancel or a new order before it
@@ -51,9 +51,15 @@ CONFIRM_TIMEOUT = 10.0
 FILL_REPORT_TIMEOUT = 120.0
 
 # Normal works the order inside the spread for longer than Urgent does. A
-# giveback exit is not seconds-urgent; the price on a wide spread is. An
-# `alg` entry or exit typed at the console gets the same.
+# giveback exit is not seconds-urgent; the price on a wide spread is. The
+# console's default, adn, is the same; adu is there for fast movers.
 ADAPTIVE_PRIORITY = "Normal"
+
+
+def _adaptive(order: Order, priority: str) -> None:
+    order.orderType = "MKT"
+    order.algoStrategy = "Adaptive"
+    order.algoParams = [TagValue("adaptivePriority", priority)]
 
 # The 15:59 exit has about a minute before the close: a fill matters more
 # than the spread there.
@@ -135,10 +141,8 @@ def entry_orders(req: EnterRequest, account: str) -> tuple[Order, Order | None]:
     parent = Order(
         action=req.action, totalQuantity=req.qty, tif="DAY", account=account
     )
-    if req.order_type == "ALG":
-        parent.orderType = "MKT"
-        parent.algoStrategy = "Adaptive"
-        parent.algoParams = [TagValue("adaptivePriority", ADAPTIVE_PRIORITY)]
+    if req.order_type in ADAPTIVE:
+        _adaptive(parent, ADAPTIVE[req.order_type])
     else:
         parent.orderType = req.order_type
     if req.order_type == "LMT":
@@ -159,16 +163,15 @@ def entry_orders(req: EnterRequest, account: str) -> tuple[Order, Order | None]:
 
 
 def exit_order(
-    action: str, qty: float, account: str, order_type: str = "ALG",
-    price: float | None = None, priority: str = ADAPTIVE_PRIORITY,
+    action: str, qty: float, account: str, order_type: str = "ADN",
+    price: float | None = None, priority: str | None = None,
 ) -> Order:
     """A DAY exit. An LMT exit is allowed outside regular hours -- the one
-    exit that can be, since MKT and Adaptive only work in them."""
+    exit that can be, since MKT and Adaptive only work in them. `priority`
+    overrides an Adaptive type's own (trail's end-of-day exit)."""
     order = Order(action=action, totalQuantity=qty, tif="DAY", account=account)
-    if order_type == "ALG":
-        order.orderType = "MKT"
-        order.algoStrategy = "Adaptive"
-        order.algoParams = [TagValue("adaptivePriority", priority)]
+    if order_type in ADAPTIVE:
+        _adaptive(order, priority or ADAPTIVE[order_type])
     elif order_type == "LMT":
         order.orderType = "LMT"
         order.lmtPrice = price
@@ -431,7 +434,7 @@ class TrailExecutor(_OrderBase):
             else [t.order.auxPrice for t in stops],
             "priority": priority,
         }
-        order = exit_order(action, qty, trade.account or "", "ALG", priority=priority)
+        order = exit_order(action, qty, trade.account or "", "ADN", priority=priority)
         return await self._flatten(trade.symbol, stops, stops[0].contract, order, extras)
 
 

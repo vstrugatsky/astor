@@ -34,6 +34,7 @@ from ib_async import (
 from astor.core.commissions import shares_for_risk, trade_risk
 from astor.core.order_entry import (
     ACCOUNT_SUFFIX,
+    ADAPTIVE,
     CommandError,
     EnterRequest,
     StopRequest,
@@ -1215,7 +1216,7 @@ class LiveDriver:
         if contract is None:
             return f"IBKR doesn't know {req.symbol}."
         in_rth = await self._in_rth(req.symbol)
-        if req.order_type == "ALG" and not in_rth:
+        if req.order_type in ADAPTIVE and not in_rth:
             return "Adaptive is regular-hours only; outside them use lmt or stp."
         snapshot = await self._snapshot(contract)
         market, half = _price_of(snapshot), _half_spread_of(snapshot)
@@ -1250,12 +1251,13 @@ class LiveDriver:
             notes.append("queued for the open" if req.order_type == "MKT" else "works from the open")
         # Pared to what is decided at the prompt: side, size, how, the stop,
         # what is at risk. SELL/BUY repeats long/short, DAY and GTC never
-        # vary (entries DAY, stops GTC), and Adaptive's priority is fixed.
+        # vary (entries DAY, stops GTC).
         # Risk counts the commission in and out, and slippage: half the
         # spread at the stop, and again at the entry when it goes in as a
-        # market order (STP, MKT). Adaptive fills at or inside the mid, and
-        # a limit can't fill past its price (astor.core.commissions).
-        slip = (half or 0.0) * (2 if req.order_type in ("STP", "MKT") else 1)
+        # market order (STP, MKT) or Adaptive Urgent, which takes the spread
+        # to get done. Adaptive Normal fills at or inside the mid, and a
+        # limit can't fill past its price (astor.core.commissions).
+        slip = (half or 0.0) * (2 if req.order_type in ("STP", "MKT", "ADU") else 1)
         ref = req.price or market
         size = f", {_bold(f'~${req.qty * ref:,.0f}')}" if ref else ""
         stop = (
@@ -1264,7 +1266,8 @@ class LiveDriver:
             f", stop {child.auxPrice:.2f}" if child is not None else ", NO stop"
         )
         kind = {
-            "ALG": "Adaptive",
+            "ADN": "Adaptive",
+            "ADU": _bold("Adaptive Urgent"),
             "LMT": f"LMT {parent.lmtPrice:.2f}",
             "STP": f"STP {parent.auxPrice:.2f}",
         }.get(req.order_type, req.order_type)
