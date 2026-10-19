@@ -1387,6 +1387,19 @@ class LiveDriver:
         quote = await (self._snapshot(contract) if in_rth else self._quote(contract))
         market, half = _price_of(quote), _half_spread_of(quote)
         notes = []
+        # A stop entry the market is already through would trigger at once
+        # and fill at the market anyway: send it as the market order it is
+        # -- Adaptive, or outside regular hours the limit below -- and say
+        # so, rather than refuse it and make the trader retype.
+        if req.order_type == "STP" and market is not None and req.price is not None:
+            long = req.direction == "long"
+            if (market >= req.price) if long else (market <= req.price):
+                side = "buy" if long else "sell"
+                notes.append(_bold(
+                    f"market {market:.2f} is already through the {side} stop {req.price:.2f}"
+                    f" -- sent as {'Adaptive' if in_rth else 'a limit'} instead"
+                ))
+                req = dataclasses.replace(req, order_type="ADN", price=None, type_defaulted=True)
         # No type typed, outside regular hours: a limit at the far side of
         # the quote -- the price that fills now, without chasing it.
         if req.type_defaulted and not in_rth:

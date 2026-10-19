@@ -202,6 +202,48 @@ def test_untyped_entry_is_marked() -> None:
     check("lmt typed: not", parse_enter("NVDA 100 lmt 36 stop 35.99", "long").type_defaulted, False)
 
 
+def _entry_driver(market: float, bid: float, ask: float, in_rth: bool = True):
+    """A LiveDriver whose IBKR calls are stubbed: one quote, nothing held."""
+    from types import SimpleNamespace as NS
+
+    from astor.drivers.live import LiveDriver
+    from astor.drivers.shortable import ShortableList
+
+    d = LiveDriver.__new__(LiveDriver)
+    d.ib = NS(managedAccounts=lambda: ["U1234566", "U7654329"], positions=lambda *a: [])
+    d.shortable = ShortableList()
+    quote = NS(bid=bid, ask=ask, last=market, marketPrice=lambda: market, midpoint=lambda: (bid + ask) / 2)
+
+    async def contract(sym):
+        return NS(symbol=sym)
+
+    async def rth(sym):
+        return in_rth
+
+    async def snap(c):
+        return quote
+
+    d._contract, d._in_rth, d._snapshot, d._quote = contract, rth, snap, snap
+    return d
+
+
+def test_a_stop_entry_already_through_goes_as_adaptive() -> None:
+    import asyncio
+
+    req = parse_enter("ARQT 200 stp 30.35 stop 30.50", "short")
+    t = asyncio.run(_entry_driver(30.31, 30.30, 30.32).prepare_entry(req))
+    check("not refused", isinstance(t, str), False)
+    check("sent as Adaptive", (t.req.order_type, t.parent.algoStrategy), ("ADN", "Adaptive"))
+    check("and says why", "already through the sell stop 30.35" in t.summary, True)
+    check("stop kept", t.child.auxPrice, 30.50)
+
+    t = asyncio.run(_entry_driver(30.31, 30.30, 30.32, in_rth=False).prepare_entry(req))
+    check("outside hours: a limit at the bid", (t.req.order_type, t.req.price), ("LMT", 30.30))
+
+    t = asyncio.run(_entry_driver(30.40, 30.39, 30.41).prepare_entry(req))
+    check("not yet through: the stop entry stands", (t.req.order_type, t.req.price), ("STP", 30.35))
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
