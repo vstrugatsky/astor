@@ -1140,7 +1140,7 @@ async def cmd_live(args: argparse.Namespace) -> int:
 
 
 _CONSOLE_COMMANDS = (
-    "Commands: 'add SYM1,SYM2', 'remove SYM1,SYM2', 'track SYM [ENTRY STOP] [ACCOUNT]', "
+    "Commands: 'add SYM1,SYM2', 'remove|rem|rm SYM1,SYM2', 'track SYM [ENTRY STOP] [ACCOUNT]', "
     "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
     "'positions', 'mute', 'unmute', 'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "
@@ -1262,7 +1262,7 @@ async def _live_console(
             for sym, status in results.items():
                 print(f"  {sym}: {status}")
             print(f"Tracking {driver.symbol_count()}/{cap or '∞'}")
-        elif cmd == "remove":
+        elif cmd in ("remove", "rem", "rm"):
             symbols = split_symbols(rest)
             if not symbols:
                 print("Usage: remove SYM1,SYM2,...")
