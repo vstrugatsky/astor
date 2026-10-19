@@ -164,76 +164,10 @@ class TrackAlert:
     bar_start: datetime
     account: str | None = None
     rule: str | None = None  # a sell: which rule fired
-
-
-class SellRuleTracker(_Book):
-    """Owns every trade currently being tracked -- one per symbol and
-    account; re-tracking one replaces it.
-    """
-
-    def track(
-        self,
-        symbol: str,
-        entry: float,
-        stop: float,
-        account: str | None = None,
-        opened_at: datetime | None = None,
-        plan: ExitPlan | None = None,
-        eod_exit: time | None = None,
-    ) -> TrackedTrade:
-        """`eod_exit` only matters with the plan's `close`: the notice to
-        sell what's left comes on the bar ending then."""
-        return self._add(TrackedTrade(
-            symbol, entry, stop, account, opened_at=opened_at,
-            plan=plan or ExitPlan(), eod_exit=eod_exit,
-        ))
-
-    def on_close(
-        self, symbol: str, close: float, bar_start: datetime, bar_end: datetime | None = None,
-        avwap: float | None = None, yard: float | None = None,
-    ) -> list[TrackAlert]:
-        """Every alert `symbol`'s close sets off. `avwap` and `yard` (ADR(1))
-        feed the avwap rule; without them it waits."""
-        return [
-            a for t in self.for_symbol(symbol)
-            for a in self._step(t, close, bar_start, bar_end, avwap, yard)
-        ]
-
-    def _step(
-        self, trade: TrackedTrade, close: float, bar_start: datetime, bar_end: datetime | None,
-        avwap: float | None, yard: float | None,
-    ) -> list[TrackAlert]:
-        if trade.state == "done":
-            return []
-        symbol, account = trade.key
-        if (
-            trade.plan.close_hold_r is None and trade.eod_exit is not None
-            and bar_end is not None and bar_end.time() >= trade.eod_exit
-        ):
-            trade.state = "done"
-            return [TrackAlert("eod", symbol, close, bar_start, account)]
-
-        alerts = []
-        if trade.avwap_lost(close, avwap, yard):
-            trade.legs_done.add("avwap")
-            alerts.append(TrackAlert("sell", symbol, close, bar_start, account, "avwap"))
-
-        if trade.state == "watching":
-            if trade.is_favorable(close):
-                trade.state = "armed"
-                trade.peak = close
-                trade.armed_at = bar_start
-                alerts.append(TrackAlert("breakeven", symbol, close, bar_start, account))
-        elif trade.open_leg("gb") is not None:
-            # armed: track the running peak, fire once giveback from it hits 0.5R
-            assert trade.peak is not None
-            trade.peak = trade.more_favorable(trade.peak, close)
-            if abs(trade.peak - close) >= 0.5 * trade.r:
-                trade.legs_done.add("gb")
-                alerts.append(TrackAlert("sell", symbol, close, bar_start, account, "gb"))
-        if trade.finished:
-            trade.state = "done"
-        return alerts
+    # as on TrailAction: why a sell fired, and whether it is all that's left
+    giveback: float = 0.0
+    limit: float = 0.0
+    whole: bool = False
 
 
 # -- trail: the same trade, managed rather than announced -------------------
@@ -401,3 +335,42 @@ class TrailTracker(_Book):
             trade.armed_at = bar_start
             actions.append(TrailAction("breakeven", symbol, close, bar_start, account))
         return actions
+
+
+class SellRuleTracker(TrailTracker):
+    """`track`: trail's rules exactly -- the same giveback, breakeven,
+    avwap and close rules, the same plan -- announced instead of acted on.
+    Each action trail would take at IBKR becomes a notice for the trader
+    to take it by hand, so the two never disagree about a trade.
+
+    (Until 2026-10-19 track had rules of its own: nothing before +1R, then
+    a 0.5R giveback off the peak, and no end-of-day rule.)
+    """
+
+    _KIND: dict[str, AlertKind] = {"breakeven": "breakeven", "exit": "sell", "eod": "eod"}
+
+    def track(  # type: ignore[override]
+        self,
+        symbol: str,
+        entry: float,
+        stop: float,
+        account: str | None = None,
+        opened_at: datetime | None = None,
+        plan: ExitPlan | None = None,
+        eod_exit: time | None = None,
+        peak: float | None = None,
+        leg_shares: dict[str, int] | None = None,
+    ) -> TrackedTrade:
+        return super().track(symbol, entry, stop, account, eod_exit, opened_at, peak, plan, leg_shares)
+
+    def on_close(  # type: ignore[override]
+        self, symbol: str, close: float, bar_start: datetime, bar_end: datetime | None = None,
+        avwap: float | None = None, yard: float | None = None,
+    ) -> list[TrackAlert]:
+        return [
+            TrackAlert(
+                self._KIND[a.kind], a.symbol, a.close, a.bar_start, a.account,
+                a.rule, a.giveback, a.limit, a.whole,
+            )
+            for a in super().on_close(symbol, close, bar_start, bar_end, avwap, yard)
+        ]

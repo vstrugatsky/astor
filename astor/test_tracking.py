@@ -58,46 +58,46 @@ def test_long_arms_on_1r_close_not_before() -> None:
     alert = close1(tr, "NVDA", 105.0, bar_time(1))
     assert alert is not None and alert.kind == "breakeven"
     check("armed", tr.trades["NVDA", None].state, "armed")
-    check("peak set to arming close", tr.trades["NVDA", None].peak, 105.0)
+    check("peak is the best close", tr.trades["NVDA", None].peak, 105.0)
 
 
-def test_long_sell_fires_on_trailing_giveback_from_peak() -> None:
+def test_track_announces_exactly_what_trail_does() -> None:
+    """Since 2026-10-19 track runs trail's rules: every action trail takes
+    is a notice from track on the same close, long and short."""
+    from datetime import time as dtime
+
+    kinds = {"breakeven": "breakeven", "exit": "sell", "eod": "eod"}
+    paths = [
+        (100.0, 95.0, [101, 103, 105, 110, 108, 104.9, 90]),   # +1R, +2R, back 1R
+        (100.0, 105.0, [99, 97, 95, 90, 92, 95.1, 110]),       # the short's mirror
+        (100.0, 95.0, [102, 97.1, 96, 94]),                    # never +1R: 1R off its peak
+    ]
+    fired = 0
+    for entry, stop, closes in paths:
+        trail, track = TrailTracker(eod_exit=dtime(15, 59)), SellRuleTracker(eod_exit=dtime(15, 59))
+        trail.track("NVDA", entry, stop)
+        track.track("NVDA", entry, stop)
+        for i, c in enumerate(closes):
+            a, n = trail.on_close("NVDA", c, bar_time(i)), track.on_close("NVDA", c, bar_time(i))
+            check(f"{entry}/{stop} close {c}", [kinds[x.kind] for x in a], [x.kind for x in n])
+            fired += len(n)
+    check("the paths set rules off", fired, 5)
+    late = OPEN.replace(hour=15, minute=58)
+    tr = SellRuleTracker(eod_exit=dtime(15, 59))
+    tr.track("NVDA", 100.0, 95.0)
+    check("under 2R at the close: a notice", close1(tr, "NVDA", 104.0, late, late + timedelta(minutes=1)).kind, "eod")
+
+
+def test_track_sells_on_the_tiered_giveback() -> None:
     tr = SellRuleTracker()
     tr.track("NVDA", entry=100.0, stop=95.0)  # R=5
-    close1(tr, "NVDA", 105.0, bar_time(0))  # arms, peak=105
-
-    # Runs further favorable -- peak should extend, no giveback alert yet.
-    check("peak extends, no alert", close1(tr, "NVDA", 110.0, bar_time(1)), None)
-    check("peak updated", tr.trades["NVDA", None].peak, 110.0)
-
-    # Gives back less than 0.5R (2.5) from the new peak (110) -- no alert.
-    check("partial giveback, no alert", close1(tr, "NVDA", 108.0, bar_time(2)), None)
-
-    # Gives back exactly 0.5R (2.5) from peak 110 -> 107.5 -- sell fires.
-    alert = close1(tr, "NVDA", 107.5, bar_time(3))
-    assert alert is not None and alert.kind == "sell"
+    check("+1R: breakeven", close1(tr, "NVDA", 105.0, bar_time(0)).kind, "breakeven")
+    check("+2R: nothing", close1(tr, "NVDA", 110.0, bar_time(1)), None)
+    check("0.5R back from +2R: nothing now (limit 1R)", close1(tr, "NVDA", 107.5, bar_time(2)), None)
+    a = close1(tr, "NVDA", 105.0, bar_time(3))
+    check("1R back: sell, all of it", (a.kind, a.rule, a.whole), ("sell", "gb", True))
     check("done after sell", tr.trades["NVDA", None].state, "done")
-
-    # No further alerts once done.
     check("no repeat after done", close1(tr, "NVDA", 90.0, bar_time(4)), None)
-
-
-def test_short_mirrors_long() -> None:
-    tr = SellRuleTracker()
-    tr.track("TSLA", entry=100.0, stop=105.0)  # R=5, short, 1R target=95
-
-    check("no alert above 1R", close1(tr, "TSLA", 95.1, bar_time(0)), None)
-    alert = close1(tr, "TSLA", 95.0, bar_time(1))
-    assert alert is not None and alert.kind == "breakeven"
-    check("peak set", tr.trades["TSLA", None].peak, 95.0)
-
-    check("peak extends lower, no alert", close1(tr, "TSLA", 90.0, bar_time(2)), None)
-    check("peak updated", tr.trades["TSLA", None].peak, 90.0)
-
-    # 0.5R = 2.5; giveback from peak 90 to 92.5 fires sell.
-    alert = close1(tr, "TSLA", 92.5, bar_time(3))
-    assert alert is not None and alert.kind == "sell"
-    check("done after sell", tr.trades["TSLA", None].state, "done")
 
 
 def test_untracked_symbol_is_a_no_op() -> None:
@@ -121,7 +121,7 @@ def test_retrack_replaces_prior_state() -> None:
 
     tr.track("NVDA", entry=100.0, stop=95.0)  # re-track resets state
     check("watching after retrack", tr.trades["NVDA", None].state, "watching")
-    check("peak cleared after retrack", tr.trades["NVDA", None].peak, None)
+    check("peak back to entry after retrack", tr.trades["NVDA", None].peak, 100.0)
 
 
 # -- trail ----------------------------------------------------------------

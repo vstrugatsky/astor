@@ -333,23 +333,28 @@ def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
             f"  ->  move stop to breakeven ({trade.entry:.2f}){_account_tag(trade.account)}"
         )
     if alert.kind == "eod":
+        hold = trade.plan.close_hold_r
         return (
             f"{header} SELL what's left -- {_accent('the close', _ANSI_BROWN)}"
-            f" @ {alert.close:.2f} ({trade.gain_r(alert.close):+.2f}R){_account_tag(trade.account)}"
+            f" @ {alert.close:.2f} ({trade.gain_r(alert.close):+.2f}R"
+            + (f", under {hold:g}R" if hold is not None else "")
+            + f"){_account_tag(trade.account)}"
         )
-    part = _leg_part(trade, alert.rule)
-    what = f"SELL {part}" if part else "SELL"
+    part = _leg_part(trade, alert.rule) if not alert.whole else ""
+    what = f"SELL {part}" if part else (
+        "SELL the rest" if alert.whole and not trade.plan.is_default else "SELL"
+    )
     if alert.rule == "avwap":
-        return (
-            f"{header} {what} -- {_accent('lost AVWAP', _ANSI_BROWN)} @ {alert.close:.2f}"
-            f"  (entry {trade.entry:.2f}, stop {trade.stop:.2f}){_account_tag(trade.account)}"
+        why = f"{_accent('lost AVWAP', _ANSI_BROWN)}: close {alert.close:.2f} is {alert.giveback:.2f} past it (limit {alert.limit:.2f})"
+    else:
+        assert trade.peak is not None
+        why = (
+            f"{_accent(f'gave back {alert.giveback / trade.r:.2f}R', _ANSI_BROWN)}"
+            f" from {trade.peak:.2f} to {alert.close:.2f} (limit {alert.limit / trade.r:.2f}R)"
         )
-    assert trade.peak is not None
     return (
-        f"{header} {what} -- {_accent('gave back 0.5R', _ANSI_BROWN)}"
-        f" from peak {trade.peak:.2f} to {alert.close:.2f}"
-        f"  (entry {trade.entry:.2f}, stop {trade.stop:.2f}, R {trade.r:.2f})"
-        f"{_account_tag(trade.account)}"
+        f"{header} {what} -- {why}"
+        f"  (entry {trade.entry:.2f}, stop {trade.stop:.2f}, R {trade.r:.2f}){_account_tag(trade.account)}"
     )
 
 
@@ -414,6 +419,27 @@ def _trail_start_state(trade: TrackedTrade, closes: list[float]) -> str:
     if round(given, 6) >= round(limit, 6):
         state += " -- " + _accent("exits on the next close unless it recovers", _ANSI_RED)
     return state
+
+
+def _eod_text(trade: TrackedTrade, close: time | None, verb: str) -> str:
+    """What happens at the close, as the track/trail confirmation says it."""
+    hold = trade.plan.close_hold_r
+    text = (
+        f"{verb} what's left at {trade.eod_exit:%H:%M} ET" if hold is None
+        else f"{verb} at {trade.eod_exit:%H:%M} ET if under {hold:g}R"
+    )
+    if close is None:
+        text += _accent(" (IBKR schedule unavailable -- assuming a 16:00 close)", _ANSI_RED)
+    return text
+
+
+def _start_lines(trade: TrackedTrade, closes: list[float]) -> str:
+    """The lines under a track/trail confirmation: where the giveback
+    stands, and whether avwap is armed."""
+    lines = f"\n  {_trail_start_state(trade, closes)}"
+    if trade.open_leg("avwap") is not None:
+        lines += f"\n  avwap: {'armed' if trade.avwap_armed else 'waits for a close on the trade side of AVWAP'}"
+    return lines
 
 
 def _print_trail_notice(symbol: str, text: str) -> None:
@@ -985,25 +1011,32 @@ class LiveDriver:
             opened_at = known.opened_at
         self.trailer.untrack(symbol, account)
 
+        # trail's rules, so trail's start: the best close since entry, the
+        # avwap rule armed if a close since was on the trade's side, the
+        # cutoff from the symbol's own close.
         plan = plan or ExitPlan()
-        eod_exit = None
-        if plan.close_hold_r is None:
-            close = await self._session_close(symbol)
-            eod_exit = _minute_before(self.session, close or time(16, 0))
-        trade = self.tracker.track(symbol, entry, stop, account, opened_at, plan, eod_exit)
+        if opened_at is None and account is not None:
+            opened_at = await self._opened_at(symbol, account)
+        closes = self._closes_since(symbol, opened_at)
+        best = (max if stop < entry else min)(closes) if closes else None
+        close = await self._session_close(symbol)
+        eod_exit = _minute_before(self.session, close) if close else None
         held = int(abs(self._held(symbol, account))) if account else 0
-        if held:
-            trade.leg_shares = allocate(plan.legs, held)
+        trade = self.tracker.track(
+            symbol, entry, stop, account, opened_at, plan, eod_exit, best,
+            allocate(plan.legs, held) if held else None,
+        )
+        self._seed_avwap(scanner, trade, closes)
         where = f" [{account}]" if account else ""
         how = "" if plan.is_default else f"; {_plan_text(trade)}"
-        if eod_exit is not None:
-            how += f"; sell what's left at {eod_exit:%H:%M} ET"
         # Styled like the TRACKING alerts this turns on, so the confirmation
         # and the alerts that follow it read as one thing.
         return (
             f"{_ANSI_BLACK}{_accent('TRACKING', _ANSI_BROWN)} {_bold(symbol)} "
             f"{trade.direction}: entry {entry:.2f} stop {stop:.2f} "
-            f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}){where}{how}{_ANSI_RESET}"
+            f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}){where}{how}; "
+            f"{_eod_text(trade, close, 'says to sell')}{_ANSI_RESET}"
+            f"{_start_lines(trade, closes)}"
         )
 
     async def trail(
@@ -1063,29 +1096,24 @@ class LiveDriver:
             symbol, entry, stop, account, eod_exit, opened_at, best,
             plan, allocate(plan.legs, int(abs(held))),
         )
-        # avwap: armed already if a close since entry was on the trade's
-        # side of AVWAP -- today's AVWAP, the one the rule will watch.
-        avwap, _ = _avwap_inputs(scanner.indicators.get(symbol))
-        if avwap is not None and closes:
-            trade.avwap_armed = any(c > avwap if stop < entry else c < avwap for c in closes)
+        self._seed_avwap(scanner, trade, closes)
         mode = " (dry run -- no orders)" if self.executor.dry_run else ""
-        eod = (
-            f"sells what's left at {trade.eod_exit:%H:%M} ET" if plan.close_hold_r is None
-            else f"exits at {trade.eod_exit:%H:%M} ET if under {plan.close_hold_r:g}R"
-        )
-        if close is None:
-            eod += _accent(" (IBKR schedule unavailable -- assuming a 16:00 close)", _ANSI_RED)
         return (
             f"{_ANSI_BLACK}{_accent('TRAIL', _ANSI_BROWN)} {_bold(symbol)} "
             f"{trade.direction}: entry {entry:.2f} stop {stop:.2f} "
             f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}) [{account}]; "
             + ("" if plan.is_default else f"{_plan_text(trade)}; ")
-            + f"{eod}{mode}{_ANSI_RESET}\n  {_trail_start_state(trade, closes)}"
-            + (
-                "" if trade.open_leg("avwap") is None else
-                f"\n  avwap: {'armed' if trade.avwap_armed else 'waits for a close on the trade side of AVWAP'}"
-            )
+            + f"{_eod_text(trade, close, 'exits')}{mode}{_ANSI_RESET}"
+            + _start_lines(trade, closes)
         )
+
+    def _seed_avwap(self, scanner: Scanner, trade: TrackedTrade, closes: list[float]) -> None:
+        """avwap: armed already if a close since entry was on the trade's
+        side of AVWAP -- today's AVWAP, the one the rule will watch."""
+        avwap, _ = _avwap_inputs(scanner.indicators.get(trade.symbol))
+        if avwap is not None and closes:
+            long = trade.direction == "long"
+            trade.avwap_armed = any(c > avwap if long else c < avwap for c in closes)
 
     async def _opened_at(self, symbol: str, account: str) -> datetime | None:
         """When today's fills opened the position now held in `account`:
