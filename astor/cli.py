@@ -45,6 +45,7 @@ from pathlib import Path
 
 from ib_async import IB
 
+from astor.core.exit_plan import parse_trade_command
 from astor.core.indicators import SessionIndicators, compute_interval_rvol, compute_rvol
 from astor.core.order_entry import (
     CommandError,
@@ -1141,7 +1142,9 @@ async def cmd_live(args: argparse.Namespace) -> int:
 
 _CONSOLE_COMMANDS = (
     "Commands: 'add SYM1,SYM2', 'remove|rem|rm SYM1,SYM2', 'track SYM [ENTRY STOP] [ACCOUNT]', "
-    "'trail SYM [ENTRY STOP] [ACCOUNT]', 'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
+    "'trail SYM [ENTRY STOP] [ACCOUNT] [1.5R] [PCT gb|avwap|be ...] [close]' "
+    "(e.g. 'trail XYZ 1.5R 35% gb 35% avwap 30% be close'; track takes the same), "
+    "'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
     "'positions', 'mute', 'unmute', 'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "
     "'buy|sell SYM [ACCOUNT] QTY [adn|adu|mkt|lmt P|stp P] [stop P]' "
@@ -1163,29 +1166,6 @@ _ORDER_PARSERS = {
 
 def _by_symbol(trades: dict) -> list:
     return sorted(trades.values(), key=lambda t: (t.symbol, t.account or ""))
-
-
-def _parse_trade_args(rest: str) -> tuple[str, float | None, float | None, str | None] | None:
-    """'SYM [ENTRY STOP] [ACCOUNT]' -> (symbol, entry, stop, account), or
-    None if malformed. Both prices or neither; IBKR account IDs are letters
-    then digits (U1234566), so a lone price is a half-given ENTRY STOP.
-    """
-    parts = rest.split()
-    if not parts:
-        return None
-    symbol = parts[0].upper().replace(".", " ")
-    args = parts[1:]
-    account = None
-    if args and args[-1][0].isalpha():
-        account = account_token(args.pop())
-    if not args:
-        return symbol, None, None, account
-    if len(args) != 2:
-        return None
-    try:
-        return symbol, float(args[0]), float(args[1]), account
-    except ValueError:
-        return None
 
 
 async def _live_console(
@@ -1272,18 +1252,19 @@ async def _live_console(
                 print(f"  {sym}: {status}")
             print(f"Tracking {driver.symbol_count()}/{cap or '∞'}")
         elif cmd in ("track", "trail"):
-            parsed = _parse_trade_args(rest)
-            if parsed is None:
-                print(f"Usage: {cmd} SYM [ENTRY STOP] [ACCOUNT] -- both prices, or neither for an IBKR lookup")
+            try:
+                parsed = parse_trade_command(rest, cmd)
+            except CommandError as e:
+                print(f"  {e}")
                 continue
-            symbol, entry, stop, account = parsed
+            symbol, entry, stop, account = parsed.symbol, parsed.entry, parsed.stop, parsed.account
             if symbol not in driver.status()["live"] and symbol not in driver.status()["pending"]:
                 room = cap - driver.symbol_count() if cap else None
                 if room is not None and room < 1:
                     print(f"No room to {cmd} {symbol} (cap {cap}, currently {driver.symbol_count()}).")
                     continue
             start = driver.track if cmd == "track" else driver.trail
-            msg = await start(scanner, symbol, entry, stop, run_id, store, account)
+            msg = await start(scanner, symbol, entry, stop, run_id, store, account, plan=parsed.plan)
             print(f"  {msg}")
         elif cmd in ("untrack", "untrail"):
             # An account narrows it to that account's trade; without one,

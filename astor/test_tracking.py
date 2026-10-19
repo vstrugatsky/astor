@@ -395,6 +395,152 @@ def test_flat_position_ends_an_unnamed_trade_only_when_nothing_is_held() -> None
     check("held nowhere -> dropped", d.tracker.trades, {})
 
 
+# -- exit plans: rules, shares, R coefficient, close ------------------------
+
+def _plan(text: str):
+    from astor.core.exit_plan import parse_trade_command
+
+    return parse_trade_command(f"XYZ {text}").plan
+
+
+def test_plan_parses_the_example() -> None:
+    from astor.core.exit_plan import CommandError, allocate, parse_trade_command
+
+    c = parse_trade_command("xyz 156.80 157.89 reg 1.5R 35% gb 35% avwap 30% be close")
+    check("prices, account", (c.symbol, c.entry, c.stop, c.account), ("XYZ", 156.80, 157.89, "reg"))
+    check("plan", c.plan.describe(), "1.5R; 35% gb, 35% avwap, 30% be; close")
+    check("nothing given: today's rule", parse_trade_command("XYZ").plan.is_default, True)
+    check("the rest rides the stop", _plan("50% avwap0.1").describe(), "50% avwap0.1, 50% be")
+    check("a bare rule takes it all", _plan("avwap").describe(), "100% avwap")
+    check("shares: largest remainder", allocate(_plan("35% gb 35% avwap 30% be").legs, 7),
+          {"gb": 3, "avwap": 2, "be": 2})
+    for bad in ("35%", "60% gb 60% avwap", "35% gb 10% gb", "156.8", "35% xyz"):
+        try:
+            parse_trade_command(f"XYZ {bad}")
+        except CommandError:
+            continue
+        raise AssertionError(f"{bad!r} should be refused")
+
+
+def test_r_coefficient_scales_every_r_rule() -> None:
+    tr = TrailTracker(eod_exit=None)
+    t = tr.track("XYZ", 100.0, 98.0, plan=_plan("1.5R"))
+    check("R is 1.5x the stop distance", t.r, 3.0)
+    check("+1R is 3 away", t.target_1r, 103.0)
+    check("102.9 is short of it", close1(tr, "XYZ", 102.9, bar_time(1)), None)
+    check("103 moves the stop", close1(tr, "XYZ", 103.0, bar_time(2)).kind, "breakeven")
+
+
+def test_avwap_rule_arms_on_the_trade_side_then_fires_past_it() -> None:
+    tr = TrailTracker(eod_exit=None)
+    tr.track("XYZ", 100.0, 98.0, plan=_plan("avwap"))
+    # yard 2.00 -> 0.05 x 2 = 0.10 past AVWAP 100.50
+    check("below AVWAP at the start: waits", close1(tr, "XYZ", 100.0, bar_time(1), None, 100.5, 2.0), None)
+    check("still below: still waits", close1(tr, "XYZ", 99.0, bar_time(2), None, 100.5, 2.0), None)
+    check("above: arms", close1(tr, "XYZ", 101.0, bar_time(3), None, 100.5, 2.0), None)
+    check("within 0.10 under: holds", close1(tr, "XYZ", 100.41, bar_time(4), None, 100.5, 2.0), None)
+    a = close1(tr, "XYZ", 100.39, bar_time(5), None, 100.5, 2.0)
+    check("past 0.10 under: sells", (a.kind, a.rule, a.whole), ("exit", "avwap", True))
+    check("and that was all of it", tr.trades["XYZ", None].state, "done")
+
+
+def test_avwap_rule_short_mirrors_long() -> None:
+    tr = TrailTracker(eod_exit=None)
+    tr.track("XYZ", 100.0, 102.0, plan=_plan("avwap"))
+    close1(tr, "XYZ", 99.0, bar_time(1), None, 99.5, 2.0)  # under AVWAP: armed
+    check("0.10 over: holds", close1(tr, "XYZ", 99.6, bar_time(2), None, 99.5, 2.0), None)
+    check("past it: sells", close1(tr, "XYZ", 99.61, bar_time(3), None, 99.5, 2.0).rule, "avwap")
+
+
+def test_partial_legs_fire_on_their_own() -> None:
+    tr = TrailTracker(eod_exit=None)
+    t = tr.track("XYZ", 100.0, 98.0, plan=_plan("35% gb 35% avwap 30% be"),
+                 leg_shares={"gb": 35, "avwap": 35, "be": 30})
+    close1(tr, "XYZ", 101.0, bar_time(1), None, 100.5, 2.0)  # armed above AVWAP
+    a = close1(tr, "XYZ", 100.3, bar_time(2), None, 100.5, 2.0)
+    check("avwap first: its share only", (a.rule, a.whole), ("avwap", False))
+    check("still trailing", t.state, "watching")
+    check("+1R: breakeven for the rest", close1(tr, "XYZ", 102.0, bar_time(3), None, 100.5, 2.0).kind, "breakeven")
+    # peak 102 = +1R: limit is 50% of it, 1.00
+    a = close1(tr, "XYZ", 101.0, bar_time(4), None, 100.5, 2.0)
+    check("gb: its share, the be shares stay", (a.rule, a.whole, t.state), ("gb", False, "armed"))
+    check("be shares ride the stop: nothing more", close1(tr, "XYZ", 100.2, bar_time(5), None, 100.5, 2.0), None)
+
+
+def test_two_rules_on_one_close_end_with_the_whole() -> None:
+    tr = TrailTracker(eod_exit=None)
+    tr.track("XYZ", 100.0, 98.0, plan=_plan("50% gb 50% avwap"))
+    tr.on_close("XYZ", 101.0, bar_time(1), None, 100.5, 2.0)
+    out = tr.on_close("XYZ", 98.9, bar_time(2), None, 100.5, 2.0)  # gave back 2.1 and lost AVWAP
+    check("both, last takes what's left", [(a.rule, a.whole) for a in out], [("gb", False), ("avwap", True)])
+
+
+def test_close_sells_even_past_2r() -> None:
+    from datetime import time as dtime
+
+    for plan, want in (("", None), ("close", "eod")):
+        tr = TrailTracker(eod_exit=dtime(15, 59))
+        tr.track("XYZ", 100.0, 98.0, plan=_plan(plan) if plan else None)
+        late = OPEN.replace(hour=15, minute=58)
+        a = close1(tr, "XYZ", 105.0, late, late + timedelta(minutes=1))  # +2.5R
+        check(f"{plan or 'no close'} at +2.5R", a.kind if a else None, want if want else "breakeven")
+
+
+def test_track_notifies_per_rule() -> None:
+    from datetime import time as dtime
+
+    tr = SellRuleTracker()
+    t = tr.track("XYZ", 100.0, 98.0, plan=_plan("50% gb 50% avwap close"), eod_exit=dtime(15, 59))
+    tr.on_close("XYZ", 101.0, bar_time(1), None, 100.5, 2.0)
+    a = close1(tr, "XYZ", 100.3, bar_time(2), None, 100.5, 2.0)
+    check("avwap: a sell notice", (a.kind, a.rule), ("sell", "avwap"))
+    check("+1R: breakeven", close1(tr, "XYZ", 102.0, bar_time(3), None, 100.5, 2.0).kind, "breakeven")
+    a = close1(tr, "XYZ", 101.0, bar_time(4), None, 100.5, 2.0)
+    check("0.5R back: gb's sell", (a.kind, a.rule, t.state), ("sell", "gb", "done"))
+    tr2 = SellRuleTracker()
+    tr2.track("XYZ", 100.0, 98.0, plan=_plan("close"), eod_exit=dtime(15, 59))
+    late = OPEN.replace(hour=15, minute=58)
+    check("close: an eod notice", close1(tr2, "XYZ", 101.0, late, late + timedelta(minutes=1)).kind, "eod")
+
+
+def _executor_holding(held: float, stops: list[tuple[float, float]]):
+    """A dry-run TrailExecutor over a fake IBKR: a long of `held` shares
+    protected by SELL stops of (qty, price)."""
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from astor.drivers.orders import TrailExecutor
+
+    trades = [
+        NS(contract=NS(symbol="XYZ"), orderStatus=NS(status="Submitted"),
+           order=NS(account="U1", action="SELL", orderType="STP", totalQuantity=q,
+                    auxPrice=p, parentId=0, orderId=-(i + 1)))
+        for i, (q, p) in enumerate(stops)
+    ]
+
+    async def all_open():
+        return trades
+
+    ib = NS(
+        positions=lambda account="": [NS(contract=NS(symbol="XYZ"), position=held)],
+        reqAllOpenOrdersAsync=all_open,
+    )
+    ex = TrailExecutor(ib, True, lambda *a: None, lambda *a: None)
+    return ex, asyncio.run
+
+
+def test_partial_sale_cuts_the_furthest_stop_first() -> None:
+    ex, run = _executor_holding(100, [(50, 97.0), (50, 98.0)])
+    t = TrackedTrade("XYZ", 100.0, 98.0, account="U1")
+    out = run(ex.exit_shares(t, 35))
+    check("cut the 97 tranche by 35", "cut stop 50@97.00 -> 15" in out.text, True)
+    check("then sells 35", "SELL 35 Adaptive" in out.text, True)
+    out = run(ex.exit_shares(t, 70))
+    check("70: cancels 97, cuts 98", "50@97.00 -> cancel, 50@98.00 -> 30" in out.text, True)
+    out = run(ex.exit_shares(t, 100))
+    check("everything: the whole exit", "cancel stop(s)" in out.text, True)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

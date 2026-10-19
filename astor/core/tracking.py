@@ -18,12 +18,14 @@ nothing to convert.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time
 from typing import Literal
 
+from astor.core.exit_plan import ExitPlan, Leg
+
 State = Literal["watching", "armed", "done"]
-AlertKind = Literal["breakeven", "sell"]
+AlertKind = Literal["breakeven", "sell", "eod"]
 
 
 @dataclass
@@ -48,6 +50,13 @@ class TrackedTrade:
     # When the position was opened, if known -- `trail` measures its best
     # close from here rather than from the moment it was started
     opened_at: datetime | None = None
+    # Which rules take it out, for what share, against what R (exit_plan)
+    plan: ExitPlan = field(default_factory=ExitPlan)
+    legs_done: set[str] = field(default_factory=set)
+    # avwap: armed once a close has been on the trade's side of AVWAP
+    avwap_armed: bool = False
+    # trail: whole shares per rule, fixed when it starts
+    leg_shares: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.stop == self.entry:
@@ -59,7 +68,9 @@ class TrackedTrade:
 
     @property
     def r(self) -> float:
-        return abs(self.entry - self.stop)
+        """R in dollars a share: the stop distance, times the plan's R
+        coefficient (1.5R for a stop set tight)."""
+        return abs(self.entry - self.stop) * self.plan.r_mult
 
     @property
     def target_1r(self) -> float:
@@ -79,6 +90,30 @@ class TrackedTrade:
     @property
     def key(self) -> TradeKey:
         return self.symbol, self.account
+
+    def open_leg(self, rule: str) -> Leg | None:
+        """The plan's leg for `rule`, if it has one that hasn't fired."""
+        leg = self.plan.leg(rule)  # type: ignore[arg-type]
+        return leg if leg is not None and rule not in self.legs_done else None
+
+    @property
+    def finished(self) -> bool:
+        """Every rule has fired and no shares ride the stop."""
+        return all(g.rule in self.legs_done for g in self.plan.legs)
+
+    def avwap_lost(self, close: float, avwap: float | None, yard: float | None) -> bool:
+        """The avwap rule on one close: arms once a close is on the trade's
+        side of AVWAP, then fires on a close `avwap_adr` x ADR(1) (`yard`)
+        past it the other way. A trade begun on the wrong side waits."""
+        leg = self.open_leg("avwap")
+        if leg is None or avwap is None or not yard:
+            return False
+        long = self.direction == "long"
+        if not self.avwap_armed:
+            self.avwap_armed = close > avwap if long else close < avwap
+            return False
+        limit = leg.avwap_adr * yard
+        return close < avwap - limit if long else close > avwap + limit
 
 
 # One trade per symbol *per account*: the same symbol can be short in one
@@ -128,6 +163,7 @@ class TrackAlert:
     close: float
     bar_start: datetime
     account: str | None = None
+    rule: str | None = None  # a sell: which rule fired
 
 
 class SellRuleTracker(_Book):
@@ -142,35 +178,62 @@ class SellRuleTracker(_Book):
         stop: float,
         account: str | None = None,
         opened_at: datetime | None = None,
+        plan: ExitPlan | None = None,
+        eod_exit: time | None = None,
     ) -> TrackedTrade:
-        return self._add(TrackedTrade(symbol, entry, stop, account, opened_at=opened_at))
+        """`eod_exit` only matters with the plan's `close`: the notice to
+        sell what's left comes on the bar ending then."""
+        return self._add(TrackedTrade(
+            symbol, entry, stop, account, opened_at=opened_at,
+            plan=plan or ExitPlan(), eod_exit=eod_exit,
+        ))
 
-    def on_close(self, symbol: str, close: float, bar_start: datetime) -> list[TrackAlert]:
-        """Every alert `symbol`'s close sets off, one per account at most."""
-        alerts = [self._step(t, close, bar_start) for t in self.for_symbol(symbol)]
-        return [a for a in alerts if a is not None]
+    def on_close(
+        self, symbol: str, close: float, bar_start: datetime, bar_end: datetime | None = None,
+        avwap: float | None = None, yard: float | None = None,
+    ) -> list[TrackAlert]:
+        """Every alert `symbol`'s close sets off. `avwap` and `yard` (ADR(1))
+        feed the avwap rule; without them it waits."""
+        return [
+            a for t in self.for_symbol(symbol)
+            for a in self._step(t, close, bar_start, bar_end, avwap, yard)
+        ]
 
-    def _step(self, trade: TrackedTrade, close: float, bar_start: datetime) -> TrackAlert | None:
+    def _step(
+        self, trade: TrackedTrade, close: float, bar_start: datetime, bar_end: datetime | None,
+        avwap: float | None, yard: float | None,
+    ) -> list[TrackAlert]:
         if trade.state == "done":
-            return None
+            return []
         symbol, account = trade.key
+        if (
+            trade.plan.close and trade.eod_exit is not None
+            and bar_end is not None and bar_end.time() >= trade.eod_exit
+        ):
+            trade.state = "done"
+            return [TrackAlert("eod", symbol, close, bar_start, account)]
+
+        alerts = []
+        if trade.avwap_lost(close, avwap, yard):
+            trade.legs_done.add("avwap")
+            alerts.append(TrackAlert("sell", symbol, close, bar_start, account, "avwap"))
 
         if trade.state == "watching":
-            if not trade.is_favorable(close):
-                return None
-            trade.state = "armed"
-            trade.peak = close
-            trade.armed_at = bar_start
-            return TrackAlert("breakeven", symbol, close, bar_start, account)
-
-        # armed: track the running peak, fire once giveback from it hits 0.5R
-        assert trade.peak is not None
-        trade.peak = trade.more_favorable(trade.peak, close)
-        giveback = abs(trade.peak - close)
-        if giveback >= 0.5 * trade.r:
+            if trade.is_favorable(close):
+                trade.state = "armed"
+                trade.peak = close
+                trade.armed_at = bar_start
+                alerts.append(TrackAlert("breakeven", symbol, close, bar_start, account))
+        elif trade.open_leg("gb") is not None:
+            # armed: track the running peak, fire once giveback from it hits 0.5R
+            assert trade.peak is not None
+            trade.peak = trade.more_favorable(trade.peak, close)
+            if abs(trade.peak - close) >= 0.5 * trade.r:
+                trade.legs_done.add("gb")
+                alerts.append(TrackAlert("sell", symbol, close, bar_start, account, "gb"))
+        if trade.finished:
             trade.state = "done"
-            return TrackAlert("sell", symbol, close, bar_start, account)
-        return None
+        return alerts
 
 
 # -- trail: the same trade, managed rather than announced -------------------
@@ -200,6 +263,11 @@ class TrailAction:
     account: str | None = None
     giveback: float = 0.0
     limit: float = 0.0
+    rule: str | None = None  # an exit: which rule's shares go
+    # an exit: the last rule, so the whole remaining position goes -- not
+    # just its share, which rounding or a partly filled stop may have left
+    # short of what is held
+    whole: bool = False
 
 
 def giveback_limit(trade: TrackedTrade) -> float:
@@ -251,60 +319,85 @@ class TrailTracker(_Book):
         eod_exit: time | None = None,
         opened_at: datetime | None = None,
         peak: float | None = None,
+        plan: ExitPlan | None = None,
+        leg_shares: dict[str, int] | None = None,
     ) -> TrackedTrade:
         """`eod_exit` is this trade's own cutoff, from its session's close;
         None takes the tracker's default. `peak` is the best close already
         seen since entry, if any -- never worse than entry itself."""
         trade = TrackedTrade(
-            symbol, entry, stop, account, eod_exit=eod_exit or self.eod_exit, opened_at=opened_at
+            symbol, entry, stop, account, eod_exit=eod_exit or self.eod_exit, opened_at=opened_at,
+            plan=plan or ExitPlan(), leg_shares=dict(leg_shares or {}),
         )
         trade.peak = entry if peak is None else trade.more_favorable(entry, peak)
         return self._add(trade)
 
     def on_close(
-        self, symbol: str, close: float, bar_start: datetime, bar_end: datetime | None = None
+        self, symbol: str, close: float, bar_start: datetime, bar_end: datetime | None = None,
+        avwap: float | None = None, yard: float | None = None,
     ) -> list[TrailAction]:
-        """Every action `symbol`'s close calls for, one per account at most."""
-        actions = [self._step(t, close, bar_start, bar_end) for t in self.for_symbol(symbol)]
-        return [a for a in actions if a is not None]
+        """Every action `symbol`'s close calls for, in the order they are to
+        be carried out. `avwap` and `yard` (ADR(1)) feed the avwap rule;
+        without them it waits."""
+        return [
+            a for t in self.for_symbol(symbol)
+            for a in self._step(t, close, bar_start, bar_end, avwap, yard)
+        ]
 
     def _step(
-        self, trade: TrackedTrade, close: float, bar_start: datetime, bar_end: datetime | None
-    ) -> TrailAction | None:
+        self, trade: TrackedTrade, close: float, bar_start: datetime, bar_end: datetime | None,
+        avwap: float | None, yard: float | None,
+    ) -> list[TrailAction]:
         if trade.state == "done":
-            return None
+            return []
         symbol, account = trade.key
         assert trade.peak is not None
         trade.peak = trade.more_favorable(trade.peak, close)
 
         # Ahead of breakeven: a trade reaching +1R on this bar still exits
         # if it is under 2R -- there is no session left for the stop to work.
+        # The plan's `close` takes it out at the close whatever the gain.
         if (
             trade.eod_exit is not None
             and bar_end is not None
             and bar_end.time() >= trade.eod_exit
-            and trade.gain_r(close) < EOD_HOLD_R
+            and (trade.plan.close or trade.gain_r(close) < EOD_HOLD_R)
         ):
             trade.state = "done"
-            return TrailAction("eod", symbol, close, bar_start, account)
+            return [TrailAction("eod", symbol, close, bar_start, account)]
 
-        # The exit is checked before breakeven: on a trade that ran past +1R
-        # before trail was started, the first close may already have given
-        # back too much, and the exit takes the stops with it anyway. On a
-        # trade trailed from entry the two can't land on the same close --
-        # the close that first reaches +1R is the peak, with nothing given back.
-        giveback = abs(trade.peak - close)
-        limit = giveback_limit(trade)
-        # Rounded first: closes and R are cent prices, and a giveback of
-        # exactly the limit must not miss it on float noise.
-        if round(giveback, 6) >= round(limit, 6):
+        # The exits are checked before breakeven: on a trade that ran past
+        # +1R before trail was started, the first close may already have
+        # given back too much. On a trade trailed from entry the giveback
+        # and breakeven can't land on the same close -- the close that first
+        # reaches +1R is the peak, with nothing given back.
+        actions = []
+        if trade.open_leg("gb") is not None:
+            giveback = abs(trade.peak - close)
+            limit = giveback_limit(trade)
+            # Rounded first: closes and R are cent prices, and a giveback of
+            # exactly the limit must not miss it on float noise.
+            if round(giveback, 6) >= round(limit, 6):
+                trade.legs_done.add("gb")
+                actions.append(TrailAction("exit", symbol, close, bar_start, account, giveback, limit, "gb"))
+        leg = trade.open_leg("avwap")
+        if leg is not None and trade.avwap_lost(close, avwap, yard):
+            assert avwap is not None and yard is not None
+            trade.legs_done.add("avwap")
+            actions.append(TrailAction(
+                "exit", symbol, close, bar_start, account,
+                abs(close - avwap), leg.avwap_adr * yard, "avwap",
+            ))
+        if trade.finished:
             trade.state = "done"
-            return TrailAction("exit", symbol, close, bar_start, account, giveback, limit)
+            if actions:
+                actions[-1] = replace(actions[-1], whole=True)
+            return actions
 
         # Off the peak, not this close: a trade handed a peak already past
         # +1R gets its breakeven on the first close, wherever that is.
         if trade.state == "watching" and trade.is_favorable(trade.peak):
             trade.state = "armed"
             trade.armed_at = bar_start
-            return TrailAction("breakeven", symbol, close, bar_start, account)
-        return None
+            actions.append(TrailAction("breakeven", symbol, close, bar_start, account))
+        return actions

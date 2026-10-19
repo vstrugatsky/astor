@@ -33,6 +33,7 @@ from ib_async import (
 )
 
 from astor.core.commissions import shares_for_risk, trade_risk
+from astor.core.exit_plan import ExitPlan, allocate
 from astor.core.order_entry import (
     ACCOUNT_SUFFIX,
     ADAPTIVE,
@@ -283,6 +284,43 @@ def _account_tag(account: str | None) -> str:
     return f"  [{'ira' if is_ira(account) else 'reg' if account.endswith(ACCOUNT_SUFFIX['reg']) else account}]"
 
 
+# The avwap rule's yardstick: today's range, capped at 10% of price -- the
+# same ADR(1) the AVT setup measures its touch in (setups' max_yard_pct).
+AVWAP_YARD_CAP_PCT = 10.0
+
+
+def _avwap_inputs(ind) -> tuple[float | None, float | None]:
+    """(AVWAP, ADR(1) yardstick) for the avwap rule, from a symbol's
+    session indicators; None for either that isn't there yet."""
+    if ind is None or ind.session_high is None or ind.session_low is None:
+        return None, None
+    day_range = ind.session_high - ind.session_low
+    if day_range <= 0:
+        return ind.avwap, None
+    return ind.avwap, min(day_range, AVWAP_YARD_CAP_PCT / 100.0 * ind.session_low)
+
+
+def _leg_part(trade: TrackedTrade, rule: str | None) -> str:
+    """'35% (35 sh)' for a rule's share; '' on a one-rule plan."""
+    leg = trade.plan.leg(rule) if rule else None  # type: ignore[arg-type]
+    if leg is None or leg.pct >= 100:
+        return ""
+    n = trade.leg_shares.get(leg.rule)
+    return f"{leg.pct:g}%" + (f" ({n} sh)" if n is not None else "")
+
+
+def _plan_text(trade: TrackedTrade) -> str:
+    """The plan as the confirmation states it: R coefficient, each rule's
+    share with its shares, and the close."""
+    plan = trade.plan
+    legs = ", ".join(
+        f"{g.label()}" + (f" ({trade.leg_shares[g.rule]} sh)" if g.rule in trade.leg_shares else "")
+        for g in plan.legs
+    )
+    parts = ([f"R x{plan.r_mult:g}"] if plan.r_mult != 1.0 else []) + [legs]
+    return "; ".join(parts)
+
+
 def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
     header = (
         f"[{alert.bar_start:%H:%M:%S} ET] {_accent('TRACKING', _ANSI_BROWN)} "
@@ -294,9 +332,21 @@ def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
             f" (target {trade.target_1r:.2f})"
             f"  ->  move stop to breakeven ({trade.entry:.2f}){_account_tag(trade.account)}"
         )
+    if alert.kind == "eod":
+        return (
+            f"{header} SELL what's left -- {_accent('the close', _ANSI_BROWN)}"
+            f" @ {alert.close:.2f} ({trade.gain_r(alert.close):+.2f}R){_account_tag(trade.account)}"
+        )
+    part = _leg_part(trade, alert.rule)
+    what = f"SELL {part}" if part else "SELL"
+    if alert.rule == "avwap":
+        return (
+            f"{header} {what} -- {_accent('lost AVWAP', _ANSI_BROWN)} @ {alert.close:.2f}"
+            f"  (entry {trade.entry:.2f}, stop {trade.stop:.2f}){_account_tag(trade.account)}"
+        )
     assert trade.peak is not None
     return (
-        f"{header} SELL -- {_accent('gave back 0.5R', _ANSI_BROWN)}"
+        f"{header} {what} -- {_accent('gave back 0.5R', _ANSI_BROWN)}"
         f" from peak {trade.peak:.2f} to {alert.close:.2f}"
         f"  (entry {trade.entry:.2f}, stop {trade.stop:.2f}, R {trade.r:.2f})"
         f"{_account_tag(trade.account)}"
@@ -318,13 +368,25 @@ def _format_trail_alert(action: TrailAction, trade: TrackedTrade, outcome: Outco
     if action.kind == "breakeven":
         why = f"+1R @ {action.close:.2f} (target {trade.target_1r:.2f})"
     elif action.kind == "eod":
-        why = f"end-of-day: last close {action.close:.2f} is {trade.gain_r(action.close):+.2f}R, under 2R"
+        gain = trade.gain_r(action.close)
+        why = f"end-of-day: last close {action.close:.2f} is {gain:+.2f}R" + (
+            "" if trade.plan.close and gain >= 2 else ", under 2R" if not trade.plan.close else ""
+        )
+    elif action.rule == "avwap":
+        why = (
+            f"lost AVWAP: close {action.close:.2f} is {action.giveback:.2f} past it "
+            f"(limit {action.limit:.2f})"
+        )
     else:
         assert trade.peak is not None
         why = (
             f"gave back {action.giveback / trade.r:.2f}R from {trade.peak:.2f} "
             f"to {action.close:.2f} (limit {action.limit / trade.r:.2f}R)"
         )
+    if action.kind == "exit" and not action.whole and (part := _leg_part(trade, action.rule)):
+        why = f"{part}: {why}"
+    elif action.kind == "exit" and not trade.plan.is_default:
+        why = f"the rest: {why}"
     done = outcome.text if outcome.ok else _accent(outcome.text, _ANSI_RED)
     return (
         f"{_trail_header(action.symbol, action.bar_start)} {trade.direction:<5} {why}  ->  {done}"
@@ -335,6 +397,8 @@ def _format_trail_alert(action: TrailAction, trade: TrackedTrade, outcome: Outco
 def _trail_start_state(trade: TrackedTrade, closes: list[float]) -> str:
     """Where a just-started trail stands: what it counts the giveback
     from, and whether the next close exits already."""
+    if trade.plan.leg("gb") is None:
+        return "no giveback rule in this plan"
     if trade.opened_at is None:
         return "entry time unknown (no fill today that opened it) -- giveback counts from the next close"
     if not closes:
@@ -901,6 +965,7 @@ class LiveDriver:
         store: TriggerStore,
         account: str | None = None,
         opened_at: datetime | None = None,
+        plan: ExitPlan | None = None,
     ) -> str:
         """Start sell-rule tracking for a position in `symbol`. `entry` and
         `stop` are either both given (trusted as-is, no IBKR lookup -- the
@@ -920,14 +985,25 @@ class LiveDriver:
             opened_at = known.opened_at
         self.trailer.untrack(symbol, account)
 
-        trade = self.tracker.track(symbol, entry, stop, account, opened_at)
+        plan = plan or ExitPlan()
+        eod_exit = None
+        if plan.close:
+            close = await self._session_close(symbol)
+            eod_exit = _minute_before(self.session, close or time(16, 0))
+        trade = self.tracker.track(symbol, entry, stop, account, opened_at, plan, eod_exit)
+        held = int(abs(self._held(symbol, account))) if account else 0
+        if held:
+            trade.leg_shares = allocate(plan.legs, held)
         where = f" [{account}]" if account else ""
+        how = "" if plan.is_default else f"; {_plan_text(trade)}"
+        if eod_exit is not None:
+            how += f"; sell what's left at {eod_exit:%H:%M} ET"
         # Styled like the TRACKING alerts this turns on, so the confirmation
         # and the alerts that follow it read as one thing.
         return (
             f"{_ANSI_BLACK}{_accent('TRACKING', _ANSI_BROWN)} {_bold(symbol)} "
             f"{trade.direction}: entry {entry:.2f} stop {stop:.2f} "
-            f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}){where}{_ANSI_RESET}"
+            f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}){where}{how}{_ANSI_RESET}"
         )
 
     async def trail(
@@ -939,6 +1015,7 @@ class LiveDriver:
         run_id: str,
         store: TriggerStore,
         account: str | None = None,
+        plan: ExitPlan | None = None,
     ) -> str:
         """Hand a position to `trail`: the trail rules (`TrailTracker`) on
         its 1-min closes, acted on at IBKR by `TrailExecutor` -- the stop
@@ -981,16 +1058,33 @@ class LiveDriver:
         self.tracker.untrack(symbol, account)
         close = await self._session_close(symbol)
         eod_exit = _minute_before(self.session, close) if close else None
-        trade = self.trailer.track(symbol, entry, stop, account, eod_exit, opened_at, best)
+        plan = plan or ExitPlan()
+        trade = self.trailer.track(
+            symbol, entry, stop, account, eod_exit, opened_at, best,
+            plan, allocate(plan.legs, int(abs(held))),
+        )
+        # avwap: armed already if a close since entry was on the trade's
+        # side of AVWAP -- today's AVWAP, the one the rule will watch.
+        avwap, _ = _avwap_inputs(scanner.indicators.get(symbol))
+        if avwap is not None and closes:
+            trade.avwap_armed = any(c > avwap if stop < entry else c < avwap for c in closes)
         mode = " (dry run -- no orders)" if self.executor.dry_run else ""
-        eod = f"exits at {trade.eod_exit:%H:%M} ET if under 2R"
+        eod = (
+            f"sells what's left at {trade.eod_exit:%H:%M} ET" if plan.close
+            else f"exits at {trade.eod_exit:%H:%M} ET if under 2R"
+        )
         if close is None:
             eod += _accent(" (IBKR schedule unavailable -- assuming a 16:00 close)", _ANSI_RED)
         return (
             f"{_ANSI_BLACK}{_accent('TRAIL', _ANSI_BROWN)} {_bold(symbol)} "
             f"{trade.direction}: entry {entry:.2f} stop {stop:.2f} "
             f"R={trade.r:.2f} (1R target {trade.target_1r:.2f}) [{account}]; "
-            f"{eod}{mode}{_ANSI_RESET}\n  {_trail_start_state(trade, closes)}"
+            + ("" if plan.is_default else f"{_plan_text(trade)}; ")
+            + f"{eod}{mode}{_ANSI_RESET}\n  {_trail_start_state(trade, closes)}"
+            + (
+                "" if trade.open_leg("avwap") is None else
+                f"\n  avwap: {'armed' if trade.avwap_armed else 'waits for a close on the trade side of AVWAP'}"
+            )
         )
 
     async def _opened_at(self, symbol: str, account: str) -> datetime | None:
@@ -1056,6 +1150,14 @@ class LiveDriver:
         already at IBKR. Returns the trades dropped."""
         return self.trailer.untrack(symbol, account)
 
+    async def _act_on_trail_in_order(
+        self, actions: list[TrailAction], run_id: str, store: TriggerStore
+    ) -> None:
+        """One close's actions, one after another: a partial sale and a
+        breakeven move both change the stops, and must not overlap."""
+        for action in actions:
+            await self._act_on_trail(action, run_id, store)
+
     async def _act_on_trail(self, action: TrailAction, run_id: str, store: TriggerStore) -> None:
         trade = self.trailer.trades.get((action.symbol, action.account))
         if trade is None:
@@ -1065,8 +1167,10 @@ class LiveDriver:
                 outcome = await self.executor.move_stop_to_breakeven(trade)
             elif action.kind == "eod":
                 outcome = await self.executor.exit(trade, EOD_ADAPTIVE_PRIORITY)
-            else:
+            elif action.whole or action.rule is None:
                 outcome = await self.executor.exit(trade)
+            else:
+                outcome = await self.executor.exit_shares(trade, trade.leg_shares.get(action.rule, 0))
         except Exception as e:  # an exception here would otherwise vanish in a task
             logger.exception("trail %s for %s failed", action.kind, action.symbol)
             outcome = Outcome(False, f"{action.kind} FAILED: {e!r} -- CHECK THE POSITION")
@@ -1085,6 +1189,9 @@ class LiveDriver:
                 "r": trade.r,
                 "giveback": action.giveback,
                 "limit": action.limit,
+                "rule": action.rule,
+                "whole": action.whole,
+                "plan": trade.plan.describe(),
                 "account": trade.account,
                 "dry_run": self.executor.dry_run,
                 "ok": outcome.ok,
@@ -1712,7 +1819,10 @@ class LiveDriver:
                     self._alert_tasks.add(task)
                     task.add_done_callback(self._alert_tasks.discard)
 
-                for track_alert in self.tracker.on_close(symbol, bar_event.close, bar_event.start):
+                avwap, yard = _avwap_inputs(scanner.indicators.get(symbol))
+                for track_alert in self.tracker.on_close(
+                    symbol, bar_event.close, bar_event.start, bar_event.end, avwap, yard
+                ):
                     trade = self.tracker.trades[symbol, track_alert.account]
                     store.record_alert(
                         run_id,
@@ -1729,18 +1839,22 @@ class LiveDriver:
                             "r": trade.r,
                             "target_1r": trade.target_1r,
                             "account": trade.account,
+                            "rule": track_alert.rule,
+                            "plan": trade.plan.describe(),
                         },
                     )
                     store.commit()
                     _print_track_alert(track_alert, trade)
 
-                for trail_action in self.trailer.on_close(
-                    symbol, bar_event.close, bar_event.start, bar_event.end
-                ):
+                actions = self.trailer.on_close(
+                    symbol, bar_event.close, bar_event.start, bar_event.end, avwap, yard
+                )
+                if actions:
                     # Orders are awaited, and this callback is not async.
-                    # The rule has already moved on (an exit marks the trade
-                    # done), so a second close can't send a second order.
-                    task = asyncio.create_task(self._act_on_trail(trail_action, run_id, store))
+                    # The rules have already moved on (a rule that fired is
+                    # marked done), so a second close can't send a second
+                    # order for it.
+                    task = asyncio.create_task(self._act_on_trail_in_order(actions, run_id, store))
                     self._trail_tasks.add(task)
                     task.add_done_callback(self._trail_tasks.discard)
             except Exception:

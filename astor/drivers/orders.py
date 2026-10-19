@@ -443,6 +443,116 @@ class TrailExecutor(_OrderBase):
         return await self._flatten(trade.symbol, stops, stops[0].contract, order, extras)
 
 
+    async def exit_shares(
+        self, trade: TrackedTrade, n: int, priority: str = ADAPTIVE_PRIORITY
+    ) -> Outcome:
+        """Sell `n` of the position -- one rule's share of it -- and keep the
+        rest protected. The stop is cut first, by exactly the shares going:
+        left whole, it would later sell more than is held and flip the
+        position. The cut comes off the stop furthest from the price, the
+        tranche least likely to fire. All of it, or nothing left beyond
+        `n`: the whole exit."""
+        held = abs(self._position_size(trade))
+        if held == 0:
+            return Outcome(True, "no position left -- the stop likely filled first")
+        if n >= held:
+            return await self.exit(trade, priority)
+        if n <= 0:
+            return Outcome(True, "no shares in this rule's part -- nothing sold")
+        stops, why = await self._find_stops(trade)
+        if not stops:
+            return Outcome(False, f"NOT sold: {why}")
+
+        long = trade.direction == "long"
+        # Furthest from the price first: the lowest stop under a long.
+        order = sorted(stops, key=lambda t: t.order.auxPrice, reverse=not long)
+        excess = sum(t.order.totalQuantity for t in stops) - (held - n)
+        cuts: list[tuple[Trade, float]] = []  # (stop, its new size; 0 = cancel)
+        for t in order:
+            if excess <= 0:
+                break
+            take = min(excess, t.order.totalQuantity)
+            cuts.append((t, t.order.totalQuantity - take))
+            excess -= take
+        before = {id(t): t.order.totalQuantity for t, _ in cuts}
+        extras = {
+            "qty": n,
+            "held": held,
+            "stops_before": _fmt_prices(stops),
+            "priority": priority,
+        }
+        action = "SELL" if long else "BUY"
+        exit = exit_order(action, n, trade.account or "", "ADN", priority=priority)
+        what = describe_order(exit)
+        cut_text = ", ".join(
+            f"{before[id(t)]:g}@{t.order.auxPrice:.2f} -> {'cancel' if q == 0 else f'{q:g}'}"
+            for t, q in cuts
+        )
+        if self.dry_run:
+            pre = f"cut stop {cut_text}, then " if cuts else ""
+            return Outcome(True, f"{self._tag()}{pre}{what}", extras)
+
+        # 1. cut the stops, undoing the cuts already made if one fails
+        done: list[tuple[Trade, float]] = []
+        for t, q in cuts:
+            if q == 0:
+                cancelled, filled, stuck = await self._cancel([t])
+                ok = bool(cancelled)
+                err = "filled first" if filled else "cancel not confirmed" if stuck else ""
+            else:
+                ok, err = await self._modify(t, qty=q)
+            if not ok:
+                restored = await self._uncut(done, before)
+                return Outcome(
+                    False,
+                    f"stop cut NOT confirmed ({err or 'no answer'}); nothing sold"
+                    + ("" if restored else " -- stops NOT restored, CHECK THE POSITION"),
+                    extras,
+                )
+            done.append((t, q))
+
+        # 2. the sale
+        contract = copy.copy(stops[0].contract)
+        contract.exchange = "SMART"
+        sale = self.ib.placeOrder(contract, exit)
+        await _wait_for(
+            lambda: sale.orderStatus.status in _WORKING + ("Filled",) or sale.isDone()
+        )
+        if sale.orderStatus.status in _WORKING + ("Filled",):
+            self._spawn(self._report_fill(trade.symbol, sale))
+            return Outcome(
+                True,
+                f"stop cut {cut_text}, {what} sent" if cuts else f"{what} sent",
+                extras | {"exit_order_id": sale.order.orderId},
+            )
+        if not sale.isDone():
+            return Outcome(
+                False,
+                f"sale sent but NOT confirmed (status {sale.orderStatus.status}); "
+                "stop already cut -- CHECK THE POSITION",
+                extras,
+            )
+        # 3. refused: the stops go back to covering the whole position
+        errors = _errors_since(sale, 0)
+        restored = await self._uncut(done, before)
+        return Outcome(
+            False,
+            f"sale REFUSED ({'; '.join(errors) or sale.orderStatus.status}); "
+            + ("stops restored" if restored else "stops NOT restored -- CHECK THE POSITION"),
+            extras,
+        )
+
+    async def _uncut(self, done: list[tuple[Trade, float]], before: dict[int, float]) -> bool:
+        """Put the stops `exit_shares` cut back to their old sizes."""
+        ok = True
+        for t, q in done:
+            if q == 0:
+                ok &= await self._restore([t])
+            else:
+                ok &= (await self._modify(t, qty=before[id(t)]))[0]
+        return ok
+
+
 class OrderDesk(_OrderBase):
     """The console's `enter`, `stop`, `cancel` and `exit`. The caller has
     already resolved the account, the position and the orders involved;
