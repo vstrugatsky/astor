@@ -406,15 +406,19 @@ def _plan(text: str):
 def test_plan_parses_the_example() -> None:
     from astor.core.exit_plan import CommandError, allocate, parse_trade_command
 
-    c = parse_trade_command("xyz 156.80 157.89 reg 1.5R 35% gb 35% avwap 30% be close")
+    c = parse_trade_command("xyz 156.80 157.89 reg 1.5R 35% gb 35% avwap 30% be close exit")
     check("prices, account", (c.symbol, c.entry, c.stop, c.account), ("XYZ", 156.80, 157.89, "reg"))
-    check("plan", c.plan.describe(), "1.5R; 35% gb, 35% avwap, 30% be; close")
+    check("plan", c.plan.describe(), "1.5R; 35% gb, 35% avwap, 30% be; close exit")
+    check("close exit", _plan("close exit").close_hold_r, None)
+    check("close 2.5R", _plan("close 2.5R").close_hold_r, 2.5)
+    check("close's R isn't the coefficient", (_plan("close 2.5R 1.5R").close_hold_r, _plan("close 2.5R 1.5R").r_mult), (2.5, 1.5))
+    check("default: 2R", (_plan("").close_hold_r, _plan("").is_default), (2.0, True))
     check("nothing given: today's rule", parse_trade_command("XYZ").plan.is_default, True)
     check("the rest rides the stop", _plan("50% avwap0.1").describe(), "50% avwap0.1, 50% be")
     check("a bare rule takes it all", _plan("avwap").describe(), "100% avwap")
     check("shares: largest remainder", allocate(_plan("35% gb 35% avwap 30% be").legs, 7),
           {"gb": 3, "avwap": 2, "be": 2})
-    for bad in ("35%", "60% gb 60% avwap", "35% gb 10% gb", "156.8", "35% xyz"):
+    for bad in ("35%", "60% gb 60% avwap", "35% gb 10% gb", "156.8", "35% xyz", "close", "close 35% gb"):
         try:
             parse_trade_command(f"XYZ {bad}")
         except CommandError:
@@ -478,19 +482,19 @@ def test_two_rules_on_one_close_end_with_the_whole() -> None:
 def test_close_sells_even_past_2r() -> None:
     from datetime import time as dtime
 
-    for plan, want in (("", None), ("close", "eod")):
+    for plan, want in (("", "breakeven"), ("close exit", "eod"), ("close 3R", "eod"), ("close 2.5R", "breakeven")):
         tr = TrailTracker(eod_exit=dtime(15, 59))
-        tr.track("XYZ", 100.0, 98.0, plan=_plan(plan) if plan else None)
+        tr.track("XYZ", 100.0, 98.0, plan=_plan(plan))
         late = OPEN.replace(hour=15, minute=58)
         a = close1(tr, "XYZ", 105.0, late, late + timedelta(minutes=1))  # +2.5R
-        check(f"{plan or 'no close'} at +2.5R", a.kind if a else None, want if want else "breakeven")
+        check(f"{plan or 'default'} at +2.5R", a.kind, want)
 
 
 def test_track_notifies_per_rule() -> None:
     from datetime import time as dtime
 
     tr = SellRuleTracker()
-    t = tr.track("XYZ", 100.0, 98.0, plan=_plan("50% gb 50% avwap close"), eod_exit=dtime(15, 59))
+    t = tr.track("XYZ", 100.0, 98.0, plan=_plan("50% gb 50% avwap close exit"), eod_exit=dtime(15, 59))
     tr.on_close("XYZ", 101.0, bar_time(1), None, 100.5, 2.0)
     a = close1(tr, "XYZ", 100.3, bar_time(2), None, 100.5, 2.0)
     check("avwap: a sell notice", (a.kind, a.rule), ("sell", "avwap"))
@@ -498,7 +502,7 @@ def test_track_notifies_per_rule() -> None:
     a = close1(tr, "XYZ", 101.0, bar_time(4), None, 100.5, 2.0)
     check("0.5R back: gb's sell", (a.kind, a.rule, t.state), ("sell", "gb", "done"))
     tr2 = SellRuleTracker()
-    tr2.track("XYZ", 100.0, 98.0, plan=_plan("close"), eod_exit=dtime(15, 59))
+    tr2.track("XYZ", 100.0, 98.0, plan=_plan("close exit"), eod_exit=dtime(15, 59))
     late = OPEN.replace(hour=15, minute=58)
     check("close: an eod notice", close1(tr2, "XYZ", 101.0, late, late + timedelta(minutes=1)).kind, "eod")
 

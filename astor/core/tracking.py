@@ -207,7 +207,7 @@ class SellRuleTracker(_Book):
             return []
         symbol, account = trade.key
         if (
-            trade.plan.close and trade.eod_exit is not None
+            trade.plan.close_hold_r is None and trade.eod_exit is not None
             and bar_end is not None and bar_end.time() >= trade.eod_exit
         ):
             trade.state = "done"
@@ -241,13 +241,13 @@ class SellRuleTracker(_Book):
 TrailActionKind = Literal["breakeven", "exit", "eod"]
 
 # The end-of-day rule: a trailed trade still open one minute before the
-# close exits unless it is up at least EOD_HOLD_R -- for days the trader
+# close exits unless it is up at least its plan's close_hold_r -- 2R
+# unless 'close 2.5R' or 'close exit' says otherwise -- for days the trader
 # can't get back to the desk. Checked on the bar *ending* at that time (the
 # 15:58 bar on a normal day), the last close available before it. The close
 # comes from IBKR's schedule per trade, so an early close (13:00) moves the
 # exit to 12:59; EOD_EXIT is the fallback when the schedule can't be read.
 EOD_EXIT = time(15, 59)
-EOD_HOLD_R = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,7 +361,7 @@ class TrailTracker(_Book):
             trade.eod_exit is not None
             and bar_end is not None
             and bar_end.time() >= trade.eod_exit
-            and (trade.plan.close or trade.gain_r(close) < EOD_HOLD_R)
+            and (trade.plan.close_hold_r is None or trade.gain_r(close) < trade.plan.close_hold_r)
         ):
             trade.state = "done"
             return [TrailAction("eod", symbol, close, bar_start, account)]

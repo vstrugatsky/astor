@@ -1142,8 +1142,8 @@ async def cmd_live(args: argparse.Namespace) -> int:
 
 _CONSOLE_COMMANDS = (
     "Commands: 'add SYM1,SYM2', 'remove|rem|rm SYM1,SYM2', 'track SYM [ENTRY STOP] [ACCOUNT]', "
-    "'trail SYM [ENTRY STOP] [ACCOUNT] [1.5R] [PCT gb|avwap|be ...] [close]' "
-    "(e.g. 'trail XYZ 1.5R 35% gb 35% avwap 30% be close'; track takes the same), "
+    "'trail SYM [ENTRY STOP] [ACCOUNT] [1.5R] [PCT gb|avwap|be ...] [close 2.5R|close exit]' "
+    "(e.g. 'trail XYZ 1.5R 35% gb 35% avwap 30% be close exit'; track takes the same), "
     "'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
     "'positions', 'mute', 'unmute', 'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "

@@ -1,7 +1,7 @@
 """How `track` and `trail` take a trade out: which rules, for what share of
 the position, against what R, and what happens at the close.
 
-    trail SYM [ENTRY STOP] [ACCOUNT] [1.5R] [PCT RULE ...] [close]
+    trail SYM [ENTRY STOP] [ACCOUNT] [1.5R] [PCT RULE ...] [close 2.5R | close exit]
     track SYM ...   (the same; track notifies where trail sells)
 
     1.5R      R is 1.5 x |entry - stop| for every rule measured in R: the
@@ -13,8 +13,10 @@ the position, against what R, and what happens at the close.
               distance.
     30% be    no rule of its own: these shares ride the stop, which goes to
               breakeven at +1R like every stop does.
-    close     whatever is left goes at the close -- trail even at +2R and
-              beyond, track as a notice. Without it trail keeps its 2R rule.
+    close 2.5R  at the close, sell what's left if it is up less than 2.5R
+              (the default is 2R); trail sells, track says to.
+    close exit  sell what's left at the close whatever the gain. A bare
+              `close` is refused: which of the two it meant is a guess.
 
 Each rule fires once, on its own, in whatever order the market brings
 them. Percentages short of 100 leave the rest to `be`. No rules at all is
@@ -32,6 +34,8 @@ from astor.core.order_entry import CommandError, account_token, is_account
 Rule = Literal["gb", "avwap", "be"]
 RULES: tuple[Rule, ...] = ("gb", "avwap", "be")
 DEFAULT_AVWAP_ADR = 0.05
+# At the close, what's left goes unless it is up at least this many R.
+DEFAULT_CLOSE_HOLD_R = 2.0
 
 _R = re.compile(r"^(\d+(?:\.\d+)?)r$", re.IGNORECASE)
 _PCT = re.compile(r"^(\d+(?:\.\d+)?)%$")
@@ -55,7 +59,8 @@ class Leg:
 class ExitPlan:
     legs: tuple[Leg, ...] = (Leg("gb", 100.0),)
     r_mult: float = 1.0
-    close: bool = False
+    # Held through the close at this gain or more; None sells it anyway.
+    close_hold_r: float | None = DEFAULT_CLOSE_HOLD_R
 
     def leg(self, rule: Rule) -> Leg | None:
         return next((g for g in self.legs if g.rule == rule), None)
@@ -68,8 +73,10 @@ class ExitPlan:
         parts = [", ".join(g.label() for g in self.legs)]
         if self.r_mult != 1.0:
             parts.insert(0, f"{self.r_mult:g}R")
-        if self.close:
-            parts.append("close")
+        if self.close_hold_r is None:
+            parts.append("close exit")
+        elif self.close_hold_r != DEFAULT_CLOSE_HOLD_R:
+            parts.append(f"close {self.close_hold_r:g}R")
         return "; ".join(parts)
 
 
@@ -105,8 +112,8 @@ def _rule(tok: str) -> tuple[Rule, float] | None:
 
 def parse_trade_command(rest: str, verb: str = "trail") -> TradeCommand:
     usage = (
-        f"{verb} SYM [ENTRY STOP] [ACCOUNT] [1.5R] [PCT gb|avwap|be ...] [close]"
-        f"  e.g. '{verb} XYZ 1.5R 35% gb 35% avwap 30% be close'"
+        f"{verb} SYM [ENTRY STOP] [ACCOUNT] [1.5R] [PCT gb|avwap|be ...] [close 2.5R|close exit]"
+        f"  e.g. '{verb} XYZ 1.5R 35% gb 35% avwap 30% be close exit'"
     )
     tokens = rest.split()
     if not tokens:
@@ -114,10 +121,27 @@ def parse_trade_command(rest: str, verb: str = "trail") -> TradeCommand:
     cmd = TradeCommand(tokens[0].upper().replace(".", " "))
     prices: list[float] = []
     legs: list[Leg] = []
-    r_mult, close = 1.0, False
+    r_mult, close_hold_r = 1.0, DEFAULT_CLOSE_HOLD_R
     pending_pct: float | None = None
 
-    for tok in tokens[1:]:
+    rest_tokens = tokens[1:]
+    i = 0
+    while i < len(rest_tokens):
+        tok = rest_tokens[i]
+        i += 1
+        if tok.lower() == "close":
+            # The token right after `close` is its own: 'exit' or an R.
+            nxt = rest_tokens[i].lower() if i < len(rest_tokens) else ""
+            if nxt == "exit":
+                close_hold_r, i = None, i + 1
+            elif (m := _R.match(nxt)) is not None:
+                close_hold_r, i = float(m.group(1)), i + 1
+            else:
+                raise CommandError(
+                    "'close' needs 'exit' (sell at the close whatever the gain) or an R "
+                    "('close 2.5R': sell if up less than 2.5R); the default is 2R"
+                )
+            continue
         if pending_pct is not None:
             rule = _rule(tok)
             if rule is None:
@@ -132,8 +156,6 @@ def parse_trade_command(rest: str, verb: str = "trail") -> TradeCommand:
             r_mult = float(m.group(1))
             if r_mult <= 0:
                 raise CommandError(f"'{tok}': R must be above 0")
-        elif tok.lower() == "close":
-            close = True
         elif (rule := _rule(tok)) is not None:
             # a rule with no percent: the whole position
             legs.append(Leg(rule[0], 100.0, rule[1]))
@@ -167,5 +189,5 @@ def parse_trade_command(rest: str, verb: str = "trail") -> TradeCommand:
             legs.append(Leg("be", rest_pct))
         else:
             legs[legs.index(be)] = Leg("be", be.pct + rest_pct)
-    cmd.plan = ExitPlan(tuple(legs) if legs else ExitPlan().legs, r_mult, close)
+    cmd.plan = ExitPlan(tuple(legs) if legs else ExitPlan().legs, r_mult, close_hold_r)
     return cmd

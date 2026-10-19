@@ -368,9 +368,9 @@ def _format_trail_alert(action: TrailAction, trade: TrackedTrade, outcome: Outco
     if action.kind == "breakeven":
         why = f"+1R @ {action.close:.2f} (target {trade.target_1r:.2f})"
     elif action.kind == "eod":
-        gain = trade.gain_r(action.close)
-        why = f"end-of-day: last close {action.close:.2f} is {gain:+.2f}R" + (
-            "" if trade.plan.close and gain >= 2 else ", under 2R" if not trade.plan.close else ""
+        hold = trade.plan.close_hold_r
+        why = f"end-of-day: last close {action.close:.2f} is {trade.gain_r(action.close):+.2f}R" + (
+            f", under {hold:g}R" if hold is not None else ""
         )
     elif action.rule == "avwap":
         why = (
@@ -987,7 +987,7 @@ class LiveDriver:
 
         plan = plan or ExitPlan()
         eod_exit = None
-        if plan.close:
+        if plan.close_hold_r is None:
             close = await self._session_close(symbol)
             eod_exit = _minute_before(self.session, close or time(16, 0))
         trade = self.tracker.track(symbol, entry, stop, account, opened_at, plan, eod_exit)
@@ -1070,8 +1070,8 @@ class LiveDriver:
             trade.avwap_armed = any(c > avwap if stop < entry else c < avwap for c in closes)
         mode = " (dry run -- no orders)" if self.executor.dry_run else ""
         eod = (
-            f"sells what's left at {trade.eod_exit:%H:%M} ET" if plan.close
-            else f"exits at {trade.eod_exit:%H:%M} ET if under 2R"
+            f"sells what's left at {trade.eod_exit:%H:%M} ET" if plan.close_hold_r is None
+            else f"exits at {trade.eod_exit:%H:%M} ET if under {plan.close_hold_r:g}R"
         )
         if close is None:
             eod += _accent(" (IBKR schedule unavailable -- assuming a 16:00 close)", _ANSI_RED)
