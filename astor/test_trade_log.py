@@ -84,6 +84,23 @@ def test_stops_from_the_entry_or_else_track_trail() -> None:
     check("R off the original stop: +1 a share on 1 of risk", round(trades[1].pnl_r, 2), 1.0)
 
 
+def test_rvol_at_entry_uses_the_bars_closed_before_it() -> None:
+    from datetime import time
+
+    from astor.core.trade_log import entry_rvol
+    from astor.core.types import BarEvent, VolumeCurve
+
+    bars = [
+        BarEvent("XYZ", at(i), at(i + 1), 10, 10, 10, 10, 1000.0) for i in range(5)
+    ]
+    curve = VolumeCurve("XYZ", 20, {time(9, 30 + i): 500.0 * (i + 1) for i in range(5)})
+    [t] = round_trips([Fill(at(3) + timedelta(seconds=20), "XYZ", REG, 100, 10.0)])
+    # 09:33:20: bars 09:30-09:32 have closed -- 3,000 shares against 1,500
+    check("RVOL at entry", entry_rvol(t, bars, curve), 2.0)
+    [early] = round_trips([Fill(at(0) + timedelta(seconds=20), "XYZ", REG, 100, 10.0)])
+    check("no bar closed yet", entry_rvol(early, bars, curve), None)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

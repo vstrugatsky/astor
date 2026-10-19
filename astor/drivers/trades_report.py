@@ -8,13 +8,15 @@ import asyncio
 import logging
 from collections.abc import Callable
 from datetime import date
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ib_async import IB, ExecutionFilter
 
 from astor.core.order_entry import ACCOUNT_SUFFIX, is_ira
 from astor.core.store import TriggerStore
-from astor.core.trade_log import Fill, Trade, attach_stops, round_trips
+from astor.core.trade_log import Fill, Trade, attach_stops, entry_rvol, round_trips
+from astor.drivers.replay import ReplayDriver
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -26,7 +28,9 @@ def _alias(account: str) -> str:
     return "ira" if is_ira(account) else "reg" if account.endswith(ACCOUNT_SUFFIX["reg"]) else account
 
 
-async def todays_trades(ib: IB, store: TriggerStore, session: date) -> list[Trade]:
+async def todays_trades(
+    ib: IB, store: TriggerStore, session: date, cache_dir: Path = Path("data/bars")
+) -> list[Trade]:
     await ib.reqExecutionsAsync(ExecutionFilter())
     loop = asyncio.get_running_loop()
     deadline = loop.time() + COMMISSION_WAIT
@@ -51,7 +55,27 @@ async def todays_trades(ib: IB, store: TriggerStore, session: date) -> list[Trad
     start = {k: now.get(k, 0.0) - n for k, n in net.items()}
     trades = round_trips(fills, start)
     attach_stops(trades, store.stop_records(session))
+    await _attach_rvol(ib, session, trades, cache_dir)
     return trades
+
+
+async def _attach_rvol(ib: IB, session: date, trades: list[Trade], cache_dir: Path) -> None:
+    """RVOL at each entry, computed now from today's 1-min bars and the
+    symbol's volume curve -- the curve usually from the warm-cache cron's
+    cache. IBKR revises intraday volume after the fact, so this can differ
+    a little from what live saw at the time; it is the same for every
+    trade, though, which is the point of a report."""
+    symbols = sorted({t.symbol for t in trades if t.opened_at is not None})
+    if not symbols:
+        return
+    ref = ReplayDriver(ib, session, "1 min", cache_dir)
+    try:
+        bars, curves = await asyncio.gather(ref.fetch_bars(symbols), ref.fetch_volume_curve(symbols))
+    except Exception:
+        logger.exception("RVOL not read; the report goes without it")
+        return
+    for t in trades:
+        t.rvol = entry_rvol(t, bars.get(t.symbol, []), curves.get(t.symbol))
 
 
 def format_trades(trades: list[Trade], color: Callable[[str, float], str] = lambda s, v: s) -> list[str]:
@@ -59,7 +83,10 @@ def format_trades(trades: list[Trade], color: Callable[[str, float], str] = lamb
     P&L cell by its sign."""
     if not trades:
         return ["  No trades today."]
-    head = f"  {'SYM':<6} {'ACCT':<4} {'SIDE':<5} {'SHARES':>6}  {'IN':>8} {'ENTRY':>9}  {'OUT':>8} {'EXIT':>9}  {'STOP':>8}  {'P&L':>9} {'R':>6}"
+    head = (
+        f"  {'SYM':<6} {'ACCT':<4} {'SIDE':<5} {'SHARES':>6}  {'IN':>8} {'ENTRY':>9} {'RVOL':>5}"
+        f"  {'OUT':>8} {'EXIT':>9}  {'STOP':>8}  {'P&L':>9} {'R':>6}"
+    )
     lines = [head]
     total = 0.0
     for t in trades:
@@ -78,8 +105,12 @@ def format_trades(trades: list[Trade], color: Callable[[str, float], str] = lamb
             tout = f"part {t.exited:g}"
         lines.append(
             f"  {t.symbol:<6} {_alias(t.account):<4} {t.direction:<5} {t.shares:>6g}  {tin:>8} {entry:>9}"
+            f" {f'{t.rvol:.2f}' if t.rvol is not None else '--':>5}"
             f"  {tout:>8} {exit_:>9}  {stop:>8}  {pnl} {r}"
         )
-    lines.append(f"  {'':<52}{'net':>8}  {color(f'{total:>+9,.2f}', total)}")
-    lines.append("  P&L is net of commissions, on the shares closed today; STOP is the original one astor recorded.")
+    lines.append(f"  {'':<58}{'net':>8}  {color(f'{total:>+9,.2f}', total)}")
+    lines.append(
+        "  P&L is net of commissions, on the shares closed today; STOP is the original one astor "
+        "recorded; RVOL is at entry, from today's bars as IBKR has them now."
+    )
     return lines

@@ -38,6 +38,7 @@ class Trade:
     _out: list[tuple[float, float]] = field(default_factory=list)  # (shares, price) closing
     commission: float = 0.0
     stop: float | None = None  # the original stop, when astor knows it
+    rvol: float | None = None  # at entry: volume through the last bar before it, against its curve
 
     @property
     def entry(self) -> float | None:
@@ -143,3 +144,18 @@ def attach_stops(trades: list[Trade], records: list[dict]) -> None:
         ]
         if during:
             t.stop = during[0]["stop"]
+
+
+def entry_rvol(t: Trade, bars: list, curve) -> float | None:
+    """RVOL when `t` was entered: today's volume through the last bar that
+    had closed by the entry fill, against the average at that bar -- the
+    same reading the setups take on each bar's close. None before the
+    first bar closes, or without bars or a curve."""
+    from astor.core.indicators import compute_rvol
+
+    if t.opened_at is None or not bars or curve is None:
+        return None
+    done = [b for b in bars if b.end <= t.opened_at]
+    if not done:
+        return None
+    return compute_rvol(sum(b.volume for b in done), done[-1].start, curve)
