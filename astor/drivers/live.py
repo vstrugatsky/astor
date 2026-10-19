@@ -469,8 +469,8 @@ def _format_order_alert(
     # 9.0 by construction: entry 10% off the leg's extreme, stop at the
     # extreme, exit back at the session's other end -- where the leg
     # started -- so 90% of the leg over 10% of it. What does vary is how
-    # violent the leg was: its pace (ADR(14) a minute, as stored) against
-    # an average day's, one ADR over the session's 390 minutes -- "13x"
+    # violent the leg was: its pace, stored as a multiple of an average
+    # day's (one ADR over the session's 390 minutes) -- "13x"
     # is a leg built thirteen times faster than the stock's usual day.
     if isinstance(a, CapitulationAlert):
         rr = f"pace {_bold(pace_label(a.pace_adr))}; " if a.pace_adr is not None else ""

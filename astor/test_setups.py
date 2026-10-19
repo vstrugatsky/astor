@@ -829,11 +829,11 @@ def test_alert_line_is_an_order_ticket() -> None:
         dollars=3641.4, max_loss_dollars=100.0,
         # Short from 2.55 with a 2.62 stop, expecting the day's low at 2.20:
         # 0.35 of reward against 0.07 of risk.
-        exit_target=2.20, rr=5.0, pace_adr1=0.004, pace_adr=0.011,
+        exit_target=2.20, rr=5.0, pace_adr1=1.56, pace_adr=4.29,
     )
     line = _format_order_alert("CAPITULATION", a)
-    # R:R is 9.0 by construction here; pace leads instead: 0.011 ADR(14)
-    # a minute is 4.3x an average day's 1/390.
+    # R:R is 9.0 by construction here; pace leads instead, as a multiple
+    # of an average day's.
     check("pace leads, right after the direction", "short; pace " in line, True)
     check("as a multiple of an average day's", "4.3x" in line, True)
     check("no R:R", "R:R" in line, False)
@@ -895,7 +895,7 @@ def test_alert_line_sizes_for_the_spread() -> None:
         ema9_extension_adr=0.6723, accel_price=4.6667, accel_vol=1.0,
         target=2.55, target_basis="retrace", stop=2.62, shares=1228,
         dollars=3131.4, max_loss_dollars=100.0,
-        exit_target=2.20, rr=5.0, pace_adr1=0.004, pace_adr=0.011,
+        exit_target=2.20, rr=5.0, pace_adr1=1.56, pace_adr=4.29,
     )
     # 7c of distance + 1c of half spread + 1c a share in commissions
     sized = _format_order_alert("C", a, slip=0.01)
@@ -2433,14 +2433,14 @@ def test_pace_measures_size_over_the_same_window_as_duration() -> None:
     minutes = t.extras["leg_duration_minutes"]
     check("duration is the revival's, not the whole day's", minutes, 5.0)
     # adr 4.0 and day_range 12.0 (98.0 high, 86.0 low) at fire time.
-    check("pace_adr uses push_size", t.extras["pace_adr"], round(10.9 / 5.0 / 4.0, 5))
-    check("pace_adr1 uses push_size", t.extras["pace_adr1"], round(10.9 / 5.0 / 12.0, 5))
+    check("pace_adr uses push_size", t.extras["pace_adr"], round(10.9 / 5.0 / 4.0 * 390, 2))
+    check("pace_adr1 uses push_size", t.extras["pace_adr1"], round(10.9 / 5.0 / 12.0 * 390, 2))
     # The old numerator was the day's range itself, which is what made
-    # pace_adr1 collapse to 1/minutes. On a revived leg it no longer does,
+    # pace_adr1 collapse to 390/minutes. On a revived leg it no longer does,
     # and that inequality is precisely the signature of a revived leg.
     check(
-        "pace_adr1 no longer collapses to 1/minutes on a revived leg",
-        t.extras["pace_adr1"] == round(1.0 / minutes, 5),
+        "pace_adr1 no longer collapses to 390/minutes on a revived leg",
+        t.extras["pace_adr1"] == round(390 / minutes, 2),
         False,
     )
 
@@ -2464,9 +2464,9 @@ def test_pace_is_unchanged_on_an_ordinary_leg() -> None:
         round(abs(setup._anchor - setup._extreme), 6),
     )
     check(
-        "pace_adr1 collapses to 1/minutes, as documented",
+        "pace_adr1 collapses to 390/minutes, as documented",
         t.extras["pace_adr1"],
-        round(1.0 / t.extras["leg_duration_minutes"], 5),
+        round(390 / t.extras["leg_duration_minutes"], 2),
     )
 
 

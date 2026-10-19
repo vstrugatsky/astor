@@ -217,9 +217,15 @@ def _leg_is_big_enough(
     )
 
 
+# An average day's pace: one ADR over the regular session's minutes.
+# Both paces are stored as multiples of it (since 2026-10-18; earlier rows
+# were converted from ADR a minute by the same factor).
+SESSION_MINUTES = 390
+
+
 def _pace_adr1(size: float | None, minutes: float, day_range: float) -> float | None:
-    """How fast a move was built: its size per minute, as a fraction of the
-    day's own range.
+    """How fast a move was built: its size per minute against the day's own
+    range, as a multiple of an average day's pace (SESSION_MINUTES).
 
     Size alone says nothing about urgency. QSI 2026-10-02 put together a
     leg over three and a half hours; the same leg in twenty minutes is a
@@ -230,7 +236,7 @@ def _pace_adr1(size: float | None, minutes: float, day_range: float) -> float | 
     say yet.
 
     Recorded but NOT displayed: for an ordinary leg this collapses to
-    1/minutes (see _pace_adr), so showing it would just restate
+    390/minutes (see _pace_adr), so showing it would just restate
     leg_duration_minutes, which `explain` already prints as "built Nm".
     pace_adr is what the readout carries.
 
@@ -239,17 +245,18 @@ def _pace_adr1(size: float | None, minutes: float, day_range: float) -> float | 
     """
     if size is None or minutes <= 0 or day_range <= 0 or size <= 0:
         return None
-    return round(size / minutes / day_range, 5)
+    return round(size / minutes / day_range * SESSION_MINUTES, 2)
 
 
 def _pace_adr(size: float | None, minutes: float, adr: float) -> float | None:
-    """The same pace against the prior-session average range instead.
+    """The same pace against the prior-session average range instead --
+    "13" is a leg built thirteen times faster than the stock's usual day.
 
     Recorded alongside _pace_adr1 because for an ordinary Reversal leg the
     ADR(1) version carries no information: such a leg runs between the
     session's own extremes by construction (_session_anchor and
     _session_extreme *are* session_high and session_low), so its size
-    equals the day's range and the ratio collapses to 1/minutes exactly --
+    equals the day's range and the ratio collapses to 390/minutes exactly --
     true of all twenty REV triggers recorded through 2026-10-02. Against
     ADR(14) the size survives, so a big fast leg and a small fast one are
     told apart: QSI 2026-10-02 (2.04x ADR in 125m) and PACB the same day
@@ -258,7 +265,7 @@ def _pace_adr(size: float | None, minutes: float, adr: float) -> float | None:
     The collapse is a property of the leg *definition*, not of ADR(1): a
     revived leg measures from its own turnaround (see _push_size), its
     push is a genuine sub-move of the day, and the ADR(1) version carries
-    information again. pace_adr1 != 1/minutes is exactly the signature of
+    information again. pace_adr1 != 390/minutes is exactly the signature of
     a revived leg.
 
     Both stay recorded; which one predicts better is an empirical question
@@ -266,23 +273,16 @@ def _pace_adr(size: float | None, minutes: float, adr: float) -> float | None:
     """
     if size is None or minutes <= 0 or adr <= 0 or size <= 0:
         return None
-    return round(size / minutes / adr, 5)
-
-
-# An average day's pace: one ADR over the regular session's minutes.
-SESSION_MINUTES = 390
+    return round(size / minutes / adr * SESSION_MINUTES, 2)
 
 
 def pace_label(pace_adr: float | None) -> str:
-    """`pace_adr` (ADR(14) a minute, as stored) as a multiple of an
-    average day's pace -- "13x" is a leg built thirteen times faster than
-    the stock's usual day. A constant factor, so it ranks exactly as
-    pace_adr does; per minute is too small to compare by eye, and per hour
-    means little for a leg that lasts minutes."""
+    """`pace_adr` for display: "13x" -- per minute was too small to
+    compare by eye, and per hour means little for a leg that lasts
+    minutes, so it is stored as a multiple of an average day's pace."""
     if pace_adr is None:
         return "n/a"
-    x = pace_adr * SESSION_MINUTES
-    return f"{x:.1f}x" if x < 10 else f"{x:.0f}x"
+    return f"{pace_adr:.1f}x" if pace_adr < 10 else f"{pace_adr:.0f}x"
 
 
 def _reward_to_risk(entry: float, stop: float, exit_price: float) -> float | None:
