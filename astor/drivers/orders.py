@@ -142,6 +142,32 @@ async def fresh_position(ib: IB, symbol: str, account: str) -> float:
     )
 
 
+def unbound_problem(trades: list[Trade]) -> str | None:
+    """Why astor can't act on `trades`, if some aren't its to change: an
+    order placed in IBKR Desktop -- a separate login from the gateway's --
+    shows up with order ID 0, and IBKR lets no API client modify or cancel
+    it. astor's own orders, even ones edited in Desktop since, are fine.
+    None when every order is astor's."""
+    foreign = [t for t in trades if t.order.orderId == 0]
+    if not foreign:
+        return None
+    what = ", ".join(_describe_one(t.order) for t in foreign)
+    one = len(foreign) == 1
+    return (
+        f"{'the' if one else 'these'} {what} {'was' if one else 'were'} placed in IBKR Desktop, "
+        f"so astor can't change {'it' if one else 'them'} -- cancel {'it' if one else 'them'} "
+        "there, or set all of this position's orders here"
+    )
+
+
+def _describe_one(o: Order) -> str:
+    if o.orderType == "STP":
+        return f"{o.totalQuantity:g}@{o.auxPrice:.2f} stop"
+    if o.orderType == "LMT":
+        return f"{o.action} {o.totalQuantity:g} LMT {o.lmtPrice:.2f}"
+    return f"{o.action} {o.totalQuantity:g} {o.orderType}"
+
+
 def _fmt_prices(stops: list[Trade]) -> str:
     return ", ".join(f"{t.order.totalQuantity:g}@{t.order.auxPrice:.2f}" for t in stops)
 
@@ -391,8 +417,8 @@ class TrailExecutor(_OrderBase):
         stops = protective_stops(working, exit_side)
         if not stops:
             return [], f"found no working {exit_side} stop"
-        if not self.dry_run and any(t.order.orderId == 0 for t in stops):
-            return [], "a stop is not bound to this session (connect as client ID 0)"
+        if not self.dry_run and (why := unbound_problem(stops)):
+            return [], why
         return stops, ""
 
     async def _position_size(self, trade: TrackedTrade) -> float:

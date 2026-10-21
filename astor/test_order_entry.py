@@ -244,6 +244,25 @@ def test_a_stop_entry_already_through_goes_as_adaptive() -> None:
     check("not yet through: the stop entry stands", (t.req.order_type, t.req.price), ("STP", 30.35))
 
 
+def test_a_desktop_order_is_named() -> None:
+    from types import SimpleNamespace as NS
+
+    from astor.drivers.orders import unbound_problem
+
+    def stop(qty, price, oid):
+        return NS(order=NS(orderId=oid, orderType="STP", action="SELL", totalQuantity=qty, auxPrice=price))
+
+    check("astor's own: fine", unbound_problem([stop(4, 536.52, 2410)]), None)
+    check(
+        "a Desktop stop, named",
+        unbound_problem([stop(4, 536.52, 2410), stop(8, 535.0, 0)]),
+        "the 8@535.00 stop was placed in IBKR Desktop, so astor can't change it -- "
+        "cancel it there, or set all of this position's orders here",
+    )
+    two = unbound_problem([stop(4, 535.0, 0), stop(4, 534.0, 0)])
+    check("two of them", two.startswith("these 4@535.00 stop, 4@534.00 stop were placed"), True)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

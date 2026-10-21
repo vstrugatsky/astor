@@ -75,6 +75,7 @@ from astor.drivers.orders import (
     exit_order,
     fresh_position,
     protective_stops,
+    unbound_problem,
     working_orders,
 )
 from astor.drivers.replay import (
@@ -1357,9 +1358,7 @@ class LiveDriver:
         return involved.pop()
 
     def _unbound(self, trades: list[Trade]) -> str | None:
-        if self.desk.dry_run or all(t.order.orderId != 0 for t in trades):
-            return None
-        return "an order is not bound to this session (connect as client ID 0)"
+        return None if self.desk.dry_run else unbound_problem(trades)
 
     def _record_order(
         self, store: TriggerStore, run_id: str, kind: str, symbol: str,
