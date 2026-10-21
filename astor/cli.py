@@ -1173,7 +1173,7 @@ _CONSOLE_COMMANDS = (
     "(adn = Adaptive Normal, the default; adu = Adaptive Urgent), "
     "'enter SYM [ACCOUNT] l|s QTY ...' (the same, direction spelled out), "
     "'stop SYM [ACCOUNT] P', 'stop SYM 1/2 P1 1/2 P2' or 'stop SYM be', "
-    "'cancel SYM [ACCOUNT]', 'exit SYM [ACCOUNT] [adn|adu|mkt|lmt P]'."
+    "'cancel SYM [ACCOUNT]', 'exit SYM [ACCOUNT] [SHARES|1/3] [adn|adu|mkt|lmt P]'."
 )
 
 _ORDER_PARSERS = {

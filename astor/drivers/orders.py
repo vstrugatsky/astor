@@ -404,8 +404,8 @@ class _OrderBase:
                 f"({s.filled:g} of {t.order.totalQuantity:g} filled)",
             )
 
+    # -- shared by trail and the console: whole and partial exits ---------
 
-class TrailExecutor(_OrderBase):
     async def _find_stops(self, trade: TrackedTrade) -> tuple[list[Trade], str]:
         """The working stops protecting this position -- one, or several
         tranches -- re-read from IBKR every time: the trader may have moved
@@ -424,41 +424,7 @@ class TrailExecutor(_OrderBase):
     async def _position_size(self, trade: TrackedTrade) -> float:
         return await fresh_position(self.ib, trade.symbol, trade.account or "")
 
-    async def move_stop_to_breakeven(self, trade: TrackedTrade) -> Outcome:
-        """Every stop tranche still short of breakeven goes to breakeven."""
-        stops, why = await self._find_stops(trade)
-        if not stops:
-            return Outcome(False, f"stop NOT moved: {why}")
-        be = breakeven_price(trade)
-        before = [t.order.auxPrice for t in stops]
-        extras = {"stop_before": before[0] if len(before) == 1 else before, "breakeven": be}
-        # Never loosen: a stop the trader already raised past entry stays.
-        loose = [
-            t for t in stops
-            if (t.order.auxPrice < be if trade.direction == "long" else t.order.auxPrice > be)
-        ]
-        if not loose:
-            return Outcome(
-                True,
-                f"{'stop' if len(stops) == 1 else 'stops'} already at or past breakeven "
-                f"({_fmt_prices(stops)}) -- not moved",
-                extras,
-            )
-        moving = ", ".join(f"{t.order.auxPrice:.2f}" for t in loose)
-        if self.dry_run:
-            return Outcome(True, f"{self._tag()}move stop {moving} -> {be:.2f}", extras)
-
-        failed = []
-        for t in loose:
-            current = t.order.auxPrice
-            ok, errors = await self._modify(t, price=be)
-            if not ok:
-                failed.append(f"{current:.2f} (still {t.order.auxPrice:.2f}{': ' + errors if errors else ''})")
-        if not failed:
-            return Outcome(True, f"stop moved {moving} -> {be:.2f}", extras)
-        return Outcome(False, f"stop move to {be:.2f} NOT confirmed for {'; '.join(failed)}", extras)
-
-    async def exit(self, trade: TrackedTrade, priority: str = ADAPTIVE_PRIORITY) -> Outcome:
+    async def _whole_exit(self, trade: TrackedTrade, priority: str = ADAPTIVE_PRIORITY) -> Outcome:
         # Stops, then the position, fresh (see exit_shares): a tranche that
         # filled a moment ago would otherwise be sold again. One that fills
         # after this is caught as it is cancelled -- no exit goes out.
@@ -480,7 +446,8 @@ class TrailExecutor(_OrderBase):
 
 
     async def exit_shares(
-        self, trade: TrackedTrade, n: int, priority: str = ADAPTIVE_PRIORITY
+        self, trade: TrackedTrade, n: int, priority: str | None = None,
+        order_type: str = "ADN", price: float | None = None,
     ) -> Outcome:
         """Sell `n` of the position -- one rule's share of it -- and keep the
         rest protected. The stop is cut first, by exactly the shares going:
@@ -513,7 +480,7 @@ class TrailExecutor(_OrderBase):
                 return Outcome(True, "no position left -- the stop likely filled first"
                                + ("" if restored else "; stops NOT restored"))
             if n >= held:
-                return await self.exit(trade, priority)
+                return await self._whole_exit(trade, priority or ADAPTIVE_PRIORITY)
             if n <= 0:
                 return Outcome(True, "no shares in this rule's part -- nothing sold")
             if not stops:
@@ -538,7 +505,7 @@ class TrailExecutor(_OrderBase):
                 for t, q in cuts
             )
             if self.dry_run:
-                exit = exit_order(action, n, trade.account or "", "ADN", priority=priority)
+                exit = exit_order(action, n, trade.account or "", order_type, price, priority=priority)
                 return Outcome(True, f"{self._tag()}cut stop {cut_text}, then {describe_order(exit)}",
                                {"qty": n, "held": held})
             for t, q in cuts:
@@ -565,7 +532,7 @@ class TrailExecutor(_OrderBase):
             )
 
         extras = {"qty": n, "held": held, "stops_before": _fmt_prices(stops), "priority": priority}
-        exit = exit_order(action, n, trade.account or "", "ADN", priority=priority)
+        exit = exit_order(action, n, trade.account or "", order_type, price, priority=priority)
         what = describe_order(exit)
         if self.dry_run:
             return Outcome(True, f"{self._tag()}{what}", extras)
@@ -612,6 +579,45 @@ class TrailExecutor(_OrderBase):
             else:
                 ok &= (await self._modify(t, qty=size))[0]
         return ok
+
+
+class TrailExecutor(_OrderBase):
+    async def move_stop_to_breakeven(self, trade: TrackedTrade) -> Outcome:
+        """Every stop tranche still short of breakeven goes to breakeven."""
+        stops, why = await self._find_stops(trade)
+        if not stops:
+            return Outcome(False, f"stop NOT moved: {why}")
+        be = breakeven_price(trade)
+        before = [t.order.auxPrice for t in stops]
+        extras = {"stop_before": before[0] if len(before) == 1 else before, "breakeven": be}
+        # Never loosen: a stop the trader already raised past entry stays.
+        loose = [
+            t for t in stops
+            if (t.order.auxPrice < be if trade.direction == "long" else t.order.auxPrice > be)
+        ]
+        if not loose:
+            return Outcome(
+                True,
+                f"{'stop' if len(stops) == 1 else 'stops'} already at or past breakeven "
+                f"({_fmt_prices(stops)}) -- not moved",
+                extras,
+            )
+        moving = ", ".join(f"{t.order.auxPrice:.2f}" for t in loose)
+        if self.dry_run:
+            return Outcome(True, f"{self._tag()}move stop {moving} -> {be:.2f}", extras)
+
+        failed = []
+        for t in loose:
+            current = t.order.auxPrice
+            ok, errors = await self._modify(t, price=be)
+            if not ok:
+                failed.append(f"{current:.2f} (still {t.order.auxPrice:.2f}{': ' + errors if errors else ''})")
+        if not failed:
+            return Outcome(True, f"stop moved {moving} -> {be:.2f}", extras)
+        return Outcome(False, f"stop move to {be:.2f} NOT confirmed for {'; '.join(failed)}", extras)
+
+    async def exit(self, trade: TrackedTrade, priority: str = ADAPTIVE_PRIORITY) -> Outcome:
+        return await self._whole_exit(trade, priority)
 
 
 class OrderDesk(_OrderBase):

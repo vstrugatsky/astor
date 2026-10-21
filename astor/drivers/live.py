@@ -1653,8 +1653,9 @@ class LiveDriver:
         return _order_line(sym, outcome)
 
     async def exit_position(self, req: SymbolRequest, run_id: str, store: TriggerStore) -> str:
-        """Close the whole position: cancel its stops, then send the exit.
-        Ends any track/trail on the symbol once the exit is in."""
+        """Close the position, or part of it ('exit SYM 100', 'exit SYM
+        1/3'): the whole goes by cancelling its stops, then the exit, and
+        ends any track/trail on it; a part goes by _exit_part."""
         sym = req.symbol
         open_trades = await self.ib.reqAllOpenOrdersAsync()
         try:
@@ -1674,6 +1675,12 @@ class LiveDriver:
         stops = protective_stops(working, "SELL" if long else "BUY")
         if why := self._unbound(stops):
             return why
+        if req.qty is not None:
+            n = req.qty if isinstance(req.qty, int) else math.floor(req.qty * abs(held))
+            if n <= 0:
+                return f"{req.qty} of {abs(held):g} shares rounds to none -- nothing sold."
+            if n < abs(held):
+                return await self._exit_part(sym, account, long, int(n), req, run_id, store)
         contract = stops[0].contract if stops else await self._contract(sym)
         if contract is None:
             return f"IBKR doesn't know {sym}."
@@ -1689,6 +1696,23 @@ class LiveDriver:
         self._record_order(
             store, run_id, "order_exit", sym, "long" if long else "short", req.price or 0.0,
             outcome, {"account": account},
+        )
+        return _order_line(sym, outcome)
+
+    async def _exit_part(
+        self, sym: str, account: str, long: bool, n: int, req: SymbolRequest,
+        run_id: str, store: TriggerStore,
+    ) -> str:
+        """'exit SYM N': sell N and keep the rest protected -- the stops cut
+        by N first, furthest tranche first, then the sale, as trail's
+        partial exits do. track/trail carry on with what's left."""
+        # Only the side, symbol and account are read: a stop below entry
+        # makes it a long.
+        trade = TrackedTrade(sym, 1.0, 0.0 if long else 2.0, account)
+        outcome = await self.desk.exit_shares(trade, n, order_type=req.order_type, price=req.price)
+        self._record_order(
+            store, run_id, "order_exit", sym, "long" if long else "short", req.price or 0.0,
+            outcome, {"account": account, "qty": n, "partial": True},
         )
         return _order_line(sym, outcome)
 

@@ -287,6 +287,41 @@ def test_stop_to_breakeven() -> None:
     check("astor's own entry when it has the trade", "move stop 529.00 -> 536.52" in out, True)
 
 
+def test_exit_part_of_the_position() -> None:
+    import asyncio
+    from fractions import Fraction
+    from types import SimpleNamespace as NS
+
+    from astor.core.tracking import SellRuleTracker, TrailTracker
+    from astor.drivers.live import LiveDriver
+    from astor.test_tracking import _live_executor
+
+    check("shares", (parse_exit("NOC 4").qty, parse_exit("NOC 4").order_type), (4, "ADN"))
+    check("a fraction, adu", (parse_exit("noc ira 1/3 adu").qty, parse_exit("noc ira 1/3 adu").order_type),
+          (Fraction(1, 3), "ADU"))
+    check("lmt", (parse_exit("NOC 4 lmt 540").qty, parse_exit("NOC 4 lmt 540").price), (4, 540.0))
+    check("all of it, as before", parse_exit("NOC").qty, None)
+
+    ex, trades, sent, state, run = _live_executor(100, [(50, 97.0), (50, 98.0)])
+    ex.ib.managedAccounts = lambda: ["U1"]
+    ex.ib.positions = lambda *a: [NS(contract=NS(symbol="XYZ"), account="U1", position=state["held"])]
+    d = LiveDriver.__new__(LiveDriver)
+    d.ib, d.desk = ex.ib, ex
+    d.tracker, d.trailer = SellRuleTracker(), TrailTracker()
+    d.trailer.track("XYZ", 100.0, 98.0, "U1")
+
+    async def rth(sym):
+        return True
+
+    d._in_rth = rth
+    store = NS(record_alert=lambda *a, **k: None, commit=lambda: None)
+    out = run(d.exit_position(parse_exit("XYZ 35"), "run", store))
+    check("35 sold", [o.totalQuantity for o in sent], [35])
+    check("stops cover the 65 left", sum(t.order.totalQuantity for t in trades), 65)
+    check("trail keeps the rest", ("XYZ", "U1") in d.trailer.trades, True)
+    check("and says what it did", "SELL 35" in out, True)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

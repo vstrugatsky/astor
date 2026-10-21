@@ -241,6 +241,9 @@ class SymbolRequest:
     account: str | None
     order_type: str = "ADN"
     price: float | None = None
+    # `exit` only: part of the position -- a share count or a fraction --
+    # or None for all of it
+    qty: Fraction | int | None = None
 
 
 def parse_cancel(rest: str) -> SymbolRequest:
@@ -253,7 +256,7 @@ def parse_cancel(rest: str) -> SymbolRequest:
     return SymbolRequest(_symbol(tokens[0]), account)
 
 
-EXIT_USAGE = "exit SYM [ACCOUNT] [adn | adu | mkt | lmt PRICE]  (default adn)"
+EXIT_USAGE = "exit SYM [ACCOUNT] [SHARES | 1/3] [adn | adu | mkt | lmt PRICE]  (default: all of it, adn)"
 
 
 def parse_exit(rest: str) -> SymbolRequest:
@@ -262,18 +265,22 @@ def parse_exit(rest: str) -> SymbolRequest:
         raise CommandError(EXIT_USAGE)
     symbol = _symbol(tokens[0])
     account, tokens = _split_account(tokens[1:])
+    qty = None
+    if tokens and (tokens[0][0].isdigit()):
+        qty = _part(tokens[0])
+        tokens = tokens[1:]
     if not tokens:
-        return SymbolRequest(symbol, account)
+        return SymbolRequest(symbol, account, qty=qty)
     order_type = EXIT_TYPES.get(tokens[0].lower())
     if order_type is None:
         raise CommandError(f"exit order '{tokens[0]}' is not adn/adu/mkt/lmt; {EXIT_USAGE}")
     if order_type == "LMT":
         if len(tokens) != 2:
-            raise CommandError("an LMT exit needs a price: 'exit SYM lmt PRICE'")
-        return SymbolRequest(symbol, account, "LMT", _price(tokens[1], "LMT price"))
+            raise CommandError("an LMT exit needs a price: 'exit SYM [SHARES] lmt PRICE'")
+        return SymbolRequest(symbol, account, "LMT", _price(tokens[1], "LMT price"), qty)
     if len(tokens) != 1:
         raise CommandError(f"{order_type} takes no price; {EXIT_USAGE}")
-    return SymbolRequest(symbol, account, order_type)
+    return SymbolRequest(symbol, account, order_type, qty=qty)
 
 
 def resolve_account(token: str | None, managed: list[str]) -> str | None:
