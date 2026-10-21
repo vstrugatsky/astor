@@ -288,7 +288,6 @@ def test_stop_to_breakeven() -> None:
 
 
 def test_exit_part_of_the_position() -> None:
-    import asyncio
     from fractions import Fraction
     from types import SimpleNamespace as NS
 
