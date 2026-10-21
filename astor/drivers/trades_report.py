@@ -31,20 +31,27 @@ def _alias(account: str) -> str:
 async def todays_trades(
     ib: IB, store: TriggerStore, session: date, cache_dir: Path = Path("data/bars")
 ) -> list[Trade]:
-    await ib.reqExecutionsAsync(ExecutionFilter())
+    # The times come from this request's own answer, which IBKR sends as
+    # '20261020 09:40:05 US/Eastern'. Not from ib.fills(): in a live
+    # session that keeps each fill as it first arrived, pushed in a UTC
+    # format ib_async reads as the Mac's local time -- three hours late
+    # in ET (2026-10-20: NOC entered 09:40, shown 16:40).
+    answered = await ib.reqExecutionsAsync(ExecutionFilter())
+    # Commissions, though, land only on ib.fills(), a few seconds behind.
     loop = asyncio.get_running_loop()
     deadline = loop.time() + COMMISSION_WAIT
     while loop.time() < deadline:
         if all(f.commissionReport.currency for f in ib.fills()):
             break
         await asyncio.sleep(0.25)
+    commission = {f.execution.execId: f.commissionReport.commission or 0.0 for f in ib.fills()}
     fills = [
         Fill(
             f.execution.time.astimezone(ET), f.contract.symbol, f.execution.acctNumber,
             f.execution.shares if f.execution.side == "BOT" else -f.execution.shares,
-            f.execution.price, f.commissionReport.commission or 0.0,
+            f.execution.price, commission.get(f.execution.execId, 0.0),
         )
-        for f in ib.fills()
+        for f in answered
         if f.contract.secType == "STK" and f.execution.time.astimezone(ET).date() == session
     ]
     # Where each position stood before today's first fill: now, less today.
