@@ -426,8 +426,12 @@ class _ReversalBase(Setup):
         min_leg_minutes: float = 4.0,
         min_ema9_extension_adr: float = 0.125,
         min_alert_move_adr: float = 0.01,
-        min_accel_price: float = 1.2,
-        min_accel_vol: float = 1.0,
+        # Both off (0) since 2026-10-20: over 17 replayed sessions the gate
+        # kept triggers no better than those it dropped, and its fallback
+        # rejects any push of 4 bars or fewer outright. Still computed and
+        # recorded, to revisit with more data.
+        min_accel_price: float = 0.0,
+        min_accel_vol: float = 0.0,
         accel_window: int = 3,
         max_loss_dollars: float = 100.0,
     ):

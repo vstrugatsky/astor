@@ -128,13 +128,18 @@ def _generous_curve(symbol: str = "REV", n: int = 60) -> VolumeCurve:
     )
 
 
+_GATED = {"min_accel_price": 1.2, "min_accel_vol": 1.0}
+
+
 def _rev_scanner(
     setup_cls, symbol: str = "REV", curve: VolumeCurve | None = None, setup_kwargs: dict | None = None
 ) -> Scanner:
     levels = DailyLevels(
         symbol, date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0
     )
-    kwargs = {setup_cls.name: setup_kwargs} if setup_kwargs else None
+    # These fixtures were built with the accel gate on (1.2 / 1.0, the
+    # defaults until 2026-10-20); they keep it unless a test says otherwise.
+    kwargs = {setup_cls.name: _GATED | (setup_kwargs or {})}
     scanner = Scanner({symbol: levels}, [setup_cls], kwargs)
     scanner.curves[symbol] = curve or _generous_curve(symbol)
     return scanner
@@ -145,6 +150,27 @@ def _feed(scanner: Scanner, bars: list[BarEvent]) -> list:
     for b in bars:
         triggers.extend(scanner.on_bar(b))
     return triggers
+
+
+def test_accel_gate_is_off_by_default() -> None:
+    """Since 2026-10-20 accel_price/accel_vol are recorded, not gated on: a
+    17-session replay found the gate kept triggers no better than those it
+    dropped. The canonical leg's minute-3 alert, held back by the gate,
+    now goes out."""
+    check("defaults off", (ReversalLong().min_accel_price, ReversalLong().min_accel_vol), (0.0, 0.0))
+
+    def alerts_with(kwargs):
+        levels = DailyLevels("REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0)
+        sc = Scanner({"REV": levels}, [ReversalLong], {"REV-L": kwargs} if kwargs else None)
+        sc.curves["REV"] = _generous_curve()
+        out = []
+        run_replay(sc, {"REV": _canonical_long_bars()}, on_trigger=lambda t: None, on_setup_alert=out.append)
+        return out
+
+    check("gate off: both alerts", len(alerts_with(None)), 2)
+    check("gate on: one", len(alerts_with(_GATED)), 1)
+    a = alerts_with(None)[0]
+    check("accel still recorded", a.accel_price is not None, True)
 
 
 def test_run_replay_end_to_end() -> None:

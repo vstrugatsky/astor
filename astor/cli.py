@@ -1546,7 +1546,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--min-accel-price",
         type=float,
-        default=1.2,
+        # Off since 2026-10-20: a 17-session replay found the gate dropped
+        # triggers as good as the ones it kept (CLF that day among them).
+        # Still computed and recorded on every trigger.
+        default=0.0,
         help="Minimum accel_price (net close-to-close speed, last "
         "accel-window bars vs. the rest of the leg's) for both the final "
         "trigger and the capitulation alert (0 = off).",
@@ -1554,7 +1557,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--min-accel-vol",
         type=float,
-        default=1.0,
+        # Off since 2026-10-20: a 17-session replay found the gate dropped
+        # triggers as good as the ones it kept (CLF that day among them).
+        # Still computed and recorded on every trigger.
+        default=0.0,
         help="Minimum accel_vol (average volume, last accel-window bars vs. "
         "the rest of the leg's) for both the final trigger and the "
         "capitulation alert (0 = off).",
@@ -1670,14 +1676,20 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument(
         "--min-accel-price",
         type=float,
-        default=1.2,
+        # Off since 2026-10-20: a 17-session replay found the gate dropped
+        # triggers as good as the ones it kept (CLF that day among them).
+        # Still computed and recorded on every trigger.
+        default=0.0,
         help="Minimum accel_price for both the final trigger and the "
         "capitulation alert (0 = off).",
     )
     lv.add_argument(
         "--min-accel-vol",
         type=float,
-        default=1.0,
+        # Off since 2026-10-20: a 17-session replay found the gate dropped
+        # triggers as good as the ones it kept (CLF that day among them).
+        # Still computed and recorded on every trigger.
+        default=0.0,
         help="Minimum accel_vol for both the final trigger and the "
         "capitulation alert (0 = off).",
     )
@@ -1781,8 +1793,8 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--min-leg-adr", type=float, default=0.9)
     ex.add_argument("--min-leg-minutes", type=float, default=4.0)
     ex.add_argument("--min-ema9-extension-adr", type=float, default=0.125)
-    ex.add_argument("--min-accel-price", type=float, default=1.2)
-    ex.add_argument("--min-accel-vol", type=float, default=1.0)
+    ex.add_argument("--min-accel-price", type=float, default=0.0)  # off, as in live
+    ex.add_argument("--min-accel-vol", type=float, default=0.0)
     ex.add_argument("--accel-window", type=int, default=3)
     ex.add_argument("--min-retrace-pct", type=float, default=10.0)
     ex.add_argument("--max-retrace-pct", type=float, default=50.0)
