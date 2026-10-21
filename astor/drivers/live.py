@@ -581,7 +581,7 @@ def _format_order_alert(
     # A capitulation against a position held is that position's move
     # running out of steam: the moment to take some of it off.
     if take_profits:
-        marker = f"{_accent('(position) - take profits', _ANSI_PURPLE)} "
+        marker = f"{_accent('(position - take profits)', _ANSI_PURPLE)} "
     # A short IBKR can't lend for would be rejected: say so up front.
     if borrow:
         marker += f"{_accent(f'({borrow})', _ANSI_PURPLE)} "

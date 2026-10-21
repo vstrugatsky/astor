@@ -903,7 +903,7 @@ def test_alert_line_sizes_for_the_spread() -> None:
     check("unshortable short says so",
           "not shortable" in _format_order_alert("C", a, slip=0.01, borrow="not shortable -- none to borrow"), True)
     check("against a position held: take profits",
-          "(position) - take profits" in _format_order_alert("C", a, held=True, take_profits=True), True)
+          "(position - take profits)" in _format_order_alert("C", a, held=True, take_profits=True), True)
     no_quote = _format_order_alert("C", a)
     check("no quote: the setup's own size", "1228" in no_quote, True)
     check("and says so", "(no quote, no slippage)" in no_quote, True)
