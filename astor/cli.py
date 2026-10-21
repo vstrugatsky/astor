@@ -1190,6 +1190,14 @@ def _by_symbol(trades: dict) -> list:
     return sorted(trades.values(), key=lambda t: (t.symbol, t.account or ""))
 
 
+async def _confirm(loop) -> bool:
+    """The order prompt, for entries and exits alike: only y or yes, in
+    any case, sends. Enter alone doesn't -- a stray one must not place or
+    close a position."""
+    answer = await loop.run_in_executor(None, input, "  send? [y/n] ")
+    return answer.strip().lower() in ("y", "yes")
+
+
 async def _live_console(
     driver: LiveDriver,
     scanner: Scanner,
@@ -1235,8 +1243,7 @@ async def _live_console(
                     print(f"  {ticket}")
                     continue
                 print(f"  {ticket.summary}")
-                answer = await loop.run_in_executor(None, input, "  send? [Y/n] ")
-                if answer.strip().lower() not in ("", "y", "yes"):
+                if not await _confirm(loop):
                     print("  not sent")
                     continue
                 print(f"  {await driver.send_entry(ticket, scanner, run_id, store)}")
@@ -1245,6 +1252,14 @@ async def _live_console(
             elif cmd == "cancel":
                 print(f"  {await driver.cancel(req, run_id, store)}")
             else:
+                planned = await driver.plan_exit(req)
+                if isinstance(planned, str):
+                    print(f"  {planned}")
+                    continue
+                print(f"  {planned.summary}")
+                if not await _confirm(loop):
+                    print("  not sent")
+                    continue
                 print(f"  {await driver.exit_position(req, run_id, store)}")
             continue
 

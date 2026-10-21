@@ -320,6 +320,35 @@ def test_exit_part_of_the_position() -> None:
     check("trail keeps the rest", ("XYZ", "U1") in d.trailer.trades, True)
     check("and says what it did", "SELL 35" in out, True)
 
+    import re
+
+    def plain(t):
+        return re.sub(r"\x1b\[[0-9;]*m", "", t)
+
+    planned = run(d.plan_exit(parse_exit("XYZ 10")))
+    check("partial, confirmed first", plain(planned.summary),
+          "XYZ long: sell 10 of 100 Adaptive  [U1]; cuts the stops by 10")
+    planned = run(d.plan_exit(parse_exit("XYZ")))
+    check("whole", plain(planned.summary).startswith("XYZ long: sell 100 Adaptive"), True)
+    check("names the stops and the trail", "cancels the stops" in plain(planned.summary)
+          and "ends track/trail" in plain(planned.summary), True)
+
+
+def test_only_y_sends() -> None:
+    import asyncio
+
+    from astor.cli import _confirm
+
+    class Loop:
+        def __init__(self, answer):
+            self.answer = answer
+
+        async def run_in_executor(self, _, fn, prompt):
+            return self.answer
+
+    for answer, sends in (("y", True), ("Y", True), ("yes", True), ("", False), ("n", False), (" y ", True)):
+        check(repr(answer), asyncio.run(_confirm(Loop(answer))), sends)
+
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 

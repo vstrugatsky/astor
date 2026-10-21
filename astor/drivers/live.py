@@ -476,6 +476,23 @@ def _print_fill_notice(symbol: str, shares: float, price: float, then: str) -> N
 
 
 @dataclass
+class ExitPlanned:
+    """An `exit` checked, for the console to confirm."""
+
+    account: str
+    long: bool
+    n: int
+    whole: bool
+    stops: list
+    working: list
+    summary: str
+
+
+def _fmt_stops(stops: list) -> str:
+    return ", ".join(f"{t.order.totalQuantity:g}@{t.order.auxPrice:.2f}" for t in stops)
+
+
+@dataclass
 class EntryTicket:
     """An `enter` checked and built, waiting on the trader's go-ahead."""
 
@@ -1652,10 +1669,11 @@ class LiveDriver:
         )
         return _order_line(sym, outcome)
 
-    async def exit_position(self, req: SymbolRequest, run_id: str, store: TriggerStore) -> str:
-        """Close the position, or part of it ('exit SYM 100', 'exit SYM
-        1/3'): the whole goes by cancelling its stops, then the exit, and
-        ends any track/trail on it; a part goes by _exit_part."""
+    async def plan_exit(self, req: SymbolRequest) -> ExitPlanned | str:
+        """What `exit` would do, checked but not sent -- for the console to
+        confirm -- or why it can't. exit_position runs it again on
+        confirmation, from fresh reads: the position may have moved while
+        the prompt waited."""
         sym = req.symbol
         open_trades = await self.ib.reqAllOpenOrdersAsync()
         try:
@@ -1675,17 +1693,47 @@ class LiveDriver:
         stops = protective_stops(working, "SELL" if long else "BUY")
         if why := self._unbound(stops):
             return why
+        n = int(abs(held))
         if req.qty is not None:
-            n = req.qty if isinstance(req.qty, int) else math.floor(req.qty * abs(held))
-            if n <= 0:
+            part = req.qty if isinstance(req.qty, int) else math.floor(req.qty * abs(held))
+            if part <= 0:
                 return f"{req.qty} of {abs(held):g} shares rounds to none -- nothing sold."
-            if n < abs(held):
-                return await self._exit_part(sym, account, long, int(n), req, run_id, store)
+            n = min(int(part), n)
+        whole = n >= abs(held)
+        kind = {
+            "ADN": "Adaptive", "ADU": _bold("Adaptive Urgent"), "MKT": "MKT",
+            "LMT": f"LMT {req.price:.2f}" if req.price is not None else "LMT",
+        }.get(req.order_type, req.order_type)
+        verb = "sell" if long else "cover"
+        stop_text = (
+            ("cancels the stops " + _fmt_stops(stops)) if whole and stops
+            else f"cuts the stops by {n}" if stops else _accent("no stop", _ANSI_RED)
+        )
+        tracked = [t for t in self._trades_on(sym, account)]
+        summary = (
+            f"{_bold(sym)} {'long' if long else 'short'}: {verb} {_bold(f'{n:g}')}"
+            f"{'' if whole else f' of {abs(held):g}'} {kind}"
+            f"  [{_account_tag(account).strip(' []')}]; {stop_text}"
+            + ("; ends track/trail" if whole and tracked else "")
+        )
+        return ExitPlanned(account, long, n, whole, stops, working, summary)
+
+    async def exit_position(self, req: SymbolRequest, run_id: str, store: TriggerStore) -> str:
+        """Close the position, or part of it ('exit SYM 100', 'exit SYM
+        1/3'): the whole goes by cancelling its stops, then the exit, and
+        ends any track/trail on it; a part goes by _exit_part."""
+        sym = req.symbol
+        plan = await self.plan_exit(req)
+        if isinstance(plan, str):
+            return plan
+        account, long, stops, working = plan.account, plan.long, plan.stops, plan.working
+        if not plan.whole:
+            return await self._exit_part(sym, account, long, plan.n, req, run_id, store)
         contract = stops[0].contract if stops else await self._contract(sym)
         if contract is None:
             return f"IBKR doesn't know {sym}."
         order = exit_order(
-            "SELL" if long else "BUY", abs(held), account, req.order_type, req.price
+            "SELL" if long else "BUY", plan.n, account, req.order_type, req.price
         )
         outcome = await self.desk.exit(sym, contract, stops, order)
         if outcome.ok and not self.desk.dry_run and self.untrack(sym, account):
@@ -1698,6 +1746,10 @@ class LiveDriver:
             outcome, {"account": account},
         )
         return _order_line(sym, outcome)
+
+    def _trades_on(self, sym: str, account: str) -> list[TrackedTrade]:
+        return [t for book in (self.tracker, self.trailer) for t in book.for_symbol(sym)
+                if t.account in (account, None)]
 
     async def _exit_part(
         self, sym: str, account: str, long: bool, n: int, req: SymbolRequest,
