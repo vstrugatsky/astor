@@ -350,6 +350,46 @@ def test_only_y_sends() -> None:
         check(repr(answer), asyncio.run(_confirm(Loop(answer))), sends)
 
 
+def test_orb_sizes_from_the_opening_range() -> None:
+    import asyncio
+    from datetime import date, datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from astor.core.types import BarEvent
+
+    et = ZoneInfo("America/New_York")
+    check("parsed", (parse_enter("CLF orb", "long").orb_minutes, parse_enter("CLF reg orb 5", "short").orb_minutes), (1, 5))
+
+    d = _entry_driver(13.60, 13.59, 13.61)
+    d.session, d.max_loss = date(2026, 10, 20), 100.0
+    open_dt = datetime(2026, 10, 20, 9, 30, tzinfo=et)
+    # CLF 2026-10-20's real 2-minute range: 13.72 / 13.26
+    bars = [
+        BarEvent("CLF", open_dt, open_dt + timedelta(minutes=1), 13.6, 13.72, 13.50, 13.55, 1e5),
+        BarEvent("CLF", open_dt + timedelta(minutes=1), open_dt + timedelta(minutes=2), 13.55, 13.60, 13.26, 13.40, 1e5),
+    ]
+
+    async def range_bars(contract, start, end):
+        return [b for b in bars if start <= b.start < end]
+
+    d._range_bars = range_bars
+    after = open_dt + timedelta(minutes=2, seconds=2)
+    req, note = asyncio.run(d._orb(parse_enter("CLF orb 2", "long"), None, now=after))
+    check("long: buy stop a tick over the high, stop at the low", (req.order_type, req.price, req.stop), ("STP", 13.73, 13.26))
+    # 0.47 a share + 0.02 of slippage (half the 2c spread, in and out) + commissions
+    from astor.core.commissions import trade_risk
+
+    check("the most shares $100 covers",
+          (trade_risk(req.qty, 13.73, 13.26, 0.02) <= 100, trade_risk(req.qty + 1, 13.73, 13.26, 0.02) > 100),
+          (True, True))
+    check("about 199", req.qty, 199)
+    check("says the range", "ORB 2m: high 13.72 low 13.26" in note, True)
+    req, _ = asyncio.run(d._orb(parse_enter("CLF orb 2", "short"), None, now=after))
+    check("short mirrors it", (req.price, req.stop), (13.25, 13.72))
+    check("another day refused", isinstance(asyncio.run(d._orb(parse_enter("CLF orb", "long"), None,
+          now=after + timedelta(days=1))), str), True)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

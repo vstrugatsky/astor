@@ -94,6 +94,9 @@ class EnterRequest:
     # No type typed: ADN in regular hours; outside them live makes it an
     # LMT at the ask (long) or bid (short).
     type_defaulted: bool = False
+    # 'buy SYM orb [N]': an opening-range break over the first N minutes --
+    # qty, entry and stop are left for live to work out from the range.
+    orb_minutes: int | None = None
 
     @property
     def action(self) -> str:
@@ -105,9 +108,12 @@ ENTER_USAGE = (
     "  e.g. 'enter SPCX short 20 stp 170.10 stop 172.01'; the type defaults to adn"
 )
 BUY_SELL_USAGE = (
-    "buy|sell SYM [ACCOUNT] QTY [adn|adu|mkt|lmt PRICE|stp PRICE] [stop PRICE]"
+    "buy|sell SYM [ACCOUNT] QTY [adn|adu|mkt|lmt PRICE|stp PRICE] [stop PRICE],"
+    " or buy|sell SYM [ACCOUNT] orb [MINUTES]"
     "  e.g. 'buy NVDA 100 stop 35.99' -- Adaptive Normal unless a type is given"
 )
+ORB_MINUTES = 1
+
 
 
 def parse_enter(rest: str, direction: str | None = None) -> EnterRequest:
@@ -129,6 +135,8 @@ def parse_enter(rest: str, direction: str | None = None) -> EnterRequest:
         tokens = tokens[1:]
     if not tokens:
         raise CommandError(usage)
+    if tokens[0].lower() == "orb":
+        return _parse_orb(symbol, account, direction, tokens[1:])
     try:
         qty = int(tokens[0])
     except ValueError:
@@ -163,6 +171,25 @@ def parse_enter(rest: str, direction: str | None = None) -> EnterRequest:
             )
         stop = _price(tokens[1], "stop")
     return EnterRequest(symbol, account, direction, qty, order_type, price, stop, defaulted)
+
+
+def _parse_orb(symbol: str, account: str | None, direction: str, tokens: list[str]) -> EnterRequest:
+    """'orb [MINUTES]': the range length, 1 minute unless given. Nothing
+    else -- the range sets the entry, the stop and the size."""
+    minutes = ORB_MINUTES
+    if tokens:
+        try:
+            minutes = int(tokens[0])
+        except ValueError:
+            raise CommandError(f"orb takes the range in whole minutes, not '{tokens[0]}'") from None
+        if not 1 <= minutes <= 60:
+            raise CommandError("the opening range is 1 to 60 minutes")
+        tokens = tokens[1:]
+    if tokens:
+        raise CommandError(
+            f"unexpected '{' '.join(tokens)}' -- orb works out the size, entry and stop itself"
+        )
+    return EnterRequest(symbol, account, direction, 0, "STP", None, None, orb_minutes=minutes)
 
 
 @dataclass(frozen=True)

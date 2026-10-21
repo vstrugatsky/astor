@@ -91,6 +91,10 @@ from astor.drivers.shortable import ShortableList
 logger = logging.getLogger(__name__)
 
 RTH_OPEN = time(9, 30)
+# ORB: how long after the range ends before its bars are read, and how
+# many reads (half a second apart) to wait for the last minute's bar
+ORB_SETTLE_SECONDS = 1.0
+ORB_TRIES = 8
 
 # How long to wait between activating successive symbols in a batch (open
 # transition, or a multi-symbol post-open `add`). `_subscribe`'s
@@ -796,6 +800,9 @@ class LiveDriver:
         # `mute`: setup alerts print without the bell. track, trail and
         # order notices always ring -- they are about money already in.
         self.muted = False
+        # Dollars a stop-out may cost: sizes ORB entries (cli sets it from
+        # --max-loss, the same budget the setups' alerts are sized to)
+        self.max_loss = 100.0
         ib.positionEvent += self._on_position
 
     def start_background(self) -> None:
@@ -1399,6 +1406,78 @@ class LiveDriver:
         )
         store.commit()
 
+    async def _orb(
+        self, req: EnterRequest, contract: Contract, now: datetime | None = None
+    ) -> tuple[EnterRequest, str] | str:
+        """'buy SYM orb N': the opening range over the first N minutes, and
+        the entry it sets -- a buy stop a tick over the range high, the
+        stop at the range low (mirrored for a short) -- sized so a stop-out
+        costs at most max_loss with commissions and slippage. Typed before
+        the range ends, it waits for the end and reads the range the moment
+        IBKR has its last bar, not a minute later."""
+        n = req.orb_minutes
+        assert n is not None
+        now = now or datetime.now(ET)
+        if now.date() != self.session:
+            return f"ORB needs today's session; the next one is {self.session}."
+        open_dt = datetime.combine(self.session, RTH_OPEN, tzinfo=ET)
+        end = open_dt + timedelta(minutes=n)
+        wait = (end - now).total_seconds() + ORB_SETTLE_SECONDS
+        if wait > 0:
+            print(f"  ORB {n}m {req.symbol}: waiting for the range to end at {end:%H:%M:%S} ET...", flush=True)
+            await asyncio.sleep(wait)
+        bars: list[BarEvent] = []
+        last_start = end - timedelta(minutes=1)
+        for _ in range(ORB_TRIES):
+            bars = await self._range_bars(contract, open_dt, end)
+            # The range's last minute is in once IBKR has a bar for it
+            if any(b.start == last_start for b in bars):
+                break
+            await asyncio.sleep(0.5)
+        if not bars:
+            return f"No {req.symbol} bars from {open_dt:%H:%M} to {end:%H:%M} ET yet -- try again in a moment."
+        high, low = max(b.high for b in bars), min(b.low for b in bars)
+        if high <= low:
+            return f"{req.symbol}'s {n}m range is a single price ({high:.2f}) -- no ORB to trade."
+        long = req.direction == "long"
+        tick = 0.01 if high >= 1.0 else 0.0001
+        entry = round(high + tick, 4) if long else round(low - tick, 4)
+        stop = low if long else high
+        # A stop entry fills at the market: half the spread going in, and
+        # half again at the stop (astor.core.commissions).
+        half = _half_spread_of(await self._snapshot(contract)) or 0.0
+        qty = shares_for_risk(entry, stop, self.max_loss, 2 * half)
+        if qty <= 0:
+            return (
+                f"{req.symbol}'s {n}m range {low:.2f}-{high:.2f} is too wide for "
+                f"${self.max_loss:,.0f} of risk -- not even one share."
+            )
+        partial = "" if any(b.start == last_start for b in bars) else " -- last minute not in yet"
+        note = _bold(
+            f"ORB {n}m: high {high:.2f} low {low:.2f}, range {high - low:.2f} "
+            f"({(high - low) / entry * 100:.1f}%){partial}"
+        )
+        return dataclasses.replace(req, qty=qty, order_type="STP", price=entry, stop=stop), note
+
+    async def _range_bars(self, contract: Contract, start: datetime, end: datetime) -> list[BarEvent]:
+        """Today's completed 1-min bars from `start` to `end`, straight from
+        IBKR's history -- the symbol needn't be subscribed."""
+        try:
+            raw = await self._ref._historical(
+                contract, endDateTime="", durationStr="1 D", barSizeSetting="1 min",
+                whatToShow="TRADES", useRTH=True, formatDate=1,
+            )
+        except Exception:
+            logger.exception("No opening-range bars for %s", contract.symbol)
+            return []
+        out = []
+        for b in raw or []:
+            t = to_et(b.date)
+            if t is not None and start <= t < end:
+                out.append(BarEvent(contract.symbol, t, t + timedelta(minutes=1),
+                                    b.open, b.high, b.low, b.close, b.volume))
+        return out
+
     async def prepare_entry(self, req: EnterRequest) -> EntryTicket | str:
         """Check an `enter` and build its orders, without sending them.
         Returns the ticket to confirm, or why it can't be sent."""
@@ -1414,12 +1493,18 @@ class LiveDriver:
         contract = await self._contract(req.symbol)
         if contract is None:
             return f"IBKR doesn't know {req.symbol}."
+        orb_note = None
+        if req.orb_minutes is not None:
+            sized = await self._orb(req, contract)
+            if isinstance(sized, str):
+                return sized
+            req, orb_note = sized
         in_rth = await self._in_rth(req.symbol)
         if req.order_type in ADAPTIVE and not in_rth and not req.type_defaulted:
             return "Adaptive is regular-hours only; outside them use lmt (works now) or stp (from the open)."
         quote = await (self._snapshot(contract) if in_rth else self._quote(contract))
         market, half = _price_of(quote), _half_spread_of(quote)
-        notes = []
+        notes = [orb_note] if orb_note else []
         # A stop entry the market is already through would trigger at once
         # and fill at the market anyway: send it as the market order it is
         # -- Adaptive, or outside regular hours the limit below -- and say

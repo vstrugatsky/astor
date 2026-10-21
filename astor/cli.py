@@ -1100,6 +1100,7 @@ async def cmd_live(args: argparse.Namespace) -> int:
 
     try:
         driver = LiveDriver(ib, Path(args.cache_dir), args.bar_size, args.dry_run_trail)
+        driver.max_loss = args.max_loss
         driver.start_background()
         run_id = f"{driver.session:%Y%m%d}-live-{uuid.uuid4().hex[:8]}"
         logger.info("Live session target: %s (run_id=%s)", driver.session, run_id)
@@ -1169,7 +1170,8 @@ _CONSOLE_COMMANDS = (
     "'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
     "'positions', 'trades', 'mute', 'unmute', 'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "
-    "'buy|sell SYM [ACCOUNT] QTY [adn|adu|mkt|lmt P|stp P] [stop P]' "
+    "'buy|sell SYM [ACCOUNT] QTY [adn|adu|mkt|lmt P|stp P] [stop P]', "
+    "'buy|sell SYM [ACCOUNT] orb [MINUTES]' (opening-range break, sized for you) "
     "(adn = Adaptive Normal, the default; adu = Adaptive Urgent), "
     "'enter SYM [ACCOUNT] l|s QTY ...' (the same, direction spelled out), "
     "'stop SYM [ACCOUNT] P', 'stop SYM 1/2 P1 1/2 P2' or 'stop SYM be', "
