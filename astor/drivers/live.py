@@ -521,7 +521,7 @@ def _overshoot_cost(
 
 def _format_order_alert(
     label: str, a: SetupAlert, held: bool = False, slip: float | None = None,
-    borrow: str | None = None,
+    borrow: str | None = None, take_profits: bool = False,
 ) -> str:
     """One line, sized to be acted on rather than studied.
 
@@ -578,6 +578,10 @@ def _format_order_alert(
     else:
         rr = f"R:R {_bold(f'{a.rr:.1f}')}; " if a.rr is not None else ""
     marker = f"{_accent('(position)', _ANSI_PURPLE)} " if held else ""
+    # A capitulation against a position held is that position's move
+    # running out of steam: the moment to take some of it off.
+    if take_profits:
+        marker = f"{_accent('(position) - take profits', _ANSI_PURPLE)} "
     # A short IBKR can't lend for would be rejected: say so up front.
     if borrow:
         marker += f"{_accent(f'({borrow})', _ANSI_PURPLE)} "
@@ -590,13 +594,14 @@ def _format_order_alert(
 
 def _print_setup_alert(
     a: SetupAlert, held: bool = False, bell: bool = True, slip: float | None = None,
-    borrow: str | None = None,
+    borrow: str | None = None, take_profits: bool = False,
 ) -> None:
     """One entry point for every setup-produced alert; the only thing that
     differs by kind is what it is called."""
     _print_alert(
         _format_order_alert(
-            "AVWAP TOUCH" if isinstance(a, TouchAlert) else "CAPITULATION", a, held, slip, borrow
+            "AVWAP TOUCH" if isinstance(a, TouchAlert) else "CAPITULATION", a, held, slip, borrow,
+            take_profits,
         ),
         bell,
     )
@@ -1329,7 +1334,11 @@ class LiveDriver:
                 slip = await self._half_spread(contract)
         finally:
             borrow = self._borrow_problem(alert.symbol) if alert.direction == "short" else None
-            _print_setup_alert(alert, held, bell, slip, borrow)
+            sign = 1 if alert.direction == "long" else -1
+            take_profits = isinstance(alert, CapitulationAlert) and any(
+                p.position * sign < 0 for p in held_positions(self.ib, alert.symbol)
+            )
+            _print_setup_alert(alert, held, bell, slip, borrow, take_profits)
 
     async def _in_rth(self, symbol: str) -> bool:
         now = datetime.now(ET)
