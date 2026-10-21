@@ -70,6 +70,7 @@ from astor.drivers.orders import (
     OrderDesk,
     Outcome,
     TrailExecutor,
+    breakeven_price,
     describe_order,
     entry_orders,
     exit_order,
@@ -1552,6 +1553,28 @@ class LiveDriver:
             logger.exception("watching the %s entry failed", sym)
             _print_order_notice(sym, f"lost track of the entry ({e!r}) -- CHECK ORDERS")
 
+    async def _stop_to_breakeven(
+        self, sym: str, account: str, run_id: str, store: TriggerStore
+    ) -> str:
+        """'stop SYM be': every stop tranche short of breakeven goes to it,
+        exactly as trail does at +1R; one already past it stays. Entry is
+        astor's own when it has the trade (the fill), else IBKR's average
+        cost, which carries the commission."""
+        pos = next((p for p in held_positions(self.ib, sym) if p.account == account), None)
+        if pos is None:
+            return f"No {sym} position in {account}."
+        known = self._known_trade(sym, account)
+        entry = known.entry if known is not None else pos.avgCost
+        long = pos.position > 0
+        # Direction comes from stop vs. entry: any stop on the losing side.
+        trade = TrackedTrade(sym, entry, entry - 1 if long else entry + 1, account)
+        outcome = await self.executor.move_stop_to_breakeven(trade)
+        self._record_order(
+            store, run_id, "order_stop", sym, trade.direction, breakeven_price(trade), outcome,
+            {"account": account, "breakeven": True, "entry": entry},
+        )
+        return _order_line(sym, outcome)
+
     async def set_stop(self, req: StopRequest, run_id: str, store: TriggerStore) -> str:
         """Make the position's protective stops exactly what `req` says --
         one price, or tranches. Before the entry fills, its attached stop
@@ -1562,6 +1585,8 @@ class LiveDriver:
             account = self._account_for(req.account, sym, open_trades)
         except CommandError as e:
             return str(e)
+        if req.breakeven:
+            return await self._stop_to_breakeven(sym, account, run_id, store)
         working = working_orders(open_trades, sym, account)
         held = self._held(sym, account)
         prices = [p for _, p in req.tranches]

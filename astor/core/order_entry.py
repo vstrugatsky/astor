@@ -171,9 +171,11 @@ class StopRequest:
     account: str | None
     # (part, price): part is a Fraction of the position or an int share count
     tranches: list[tuple[Fraction | int, float]]
+    # 'stop SYM be': every stop short of breakeven goes to it
+    breakeven: bool = False
 
 
-STOP_USAGE = "stop SYM [ACCOUNT] PRICE, or stop SYM [ACCOUNT] 1/2 PRICE 1/2 PRICE"
+STOP_USAGE = "stop SYM [ACCOUNT] PRICE, stop SYM [ACCOUNT] 1/2 PRICE 1/2 PRICE, or stop SYM [ACCOUNT] be"
 
 
 def _part(tok: str) -> Fraction | int:
@@ -197,6 +199,8 @@ def parse_stop(rest: str) -> StopRequest:
         raise CommandError(STOP_USAGE)
     symbol = _symbol(tokens[0])
     account, tokens = _split_account(tokens[1:])
+    if len(tokens) == 1 and tokens[0].lower() == "be":
+        return StopRequest(symbol, account, [], breakeven=True)
     if len(tokens) == 1:
         return StopRequest(symbol, account, [(Fraction(1), _price(tokens[0], "stop"))])
     if not tokens or len(tokens) % 2:

@@ -263,6 +263,30 @@ def test_a_desktop_order_is_named() -> None:
     check("two of them", two.startswith("these 4@535.00 stop, 4@534.00 stop were placed"), True)
 
 
+def test_stop_to_breakeven() -> None:
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from astor.core.tracking import SellRuleTracker, TrailTracker
+    from astor.drivers.live import LiveDriver
+    from astor.test_tracking import _executor_holding
+
+    r = parse_stop("noc ira BE")
+    check("parsed", (r.symbol, r.account, r.breakeven, r.tranches), ("NOC", "ira", True, []))
+
+    # Long 12 NOC at 536.52, stops 4@542.62 (past breakeven) and 8@529.00
+    ex, _ = _executor_holding(12, [(4, 542.62), (8, 529.0)])
+    d = LiveDriver.__new__(LiveDriver)
+    d.tracker, d.trailer, d.executor, d.desk = SellRuleTracker(), TrailTracker(), ex, NS(dry_run=True)
+    d.ib = NS(positions=lambda *a: [NS(contract=NS(symbol="XYZ"), account="U1", position=12, avgCost=536.6033)])
+    store = NS(record_alert=lambda *a, **k: None, commit=lambda: None)
+    out = asyncio.run(d._stop_to_breakeven("XYZ", "U1", "run", store))
+    check("only the loose tranche moves, to avgCost rounded up", "move stop 529.00 -> 536.61" in out, True)
+    d.trailer.track("XYZ", 536.52, 529.0, "U1")
+    out = asyncio.run(d._stop_to_breakeven("XYZ", "U1", "run", store))
+    check("astor's own entry when it has the trade", "move stop 529.00 -> 536.52" in out, True)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
