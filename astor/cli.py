@@ -1168,7 +1168,8 @@ _CONSOLE_COMMANDS = (
     "'trail SYM [ENTRY STOP] [ACCOUNT] [1.5R] [PCT gb|avwap|be ...] [close 2.5R|close exit]' "
     "(e.g. 'trail XYZ 1.5R 35% gb 35% avwap 30% be close exit'; track takes the same), "
     "'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
-    "'positions', 'trades', 'mute', 'unmute', 'list', 'quit'.\n"
+    "'positions', 'trades', 'mute', 'unmute', 'pause SETUP SYM1,SYM2', 'resume [SETUP] SYM1,SYM2', "
+    "'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "
     "'buy|sell SYM [ACCOUNT] [QTY] stop P [when P] [lim P] [urgent] [mkt] [loss $]' "
     "(no QTY: astor sizes it from the stop and the max loss; Adaptive Normal unless "
@@ -1191,6 +1192,35 @@ _ORDER_PARSERS = {
 
 def _by_symbol(trades: dict) -> list:
     return sorted(trades.values(), key=lambda t: (t.symbol, t.account or ""))
+
+
+# 'pause rev-l ...': a setup's name, or a group of them
+_SETUP_GROUPS = {"rev": ["REV-L", "REV-S"], "avt": ["AVT-L", "AVT-S"]}
+
+
+def _pause_args(words: list[str], resume: bool) -> tuple[list[str] | None, list[str]]:
+    """'pause SETUP SYM1,SYM2' -> (setups, symbols). SETUP is a setup
+    name (rev-l), a group (rev, avt) or all; resume may leave it out to
+    resume every setup on the symbols."""
+    usage = f"Usage: {'resume [SETUP]' if resume else 'pause SETUP'} SYM1,SYM2  (SETUP: rev-l, rev-s, avt-l, avt-s, rev, avt, all)"
+    if not words:
+        raise CommandError(usage)
+    head = words[0].lower()
+    names = {s.name.lower(): s.name for s in ALL_SETUPS}
+    if head == "all":
+        setups: list[str] | None = [s.name for s in ALL_SETUPS]
+    elif head in _SETUP_GROUPS:
+        setups = _SETUP_GROUPS[head]
+    elif head in names:
+        setups = [names[head]]
+    elif resume:
+        setups, words = None, ["", " ".join(words)]
+    else:
+        raise CommandError(f"'{words[0]}' isn't a setup; {usage}")
+    symbols = split_symbols(words[1]) if len(words) > 1 else []
+    if not symbols:
+        raise CommandError(usage)
+    return setups, symbols
 
 
 async def _confirm(loop) -> bool:
@@ -1338,6 +1368,19 @@ async def _live_console(
                 "  Setup alerts muted: still shown, no bell. track/trail/orders still ring."
                 if driver.muted else "  Setup alerts unmuted."
             )
+        elif cmd in ("pause", "resume"):
+            words = rest.split(maxsplit=1)
+            try:
+                setups, symbols = _pause_args(words, resume=cmd == "resume")
+            except CommandError as e:
+                print(f"  {e}")
+                continue
+            if cmd == "pause":
+                driver.pause(setups, symbols)
+                print(f"  Paused {', '.join(setups)} alerts on {', '.join(symbols)} -- still recorded; 'resume' undoes it.")
+            else:
+                gone = driver.resume(setups, symbols)
+                print(f"  Resumed {', '.join(f'{s} {sym}' for s, sym in gone)}." if gone else "  Nothing paused there.")
         elif cmd in ("positions", "pos"):
             for line in await driver.position_lines():
                 print(line)
@@ -1350,6 +1393,11 @@ async def _live_console(
             print(f"Tracking {total}/{cap or '∞'}" + ("  (setup alerts muted)" if driver.muted else ""))
             if tracked["live"]:
                 print(f"  live    ({len(tracked['live'])}): {', '.join(tracked['live'])}")
+            if driver.paused:
+                by_setup: dict[str, list[str]] = {}
+                for setup, sym in sorted(driver.paused):
+                    by_setup.setdefault(setup, []).append(sym)
+                print("  paused: " + "; ".join(f"{s} {','.join(syms)}" for s, syms in by_setup.items()))
             if tracked["pending"]:
                 print(
                     f"  pending ({len(tracked['pending'])}): "

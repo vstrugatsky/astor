@@ -283,6 +283,12 @@ def _print_trigger_alert(t: Trigger, bell: bool = True) -> None:
     _print_alert(_format_trigger_line(t), bell)
 
 
+def _alert_setup(a: SetupAlert) -> str:
+    """The setup a setup alert belongs to: AVT-L/S or REV-L/S."""
+    side = "L" if a.direction == "long" else "S"
+    return f"{'AVT' if isinstance(a, TouchAlert) else 'REV'}-{side}"
+
+
 def _account_tag(account: str | None) -> str:
     """ira/reg rather than the ID: it is there to tell apart two trades of
     one symbol, and those can only be in these two accounts."""
@@ -817,10 +823,27 @@ class LiveDriver:
         # `mute`: setup alerts print without the bell. track, trail and
         # order notices always ring -- they are about money already in.
         self.muted = False
+        # `pause SETUP SYM,...`: (setup, symbol) pairs whose alerts and
+        # trigger notices stay off the screen -- still recorded -- until
+        # `resume` or the end of the session
+        self.paused: set[tuple[str, str]] = set()
         # Dollars a stop-out may cost: sizes ORB entries (cli sets it from
         # --max-loss, the same budget the setups' alerts are sized to)
         self.max_loss = 100.0
         ib.positionEvent += self._on_position
+
+    def is_paused(self, setup: str, symbol: str) -> bool:
+        return (setup, symbol) in self.paused
+
+    def pause(self, setups: list[str], symbols: list[str]) -> None:
+        self.paused |= {(s, sym) for s in setups for sym in symbols}
+
+    def resume(self, setups: list[str] | None, symbols: list[str]) -> list[tuple[str, str]]:
+        """Undo `pause`, for the setups given or every setup; what was
+        resumed."""
+        gone = [(s, sym) for s, sym in self.paused if sym in symbols and (setups is None or s in setups)]
+        self.paused -= set(gone)
+        return sorted(gone)
 
     def start_background(self) -> None:
         """Work the session keeps doing on its own: for now, refreshing the
@@ -2083,7 +2106,7 @@ class LiveDriver:
                     # Every trigger is still stored regardless of grade or
                     # setup -- only the terminal alert is gated, so a look
                     # back at the full session never has gaps to explain.
-                    if _should_notify(trigger):
+                    if _should_notify(trigger) and not self.is_paused(trigger.setup, trigger.symbol):
                         _print_trigger_alert(trigger, not self.muted)
 
                 for alert in scanner.pop_alerts():
@@ -2099,6 +2122,9 @@ class LiveDriver:
                         bar_end=alert.bar_end,
                     )
                     store.commit()
+                    # Recorded above either way; a pause only keeps it off the screen
+                    if self.is_paused(_alert_setup(alert), alert.symbol):
+                        continue
                     # The quote for slippage is awaited; this callback isn't async.
                     task = asyncio.create_task(self._print_setup_alert_sized(
                         alert, alert.symbol in self.positions, not self.muted

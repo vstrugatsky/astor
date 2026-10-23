@@ -459,6 +459,28 @@ def test_sizing_on_the_worst_price_the_order_allows() -> None:
           "too far" in asyncio.run(d.prepare_entry(parse_enter("XYZ stop 1.00 loss 5", "long"))), True)
 
 
+def test_pause_and_resume() -> None:
+    from astor.cli import _pause_args
+    from astor.drivers.live import LiveDriver
+
+    check("one setup", _pause_args(["rev-l", "lbrt,kalu,oii"], False), (["REV-L"], ["LBRT", "KALU", "OII"]))
+    check("a group", _pause_args(["REV", "lbrt"], False)[0], ["REV-L", "REV-S"])
+    check("all", len(_pause_args(["all", "lbrt"], False)[0]), 4)
+    check("resume without a setup: all of them", _pause_args(["lbrt,kalu"], True), (None, ["LBRT", "KALU"]))
+    raises("pause needs a setup", _pause_args, ["lbrt"], False)
+    raises("and tickers", _pause_args, ["rev-l"], False)
+
+    d = LiveDriver.__new__(LiveDriver)
+    d.paused = set()
+    d.pause(["REV-L"], ["LBRT", "KALU"])
+    check("paused", (d.is_paused("REV-L", "LBRT"), d.is_paused("REV-S", "LBRT"), d.is_paused("REV-L", "OII")),
+          (True, False, False))
+    check("resume one", d.resume(["REV-L"], ["LBRT"]), [("REV-L", "LBRT")])
+    d.pause(["REV-L", "AVT-L"], ["OII"])
+    check("resume every setup on a ticker", d.resume(None, ["OII"]), [("AVT-L", "OII"), ("REV-L", "OII")])
+    check("KALU still paused", d.paused, {("REV-L", "KALU")})
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

@@ -928,6 +928,9 @@ def test_alert_line_sizes_for_the_spread() -> None:
     check("resized with the quote", ("1111" in sized, "1228" in sized, "no quote" in sized), (True, False, False))
     check("unshortable short says so",
           "not shortable" in _format_order_alert("C", a, slip=0.01, borrow="not shortable -- none to borrow"), True)
+    from astor.drivers.live import _alert_setup
+
+    check("a short capitulation is REV-S, for pause", _alert_setup(a), "REV-S")
     check("against a position held: take profits",
           "(position - take profits)" in _format_order_alert("C", a, held=True, take_profits=True), True)
     no_quote = _format_order_alert("C", a)
