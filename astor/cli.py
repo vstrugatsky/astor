@@ -9,8 +9,8 @@
         'track NVDA', 'track NVDA 137.50 130.10' or
         'track NVDA U1234566', 'trail NVDA', 'trail NVDA 137.50 130.10 U1234566',
         'untrail NVDA', 'untrack NVDA', 'positions', 'mute', 'unmute', 'quit'; --dry-run-trail to have trail place no orders)
-        orders: 'buy NVDA 100 stop 35.99' (Adaptive Normal), 'buy NVDA 100 adu stop 35.99'
-        (Adaptive Urgent), 'sell SPCX 20 stp 170.10 stop 172.01',
+        orders: 'buy NVDA stop 35.99' (sized by astor, Adaptive Normal), 'buy NVDA 100 stop 35.99',
+        'sell SPCX stop 172.01 when 170.10 lim 170.00 loss 250' (stop-limit),
         'enter SPCX short 20 stp 170.10 stop 172.01', 'stop SPCX 170.10',
         'stop SPCX 1/2 168.05 1/2 170.01', 'cancel SPCX', 'exit SPCX [lmt 168.20]'
         (--dry-run-trail covers these too)
@@ -1170,9 +1170,10 @@ _CONSOLE_COMMANDS = (
     "'untrail SYM [ACCOUNT]', 'untrack SYM [ACCOUNT]', "
     "'positions', 'trades', 'mute', 'unmute', 'list', 'quit'.\n"
     "Orders ([ACCOUNT] = ira/reg/ID): "
-    "'buy|sell SYM [ACCOUNT] QTY [adn|adu|mkt|lmt P|stp P] [stop P]', "
-    "'buy|sell SYM [ACCOUNT] orb [MINUTES]' (opening-range break, sized for you) "
-    "(adn = Adaptive Normal, the default; adu = Adaptive Urgent), "
+    "'buy|sell SYM [ACCOUNT] [QTY] stop P [when P] [lim P] [urgent] [mkt] [loss $]' "
+    "(no QTY: astor sizes it from the stop and the max loss; Adaptive Normal unless "
+    "told otherwise; when = a stop entry, lim = a price cap, both = stop-limit), "
+    "'buy|sell SYM [ACCOUNT] orb [MINUTES] [lim P] [loss $]' (opening-range break), "
     "'enter SYM [ACCOUNT] l|s QTY ...' (the same, direction spelled out), "
     "'stop SYM [ACCOUNT] P', 'stop SYM 1/2 P1 1/2 P2' or 'stop SYM be', "
     "'cancel SYM [ACCOUNT]', 'exit SYM [ACCOUNT] [SHARES|1/3] [adn|adu|mkt|lmt P]'."

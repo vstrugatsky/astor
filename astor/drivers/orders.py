@@ -172,25 +172,40 @@ def _fmt_prices(stops: list[Trade]) -> str:
     return ", ".join(f"{t.order.totalQuantity:g}@{t.order.auxPrice:.2f}" for t in stops)
 
 
-def entry_orders(req: EnterRequest, account: str) -> tuple[Order, Order | None]:
+def entry_orders(
+    req: EnterRequest, account: str, in_rth: bool = True
+) -> tuple[Order, Order | None]:
     """The entry, DAY, and the stop loss attached to it, GTC. IBKR holds an
     attached stop until the entry fills and cancels it with the entry.
 
-    An LMT entry works in extended hours too -- the way in before the open
-    for a short, which IBKR Desktop doesn't offer this trader. The stop
-    still triggers in regular hours only: pre-market prints are thin."""
+    A limit is a cap on the price, not a resting order: in regular hours
+    it goes as an Adaptive limit -- worked inside the spread, never past
+    the limit -- at Normal or Urgent priority. Outside them Adaptive can't
+    run, so it is a plain limit that works pre- and after-market -- the
+    way in before the open for a short, which IBKR Desktop doesn't offer
+    this trader. A stop entry with a cap is a stop-limit. The stop still
+    triggers in regular hours only: pre-market prints are thin."""
     parent = Order(
         action=req.action, totalQuantity=req.qty, tif="DAY", account=account
     )
     if req.order_type in ADAPTIVE:
         _adaptive(parent, ADAPTIVE[req.order_type])
+    elif req.order_type == "LMT":
+        parent.orderType = "LMT"
+        parent.lmtPrice = req.price
+        if in_rth:
+            parent.algoStrategy = "Adaptive"
+            parent.algoParams = [TagValue("adaptivePriority", "Urgent" if req.urgent else "Normal")]
+        else:
+            parent.outsideRth = True
+    elif req.order_type == "STP LMT":
+        parent.orderType = "STP LMT"
+        parent.auxPrice = req.price
+        parent.lmtPrice = req.cap
     else:
         parent.orderType = req.order_type
-    if req.order_type == "LMT":
-        parent.lmtPrice = req.price
-        parent.outsideRth = True
-    if req.order_type == "STP":
-        parent.auxPrice = req.price
+        if req.order_type == "STP":
+            parent.auxPrice = req.price
     if req.stop is None:
         return parent, None
     child = Order(
@@ -224,12 +239,17 @@ def exit_order(
 
 
 def describe_order(o: Order) -> str:
-    if o.algoStrategy == "Adaptive":
-        kind = f"Adaptive market ({o.algoParams[0].value})" if o.algoParams else "Adaptive market"
+    priority = f" ({o.algoParams[0].value})" if o.algoParams else ""
+    if o.algoStrategy == "Adaptive" and o.orderType == "LMT":
+        kind = f"Adaptive LMT {o.lmtPrice:.2f}{priority}"
+    elif o.algoStrategy == "Adaptive":
+        kind = f"Adaptive market{priority}"
     elif o.orderType == "LMT":
         kind = f"LMT {o.lmtPrice:.2f}"
     elif o.orderType == "STP":
         kind = f"STP {o.auxPrice:.2f}"
+    elif o.orderType == "STP LMT":
+        kind = f"STP {o.auxPrice:.2f} LMT {o.lmtPrice:.2f}"
     else:
         kind = o.orderType
     return f"{o.action} {o.totalQuantity:g} {kind} {o.tif}"

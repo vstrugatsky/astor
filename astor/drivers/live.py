@@ -465,6 +465,23 @@ def _print_order_notice(symbol: str, text: str) -> None:
     _print_alert(_order_line(symbol, Outcome(True, text)))
 
 
+def _worst_entry(req: EnterRequest, market: float | None, half: float | None) -> tuple[float | None, float]:
+    """(price, slippage a share) an entry is sized and its risk figured
+    on: the worst price the order allows. A limit or stop-limit can't
+    fill past its limit, so slippage is only the half spread at the stop.
+    A stop entry fills at the market once triggered, and Adaptive Urgent
+    and a plain market order take the spread: half again going in.
+    Adaptive Normal fills at or inside the mid (astor.core.commissions)."""
+    h = half or 0.0
+    if req.order_type == "LMT":
+        return req.price, h
+    if req.order_type == "STP LMT":
+        return req.cap, h
+    if req.order_type == "STP":
+        return req.price, 2 * h
+    return market, h if req.order_type == "ADN" else 2 * h
+
+
 def _r_text(entry: float, r: float) -> str:
     """'R=0.25 (0.8%)': R in dollars a share, and as a percent of entry."""
     return f"R={r:.2f} ({r / entry * 100:.1f}%)"
@@ -1410,9 +1427,9 @@ class LiveDriver:
         self, req: EnterRequest, contract: Contract, now: datetime | None = None
     ) -> tuple[EnterRequest, str] | str:
         """'buy SYM orb N': the opening range over the first N minutes, and
-        the entry it sets -- a buy stop a tick over the range high, the
-        stop at the range low (mirrored for a short) -- sized so a stop-out
-        costs at most max_loss with commissions and slippage. Typed before
+        the entry it sets -- a buy stop a tick over the range high (a
+        stop-limit with 'lim'), the stop at the range low, mirrored for a
+        short. Sized afterwards like any entry. Typed before
         the range ends, it waits for the end and reads the range the moment
         IBKR has its last bar, not a minute later."""
         n = req.orb_minutes
@@ -1443,21 +1460,14 @@ class LiveDriver:
         tick = 0.01 if high >= 1.0 else 0.0001
         entry = round(high + tick, 4) if long else round(low - tick, 4)
         stop = low if long else high
-        # A stop entry fills at the market: half the spread going in, and
-        # half again at the stop (astor.core.commissions).
-        half = _half_spread_of(await self._snapshot(contract)) or 0.0
-        qty = shares_for_risk(entry, stop, self.max_loss, 2 * half)
-        if qty <= 0:
-            return (
-                f"{req.symbol}'s {n}m range {low:.2f}-{high:.2f} is too wide for "
-                f"${self.max_loss:,.0f} of risk -- not even one share."
-            )
         partial = "" if any(b.start == last_start for b in bars) else " -- last minute not in yet"
         note = _bold(
             f"ORB {n}m: high {high:.2f} low {low:.2f}, range {high - low:.2f} "
             f"({(high - low) / entry * 100:.1f}%){partial}"
         )
-        return dataclasses.replace(req, qty=qty, order_type="STP", price=entry, stop=stop), note
+        # Sized like any entry, from the stop -- prepare_entry's next step
+        order_type = "STP LMT" if req.cap is not None else "STP"
+        return dataclasses.replace(req, order_type=order_type, price=entry, stop=stop), note
 
     async def _range_bars(self, contract: Contract, start: datetime, end: datetime) -> list[BarEvent]:
         """Today's completed 1-min bars from `start` to `end`, straight from
@@ -1509,15 +1519,24 @@ class LiveDriver:
         # and fill at the market anyway: send it as the market order it is
         # -- Adaptive, or outside regular hours the limit below -- and say
         # so, rather than refuse it and make the trader retype.
-        if req.order_type == "STP" and market is not None and req.price is not None:
+        if req.order_type in ("STP", "STP LMT") and market is not None and req.price is not None:
             long = req.direction == "long"
             if (market >= req.price) if long else (market <= req.price):
                 side = "buy" if long else "sell"
-                notes.append(_bold(
-                    f"market {market:.2f} is already through the {side} stop {req.price:.2f}"
-                    f" -- sent as {'Adaptive' if in_rth else 'a limit'} instead"
-                ))
-                req = dataclasses.replace(req, order_type="ADN", price=None, type_defaulted=True)
+                if req.order_type == "STP LMT":
+                    # The cap still holds: a limit at it, which in regular
+                    # hours goes Adaptive
+                    notes.append(_bold(
+                        f"market {market:.2f} is already through the {side} stop {req.price:.2f}"
+                        f" -- sent as a limit at {req.cap:.2f} instead"
+                    ))
+                    req = dataclasses.replace(req, order_type="LMT", price=req.cap, cap=None)
+                else:
+                    notes.append(_bold(
+                        f"market {market:.2f} is already through the {side} stop {req.price:.2f}"
+                        f" -- sent as {'Adaptive' if in_rth else 'a limit'} instead"
+                    ))
+                    req = dataclasses.replace(req, order_type="ADN", price=None, type_defaulted=True)
         # No type typed, outside regular hours: a limit at the far side of
         # the quote -- the price that fills now, without chasing it.
         if req.type_defaulted and not in_rth:
@@ -1531,8 +1550,25 @@ class LiveDriver:
         problems = entry_problems(req, market, held)
         if problems:
             return "NOT sent: " + "; ".join(problems)
+        # No share count: as many as the max loss covers, sized on the
+        # worst price the order allows (see _worst_entry).
+        if not req.qty:
+            loss = req.max_loss or self.max_loss
+            ref, slip = _worst_entry(req, market, half)
+            if ref is None or req.stop is None:
+                return "No market price to size from -- give a share count, or a limit."
+            qty = shares_for_risk(ref, req.stop, loss, slip)
+            if qty <= 0:
+                return (
+                    f"stop {req.stop:.2f} is too far from {ref:.2f} for ${loss:,.0f} of risk"
+                    " -- not even one share."
+                )
+            req = dataclasses.replace(req, qty=qty)
+            notes.append(f"sized for ${loss:,.0f}")
+        if req.order_type == "LMT" and req.urgent and not in_rth:
+            notes.append("urgent is for regular hours -- a plain limit now")
 
-        parent, child = entry_orders(req, account)
+        parent, child = entry_orders(req, account, in_rth)
         if market is None:
             notes.append("no market price -- side checks skipped")
         if half is None:
@@ -1566,8 +1602,7 @@ class LiveDriver:
         # market order (STP, MKT) or Adaptive Urgent, which takes the spread
         # to get done. Adaptive Normal fills at or inside the mid, and a
         # limit can't fill past its price (astor.core.commissions).
-        slip = (half or 0.0) * (2 if req.order_type in ("STP", "MKT", "ADU") else 1)
-        ref = req.price or market
+        ref, slip = _worst_entry(req, market, half)
         size = f", {_bold(f'~${req.qty * ref:,.0f}')}" if ref else ""
         stop = (
             f", stop {child.auxPrice:.2f} {_r_text(ref, abs(ref - child.auxPrice))}"
@@ -1575,11 +1610,16 @@ class LiveDriver:
             if child is not None and ref else
             f", stop {child.auxPrice:.2f}" if child is not None else f", {_accent(_bold('NO stop'), _ANSI_RED)}"
         )
+        adaptive_lmt = req.order_type == "LMT" and parent.algoStrategy == "Adaptive"
         kind = {
             "ADN": "Adaptive",
             "ADU": _bold("Adaptive Urgent"),
-            "LMT": f"LMT {parent.lmtPrice:.2f}",
+            "LMT": (
+                (_bold("Adaptive Urgent") if req.urgent else "Adaptive") + f" LMT {parent.lmtPrice:.2f}"
+                if adaptive_lmt else f"LMT {parent.lmtPrice:.2f}"
+            ),
             "STP": f"STP {parent.auxPrice:.2f}",
+            "STP LMT": f"STP {parent.auxPrice:.2f} LMT {parent.lmtPrice:.2f}",
         }.get(req.order_type, req.order_type)
         mkt = f"  [market {market:.2f}]" if market is not None else ""
         summary = (

@@ -87,16 +87,24 @@ class EnterRequest:
     symbol: str
     account: str | None  # as typed: 'ira', 'reg', an ID, or None
     direction: str  # 'long' | 'short'
-    qty: int
-    order_type: str  # ADN | ADU | MKT | LMT | STP
+    qty: int  # 0: astor works it out from the stop and the max loss
+    order_type: str  # ADN | ADU | MKT | LMT | STP | STP LMT
+    # STP and STP LMT: the trigger. LMT: the limit -- a cap on the price,
+    # worked by Adaptive in regular hours.
     price: float | None
     stop: float | None
     # No type typed: ADN in regular hours; outside them live makes it an
     # LMT at the ask (long) or bid (short).
     type_defaulted: bool = False
     # 'buy SYM orb [N]': an opening-range break over the first N minutes --
-    # qty, entry and stop are left for live to work out from the range.
+    # entry and stop are left for live to work out from the range.
     orb_minutes: int | None = None
+    # STP LMT: the cap on the fill once the stop triggers
+    cap: float | None = None
+    # an Adaptive limit at Urgent priority
+    urgent: bool = False
+    # 'loss 250': the max loss this entry is sized to, in place of live's
+    max_loss: float | None = None
 
     @property
     def action(self) -> str:
@@ -104,22 +112,34 @@ class EnterRequest:
 
 
 ENTER_USAGE = (
-    "enter SYM [ACCOUNT] l|s QTY [adn|adu|mkt|lmt PRICE|stp PRICE] [stop PRICE]"
-    "  e.g. 'enter SPCX short 20 stp 170.10 stop 172.01'; the type defaults to adn"
+    "enter SYM [ACCOUNT] l|s [QTY] ... -- the same options as buy/sell"
+    "  e.g. 'enter SPCX short 20 stp 170.10 stop 172.01'"
 )
 BUY_SELL_USAGE = (
-    "buy|sell SYM [ACCOUNT] QTY [adn|adu|mkt|lmt PRICE|stp PRICE] [stop PRICE],"
-    " or buy|sell SYM [ACCOUNT] orb [MINUTES]"
-    "  e.g. 'buy NVDA 100 stop 35.99' -- Adaptive Normal unless a type is given"
+    "buy|sell SYM [ACCOUNT] [QTY] [stop P] [when|stp P] [limit|lim|lmt P] [urgent|urg] [mkt]"
+    " [loss|maxloss $], or buy|sell SYM [ACCOUNT] orb [MINUTES] [lim P] [loss $]"
+    "  e.g. 'buy NVDA stop 35.99' -- astor sizes it; Adaptive Normal unless told otherwise"
 )
 ORB_MINUTES = 1
 
+# Keyword -> what it sets. Synonyms side by side: 'when' reads apart from
+# the protective 'stop' better than 'stp' does.
+_TRIGGER = ("when", "stp")
+_CAP = ("limit", "lim", "lmt")
+_URGENT = ("urgent", "urg", "adu")
+_LOSS = ("loss", "maxloss")
 
 
 def parse_enter(rest: str, direction: str | None = None) -> EnterRequest:
-    """`enter SYM [ACCOUNT] l|s QTY ...`, or with `direction` given --
-    `buy`/`sell`, the same order with the direction in the verb -- without
-    the l|s. The order type is optional: none means Adaptive Normal."""
+    """`buy|sell SYM [ACCOUNT] [QTY] OPTIONS`, or `enter SYM [ACCOUNT]
+    l|s ...` with the direction spelled out. With no share count astor
+    sizes the entry from the protective stop and the max loss.
+
+    OPTIONS, in any order: `stop P` (the protective stop), `when|stp P`
+    (a stop entry triggering at P), `limit|lim|lmt P` (a cap on the
+    entry price), `urgent|urg` (Adaptive Urgent), `mkt` (a plain market
+    order), `adn` (Adaptive Normal, the default), `loss|maxloss $`, and
+    `orb [MINUTES]`. A trigger and a cap together make a stop-limit."""
     usage = ENTER_USAGE if direction is None else BUY_SELL_USAGE
     tokens = rest.split()
     if not tokens:
@@ -127,7 +147,7 @@ def parse_enter(rest: str, direction: str | None = None) -> EnterRequest:
     symbol = _symbol(tokens[0])
     account, tokens = _split_account(tokens[1:])
     if direction is None:
-        if len(tokens) < 2:
+        if not tokens:
             raise CommandError(usage)
         direction = DIRECTIONS.get(tokens[0].lower())
         if direction is None:
@@ -135,61 +155,96 @@ def parse_enter(rest: str, direction: str | None = None) -> EnterRequest:
         tokens = tokens[1:]
     if not tokens:
         raise CommandError(usage)
-    if tokens[0].lower() == "orb":
-        return _parse_orb(symbol, account, direction, tokens[1:])
-    try:
-        qty = int(tokens[0])
-    except ValueError:
-        raise CommandError(f"share count '{tokens[0]}' is not a whole number") from None
-    if qty <= 0:
-        raise CommandError("share count must be positive")
-    tokens = tokens[1:]
-    order_type = ENTRY_TYPES.get(tokens[0].lower()) if tokens else None
-    if order_type is None:
-        # No type given: Adaptive Normal. Anything else here is a mistyped type.
-        if tokens and tokens[0].lower() != "stop":
-            raise CommandError(f"'{tokens[0]}' is not an order type (adn/adu/mkt/lmt/stp) or 'stop PRICE'")
-        order_type, defaulted = "ADN", True
-    else:
-        tokens = tokens[1:]
-        defaulted = False
 
-    price = None
-    if order_type in PRICED:
-        if not tokens or tokens[0].lower() == "stop":
-            raise CommandError(f"{order_type} needs a price: '... {order_type.lower()} PRICE'")
-        price = _price(tokens[0], f"{order_type} price")
-        tokens = tokens[1:]
-
-    stop = None
-    if tokens:
-        if tokens[0].lower() != "stop" or len(tokens) != 2:
-            raise CommandError(
-                f"unexpected '{' '.join(tokens)}'"
-                + (" -- MKT/ADN/ADU take no price" if order_type not in PRICED else "")
-                + "; the stop loss is 'stop PRICE'"
-            )
-        stop = _price(tokens[1], "stop")
-    return EnterRequest(symbol, account, direction, qty, order_type, price, stop, defaulted)
-
-
-def _parse_orb(symbol: str, account: str | None, direction: str, tokens: list[str]) -> EnterRequest:
-    """'orb [MINUTES]': the range length, 1 minute unless given. Nothing
-    else -- the range sets the entry, the stop and the size."""
-    minutes = ORB_MINUTES
-    if tokens:
+    qty: int | None = None
+    if tokens[0][0].isdigit():
         try:
-            minutes = int(tokens[0])
+            qty = int(tokens[0])
         except ValueError:
-            raise CommandError(f"orb takes the range in whole minutes, not '{tokens[0]}'") from None
-        if not 1 <= minutes <= 60:
-            raise CommandError("the opening range is 1 to 60 minutes")
+            raise CommandError(f"share count '{tokens[0]}' is not a whole number") from None
+        if qty <= 0:
+            raise CommandError("share count must be positive")
         tokens = tokens[1:]
-    if tokens:
-        raise CommandError(
-            f"unexpected '{' '.join(tokens)}' -- orb works out the size, entry and stop itself"
-        )
-    return EnterRequest(symbol, account, direction, 0, "STP", None, None, orb_minutes=minutes)
+
+    seen: dict[str, object] = {}
+
+    def once(key: str, value: object, tok: str) -> None:
+        if key in seen:
+            raise CommandError(f"'{tok}' given twice")
+        seen[key] = value
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i].lower()
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if tok in ("stop",) + _TRIGGER + _CAP + _LOSS:
+            if nxt is None:
+                raise CommandError(f"'{tok}' needs a value: '{tok} PRICE'")
+            if tok in _LOSS:
+                once("loss", _dollars(nxt), tok)
+            else:
+                key = "stop" if tok == "stop" else "trigger" if tok in _TRIGGER else "cap"
+                once(key, _price(nxt, {"stop": "stop", "trigger": "stop entry", "cap": "limit"}[key]), tok)
+            i += 2
+            continue
+        if tok in _URGENT:
+            once("urgent", True, tok)
+        elif tok in ("adn", "alg"):
+            once("adn", True, tok)
+        elif tok == "mkt":
+            once("mkt", True, tok)
+        elif tok == "orb":
+            minutes = ORB_MINUTES
+            if nxt is not None and nxt.isdigit():
+                minutes = int(nxt)
+                if not 1 <= minutes <= 60:
+                    raise CommandError("the opening range is 1 to 60 minutes")
+                i += 1
+            once("orb", minutes, tok)
+        else:
+            raise CommandError(f"'{tokens[i]}' isn't one of the options; {usage}")
+        i += 1
+
+    stop, trigger, cap = seen.get("stop"), seen.get("trigger"), seen.get("cap")
+    urgent, mkt, orb = bool(seen.get("urgent")), bool(seen.get("mkt")), seen.get("orb")
+    loss = seen.get("loss")
+    if qty is not None and loss is not None:
+        raise CommandError("a share count and a loss both set the size -- give one")
+    if orb is not None and (qty is not None or stop is not None or trigger is not None):
+        raise CommandError("orb sets the size, entry and stop itself -- only lim and loss go with it")
+    if mkt and (cap is not None or trigger is not None or urgent):
+        raise CommandError("mkt is a plain market order -- no limit, stop entry or urgency")
+    if urgent and trigger is not None:
+        raise CommandError("a stop entry fills at the market once triggered -- urgent is for Adaptive orders")
+    if urgent and orb is not None:
+        raise CommandError("an ORB entry is a stop entry -- urgent is for Adaptive orders")
+    if qty is None and orb is None and stop is None:
+        raise CommandError("give the protective stop ('stop PRICE') for astor to size from, or a share count")
+
+    if orb is not None or trigger is not None:
+        order_type = "STP LMT" if cap is not None else "STP"
+        price, cap_ = (trigger, cap) if cap is not None else (trigger, None)
+    elif cap is not None:
+        order_type, price, cap_ = "LMT", cap, None
+    elif mkt:
+        order_type, price, cap_ = "MKT", None, None
+    else:
+        order_type, price, cap_ = ("ADU" if urgent else "ADN"), None, None
+    defaulted = not (trigger is not None or cap is not None or mkt or urgent or seen.get("adn") or orb is not None)
+    return EnterRequest(
+        symbol, account, direction, qty or 0, order_type, price, stop, defaulted,
+        orb_minutes=orb, cap=cap_, urgent=urgent, max_loss=loss,
+    )
+
+
+def _dollars(tok: str) -> float:
+    try:
+        v = float(tok.lstrip("$").replace(",", ""))
+    except ValueError:
+        raise CommandError(f"loss '{tok}' is not a dollar amount") from None
+    if v <= 0:
+        raise CommandError("the loss must be above $0")
+    return v
 
 
 @dataclass(frozen=True)
@@ -344,7 +399,13 @@ def entry_problems(req: EnterRequest, market: float | None, held: float) -> list
             f"already {'long' if held > 0 else 'short'} {abs(held):g} in this account"
             f" -- 'exit {req.symbol}' first"
         )
-    if req.order_type == "STP" and market is not None:
+    if req.order_type == "STP LMT" and req.cap is not None and req.price is not None:
+        if (req.cap < req.price) if long else (req.cap > req.price):
+            problems.append(
+                f"the limit {req.cap:.2f} is {'below' if long else 'above'} the stop entry "
+                f"{req.price:.2f} -- it could never fill"
+            )
+    if req.order_type in ("STP", "STP LMT") and market is not None and req.price is not None:
         if long and req.price <= market:
             problems.append(
                 f"a buy stop at {req.price:.2f} is not above the market ({market:.2f})"
@@ -355,7 +416,7 @@ def entry_problems(req: EnterRequest, market: float | None, held: float) -> list
                 f"a sell stop at {req.price:.2f} is not below the market ({market:.2f})"
                 " -- it would trigger at once"
             )
-    ref = req.price if req.order_type in PRICED else market
+    ref = req.price if req.price is not None else market
     if req.stop is not None and ref is not None:
         if long and req.stop >= ref:
             problems.append(f"stop {req.stop:.2f} is not below the entry ({ref:.2f})")

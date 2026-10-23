@@ -189,8 +189,10 @@ def test_adaptive_priorities() -> None:
 def test_lmt_entry_works_outside_regular_hours() -> None:
     from astor.drivers.orders import entry_orders
 
-    parent, child = entry_orders(parse_enter("SPCX 20 lmt 170.10 stop 172.01", "short"), "U7654329")
-    check("LMT entry works pre-market", parent.outsideRth, True)
+    parent, child = entry_orders(parse_enter("SPCX 20 lmt 170.10 stop 172.01", "short"), "U7654329", in_rth=False)
+    check("LMT entry works pre-market", (parent.outsideRth, parent.algoStrategy), (True, ""))
+    rth, _ = entry_orders(parse_enter("SPCX 20 lmt 170.10 stop 172.01", "short"), "U7654329")
+    check("in regular hours, an Adaptive limit", (rth.orderType, rth.algoStrategy, rth.lmtPrice), ("LMT", "Adaptive", 170.10))
     check("its stop waits for regular hours", child.outsideRth, False)
     parent, _ = entry_orders(parse_enter("SPCX 20 stp 170.10", "short"), "U7654329")
     check("STP entry waits for the open", parent.outsideRth, False)
@@ -212,6 +214,7 @@ def _entry_driver(market: float, bid: float, ask: float, in_rth: bool = True):
     d = LiveDriver.__new__(LiveDriver)
     d.ib = NS(managedAccounts=lambda: ["U1234566", "U7654329"], positions=lambda *a: [])
     d.shortable = ShortableList()
+    d.max_loss = 100.0
     quote = NS(bid=bid, ask=ask, last=market, marketPrice=lambda: market, midpoint=lambda: (bid + ask) / 2)
 
     async def contract(sym):
@@ -376,18 +379,84 @@ def test_orb_sizes_from_the_opening_range() -> None:
     after = open_dt + timedelta(minutes=2, seconds=2)
     req, note = asyncio.run(d._orb(parse_enter("CLF orb 2", "long"), None, now=after))
     check("long: buy stop a tick over the high, stop at the low", (req.order_type, req.price, req.stop), ("STP", 13.73, 13.26))
-    # 0.47 a share + 0.02 of slippage (half the 2c spread, in and out) + commissions
-    from astor.core.commissions import trade_risk
-
-    check("the most shares $100 covers",
-          (trade_risk(req.qty, 13.73, 13.26, 0.02) <= 100, trade_risk(req.qty + 1, 13.73, 13.26, 0.02) > 100),
-          (True, True))
-    check("about 199", req.qty, 199)
     check("says the range", "ORB 2m: high 13.72 low 13.26" in note, True)
     req, _ = asyncio.run(d._orb(parse_enter("CLF orb 2", "short"), None, now=after))
     check("short mirrors it", (req.price, req.stop), (13.25, 13.72))
-    check("another day refused", isinstance(asyncio.run(d._orb(parse_enter("CLF orb", "long"), None,
+    req, _ = asyncio.run(d._orb(parse_enter("CLF orb 2 lim 13.80", "long"), None, now=after))
+    check("with lim: a stop-limit", (req.order_type, req.price, req.cap), ("STP LMT", 13.73, 13.80))
+
+    # Through the whole entry: sized from the stop, like any other
+    orig = d._orb
+    d._orb = lambda r, c: orig(r, c, now=after)
+    t = asyncio.run(d.prepare_entry(parse_enter("CLF orb 2", "long")))
+    from astor.core.commissions import trade_risk
+
+    # 0.47 a share + 0.02 of slippage (half the 2c spread, in and out) + commissions
+    check("the most shares $100 covers",
+          (trade_risk(t.req.qty, 13.73, 13.26, 0.02) <= 100, trade_risk(t.req.qty + 1, 13.73, 13.26, 0.02) > 100),
+          (True, True))
+    t = asyncio.run(d.prepare_entry(parse_enter("CLF orb 2 loss 50", "long")))
+    check("loss 50: 97 (the $2 of commissions don't halve)", t.req.qty, 97)
+    check("another day refused", isinstance(asyncio.run(orig(parse_enter("CLF orb", "long"), None,
           now=after + timedelta(days=1))), str), True)
+
+
+def test_sized_entry_grammar() -> None:
+    long = lambda t: parse_enter(t, "long")  # noqa: E731
+    r = long("XYZ stop 9.50")
+    check("stop only: astor sizes, Adaptive Normal",
+          (r.qty, r.order_type, r.stop, r.type_defaulted), (0, "ADN", 9.50, True))
+    check("loss", long("XYZ stop 9.5 loss 250").max_loss, 250.0)
+    check("maxloss, $", long("XYZ stop 9.5 maxloss $250").max_loss, 250.0)
+    r = long("XYZ stop 9.5 when 10.10")
+    check("when: a stop entry", (r.order_type, r.price), ("STP", 10.10))
+    check("stp too", long("XYZ stop 9.5 stp 10.10").order_type, "STP")
+    for word in ("limit", "lim", "lmt"):
+        r = long(f"XYZ stop 9.5 {word} 10.05")
+        check(f"{word}: a cap", (r.order_type, r.price), ("LMT", 10.05))
+    r = long("XYZ stop 9.5 when 10.10 lim 10.20")
+    check("when + lim: stop-limit", (r.order_type, r.price, r.cap), ("STP LMT", 10.10, 10.20))
+    check("urgent", long("XYZ stop 9.5 urgent").order_type, "ADU")
+    r = long("XYZ stop 9.5 lim 10.05 urg")
+    check("urgent limit", (r.order_type, r.urgent), ("LMT", True))
+    r = long("XYZ orb 1 lim 10.20 loss 50")
+    check("orb with lim and loss", (r.orb_minutes, r.order_type, r.cap, r.max_loss), (1, "STP LMT", 10.20, 50.0))
+    check("old form still", parse_enter("SPCX short 20 stp 170.10 stop 172.01").order_type, "STP")
+    check("a count without a stop still goes", long("XYZ 100").qty, 100)
+    for bad in ("XYZ", "XYZ 100 stop 9.5 loss 250", "XYZ stop 9.5 when 10.1 urgent",
+                "XYZ stop 9.5 mkt lim 10", "XYZ orb stop 9.5", "XYZ stop 9.5 stop 9.4", "XYZ stop 9.5 bogus"):
+        raises(bad, parse_enter, bad, "long")
+
+
+def test_sizing_on_the_worst_price_the_order_allows() -> None:
+    import asyncio
+
+    from astor.core.commissions import shares_for_risk
+
+    d = _entry_driver(10.00, 9.99, 10.01)  # half spread 0.01
+    for text, ref, slip, kind in (
+        ("XYZ stop 9.50", 10.00, 0.01, "Adaptive"),                         # market, stop-side slip
+        ("XYZ stop 9.50 lim 10.05", 10.05, 0.01, "Adaptive LMT 10.05"),     # the cap
+        ("XYZ stop 9.50 urg", 10.00, 0.02, "Adaptive Urgent"),              # takes the spread
+        ("XYZ stop 9.50 when 10.10", 10.10, 0.02, "STP 10.10"),             # fills at market
+        ("XYZ stop 9.50 when 10.10 lim 10.20", 10.20, 0.01, "STP 10.10 LMT 10.20"),
+    ):
+        t = asyncio.run(d.prepare_entry(parse_enter(text, "long")))
+        check(f"{text}: shares", t.req.qty, shares_for_risk(ref, 9.50, 100.0, slip))
+        check(f"{text}: says so", kind in t.summary and "sized for $100" in t.summary, True)
+    t = asyncio.run(d.prepare_entry(parse_enter("XYZ stop 9.50 when 10.10 lim 10.20 loss 300", "long")))
+    check("loss 300", t.req.qty, shares_for_risk(10.20, 9.50, 300.0, 0.01))
+    t = asyncio.run(d.prepare_entry(parse_enter("XYZ stop 9.50 when 10.10 lim 10.20", "long")))
+    check("stop-limit order", (t.parent.orderType, t.parent.auxPrice, t.parent.lmtPrice), ("STP LMT", 10.10, 10.20))
+
+    through = _entry_driver(10.15, 10.14, 10.16)
+    t = asyncio.run(through.prepare_entry(parse_enter("XYZ stop 9.50 when 10.10 lim 10.20", "long")))
+    check("through the trigger: a limit at the cap",
+          (t.req.order_type, t.parent.lmtPrice, t.parent.algoStrategy), ("LMT", 10.20, "Adaptive"))
+    check("stop on the wrong side refused",
+          asyncio.run(d.prepare_entry(parse_enter("XYZ stop 10.50", "long"))).startswith("NOT sent"), True)
+    check("too wide for the loss",
+          "too far" in asyncio.run(d.prepare_entry(parse_enter("XYZ stop 1.00 loss 5", "long"))), True)
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
