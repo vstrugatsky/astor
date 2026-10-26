@@ -925,7 +925,7 @@ class _ReversalBase(Setup):
                 what = f"anchor moved to {self._anchor:.2f} (extreme {self._extreme:.2f})"
             _trace(trace, bar, f"{what} -- leg={leg_size_now:.2f}")
             if push_active:
-                self._maybe_flag_capitulation(bar, levels, indicators, curve)
+                self._maybe_flag_capitulation(bar, levels, indicators, curve, trace)
             # The extreme and the reversal can be one bar: price runs the
             # leg's way in the first seconds and comes back hard in the
             # last ones. Such a bar -- a fresh extreme on the same anchor,
@@ -968,7 +968,7 @@ class _ReversalBase(Setup):
         # announcing once per push. A same-bar reversal already refreshed
         # it above.
         if not same_bar_reversal:
-            self._maybe_flag_capitulation(bar, levels, indicators, curve)
+            self._maybe_flag_capitulation(bar, levels, indicators, curve, trace)
 
         if retrace_pct > self.max_retrace_pct:
             self._retrace_dead = True
@@ -1365,6 +1365,7 @@ class _ReversalBase(Setup):
         levels: DailyLevels,
         indicators: SessionIndicators,
         curve: VolumeCurve | None,
+        trace: list[dict] | None = None,
     ) -> None:
         """Same leg-quality bar the eventual trigger requires -- size,
         duration, volume, 9EMA extension -- checked while the leg is still
@@ -1456,6 +1457,13 @@ class _ReversalBase(Setup):
                     # Kept for the pace test either way: a later flush is
                     # timed from every quiet minute since the last alert.
                     self._marks_since_alert.append((bar.end, self._extreme))
+                    if round(self._extreme, 2) != round(prev_stop, 2):
+                        _trace(
+                            trace, bar,
+                            f"alert held back: stop {self._extreme:.2f} moved {moved:.2f} of "
+                            f"{self.realert_stop_adr * adr:.2f} ({self.realert_stop_adr:g}x ADR) "
+                            f"since the {prev_stop:.2f} alert",
+                        )
                     return
                 if self.realert_pace > 0:
                     # The fastest stretch since the last alert, ending at
@@ -1471,6 +1479,12 @@ class _ReversalBase(Setup):
                     )
                     if rate < self.realert_pace * leg_rate:
                         self._marks_since_alert.append((bar.end, self._extreme))
+                        _trace(
+                            trace, bar,
+                            f"alert held back: stop {self._extreme:.2f} reached at {rate:.3f}/min, "
+                            f"slower than the leg's {leg_rate:.3f}/min"
+                            + (f" x{self.realert_pace:g}" if self.realert_pace != 1 else ""),
+                        )
                         return
             else:
                 stop_moved = round(self._extreme, 2) != round(prev_stop, 2)

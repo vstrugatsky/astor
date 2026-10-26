@@ -205,6 +205,19 @@ def test_pace_throttle_quiets_a_slowing_leg() -> None:
     check("the flush speaks up", paced[-1].bar_start, OPEN + timedelta(minutes=10))
     check("climax recorded on the alert", paced[-1].climax is not None, True)
 
+    # explain says what was held back, and why
+    trace: list[dict] = []
+    s = ReversalLong()
+    from astor.core.indicators import SessionIndicators
+
+    ind = SessionIndicators("REV")
+    for bar in fall + creep:
+        ind.update(bar)
+        s.on_bar(bar, levels, ind, _generous_curve(), trace)
+        s.pop_alert()
+    held = [e["text"] for e in trace if "alert held back" in e["text"]]
+    check("held-back lines in the trace", bool(held) and "of 0.40 (0.1x ADR)" in held[0], True)
+
 
 def test_run_replay_end_to_end() -> None:
     sc = _rev_scanner(ReversalLong)
