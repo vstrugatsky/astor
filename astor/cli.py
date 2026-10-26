@@ -122,6 +122,14 @@ def _setup_kwargs(args: argparse.Namespace) -> dict:
         "min_accel_price": args.min_accel_price,
         "min_accel_vol": args.min_accel_vol,
         "accel_window": args.accel_window,
+        "climax_bars": getattr(args, "climax_bars", 0),
+        "climax_ext_adr": getattr(args, "climax_ext_adr", 0.125),
+        "climax_window_minutes": getattr(args, "climax_window", 30.0),
+        "climax_mode": getattr(args, "climax_mode", "each"),
+        "climax_fast_minutes": getattr(args, "climax_fast", 0.0),
+        "climax_skip_open": getattr(args, "climax_skip_open", False),
+        "realert_stop_adr": getattr(args, "realert_stop_adr", 0.1),
+        "realert_pace": getattr(args, "realert_pace", 1.0),
         "max_loss_dollars": args.max_loss,
     }
     avt_kwargs = {
@@ -333,19 +341,19 @@ def _alert_timeline(replay: list, received: list[dict]) -> list[dict]:
     by_bar = {r["bar_start"]: r for r in received}
     out = []
 
-    def ticket(target, stop, shares, rr, pace) -> str:
+    def ticket(target, stop, shares, rr, pace, climax=None) -> str:
         t = f"{target:.2f}" if target is not None else "n/a"
         # Capitulation's R:R is 9.0 by construction; its pace is the
         # number that varies, as on the live alert line.
         if pace is not None:
-            lead = f" pace {pace_label(pace)}"
+            lead = f" pace {pace_label(pace)}" + (f" climax {climax}" if climax is not None else "")
         else:
             lead = f" R:R {rr:.1f}" if rr is not None else ""
         sh = f" {shares} sh" if shares is not None else ""
         return f"target {t} stop {stop:.2f}{sh}{lead}"
 
     for a in replay:
-        line = f"ALERT {ticket(a.target, a.stop, a.shares, a.rr, getattr(a, 'pace_adr', None))}"
+        line = f"ALERT {ticket(a.target, a.stop, a.shares, a.rr, getattr(a, 'pace_adr', None), getattr(a, 'climax', None))}"
         got = by_bar.pop(a.bar_start, None)
         if got is not None:
             line += f"  <- RECEIVED {got['detection_ts']:%H:%M:%S}"
@@ -356,7 +364,7 @@ def _alert_timeline(replay: list, received: list[dict]) -> list[dict]:
     for r in by_bar.values():
         x = r["extras"]
         line = (
-            f"ALERT {ticket(x.get('target'), x.get('stop'), x.get('level_stop_shares'), x.get('rr'), x.get('pace_adr'))}"
+            f"ALERT {ticket(x.get('target'), x.get('stop'), x.get('level_stop_shares'), x.get('rr'), x.get('pace_adr'), x.get('climax'))}"
             f"  <- RECEIVED {r['detection_ts']:%H:%M:%S} (live only: the replay does not "
             "reproduce it -- likely IBKR's revised volume)"
         )
@@ -1624,6 +1632,17 @@ def build_parser() -> argparse.ArgumentParser:
         "N bars' net close-to-close speed (accel_price) and average volume "
         "(accel_vol) against the rest of the leg's.",
     )
+    r.add_argument("--climax-bars", type=int, default=0,
+        help="REV climax gate: bars of the push extended past the 9EMA with an outsized move and volume (0 = off)")
+    r.add_argument("--climax-ext-adr", type=float, default=0.125)
+    r.add_argument("--climax-window", type=float, default=30.0, help="minutes")
+    r.add_argument("--climax-mode", choices=["each", "or", "avg", "rel", "ext"], default="each")
+    r.add_argument("--climax-fast", type=float, default=0.0, help="legs this many minutes or faster skip the climax gate")
+    r.add_argument("--climax-skip-open", action="store_true", help="leave the 09:30 bar out of the leg's averages")
+    r.add_argument("--realert-pace", type=float, default=1.0,
+        help="REV: repeat a capitulation alert only if the move since the last one beats the leg's pace by this factor (0 = every changed ticket)")
+    r.add_argument("--realert-stop-adr", type=float, default=0.1,
+        help="REV: repeat a capitulation alert only after the stop moves this many ADR (0 = off)")
     r.add_argument(
         "--min-retrace-pct",
         type=float,
@@ -1750,6 +1769,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="Bars used for the accel_price/accel_vol diagnostics.",
     )
+    lv.add_argument("--climax-bars", type=int, default=0,
+        help="REV climax gate: bars of the push extended past the 9EMA with an outsized move and volume (0 = off)")
+    lv.add_argument("--climax-ext-adr", type=float, default=0.125)
+    lv.add_argument("--climax-window", type=float, default=30.0, help="minutes")
+    lv.add_argument("--climax-mode", choices=["each", "or", "avg", "rel", "ext"], default="each")
+    lv.add_argument("--climax-fast", type=float, default=0.0, help="legs this many minutes or faster skip the climax gate")
+    lv.add_argument("--climax-skip-open", action="store_true", help="leave the 09:30 bar out of the leg's averages")
+    lv.add_argument("--realert-pace", type=float, default=1.0,
+        help="REV: repeat a capitulation alert only if the move since the last one beats the leg's pace by this factor (0 = every changed ticket)")
+    lv.add_argument("--realert-stop-adr", type=float, default=0.1,
+        help="REV: repeat a capitulation alert only after the stop moves this many ADR (0 = off)")
     lv.add_argument(
         "--min-retrace-pct",
         type=float,
@@ -1847,6 +1877,17 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--min-accel-price", type=float, default=0.0)  # off, as in live
     ex.add_argument("--min-accel-vol", type=float, default=0.0)
     ex.add_argument("--accel-window", type=int, default=3)
+    ex.add_argument("--climax-bars", type=int, default=0,
+        help="REV climax gate: bars of the push extended past the 9EMA with an outsized move and volume (0 = off)")
+    ex.add_argument("--climax-ext-adr", type=float, default=0.125)
+    ex.add_argument("--climax-window", type=float, default=30.0, help="minutes")
+    ex.add_argument("--climax-mode", choices=["each", "or", "avg", "rel", "ext"], default="each")
+    ex.add_argument("--climax-fast", type=float, default=0.0, help="legs this many minutes or faster skip the climax gate")
+    ex.add_argument("--climax-skip-open", action="store_true", help="leave the 09:30 bar out of the leg's averages")
+    ex.add_argument("--realert-pace", type=float, default=1.0,
+        help="REV: repeat a capitulation alert only if the move since the last one beats the leg's pace by this factor (0 = every changed ticket)")
+    ex.add_argument("--realert-stop-adr", type=float, default=0.1,
+        help="REV: repeat a capitulation alert only after the stop moves this many ADR (0 = off)")
     ex.add_argument("--min-retrace-pct", type=float, default=10.0)
     ex.add_argument("--max-retrace-pct", type=float, default=50.0)
     ex.add_argument("--min-confirm-minutes", type=float, default=0.0)

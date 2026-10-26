@@ -32,7 +32,7 @@ real, we are simply still waiting for a fire worth reporting.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import ClassVar
 
 from astor.core.commissions import shares_for_risk
@@ -108,6 +108,8 @@ class _FilterReadout:
     min_accel_price: float
     accel_vol: float | None
     min_accel_vol: float
+    climax_bars: int | None
+    min_climax_bars: int
     # No threshold: recorded and shown, not filtered on, until there is
     # enough of it to know what a good value looks like.
     pace_adr1: float | None
@@ -131,6 +133,7 @@ class _FilterReadout:
                 f"ema9_ext {v(self.ema9_extension_adr, 4)}/{self.min_ema9_extension_adr:g}",
                 f"accel_price {v(self.accel_price, 4)}/{self.min_accel_price:g}",
                 f"accel_vol {v(self.accel_vol)}/{self.min_accel_vol:g}",
+                f"climax {self.climax_bars if self.climax_bars is not None else 'n/a'}/{self.min_climax_bars}",
                 # Against ADR(14), as a multiple of an average day's pace
                 # (pace_label). No R:R: it is 9.0 by construction here
                 # (see the live alert line).
@@ -285,6 +288,19 @@ def pace_label(pace_adr: float | None) -> str:
     return f"{pace_adr:.1f}x" if pace_adr < 10 else f"{pace_adr:.0f}x"
 
 
+def _minute_volume(curve: VolumeCurve | None, start: datetime) -> float | None:
+    """The usual volume of the 1-min bar starting at `start`, from the
+    curve's average cumulative volume: this minute's less the last's."""
+    if curve is None:
+        return None
+    t = start.timetz().replace(tzinfo=None)
+    now = curve.avg_cum_volume_at(t)
+    if not now:
+        return None
+    prev = curve.avg_cum_volume_at((start - timedelta(minutes=1)).timetz().replace(tzinfo=None)) or 0.0
+    return now - prev if now > prev else None
+
+
 def _reward_to_risk(entry: float, stop: float, exit_price: float) -> float | None:
     """How many times the risk the move is worth, if it goes the way the
     setup says.
@@ -433,6 +449,34 @@ class _ReversalBase(Setup):
         min_accel_price: float = 0.0,
         min_accel_vol: float = 0.0,
         accel_window: int = 3,
+        # The climax gate (0 = off): at least climax_bars bars of the push
+        # closed climax_ext_adr x ADR past the 9EMA with a bigger move and
+        # bigger volume than the leg's average bar, the first of them no
+        # more than climax_window_minutes ago. climax_mode 'avg' asks it
+        # of those bars' averages instead of each bar.
+        climax_bars: int = 0,
+        climax_ext_adr: float = 0.125,
+        climax_window_minutes: float = 30.0,
+        climax_mode: str = "each",
+        # A leg built this fast or faster passes the climax gate outright:
+        # already big enough on enough volume, it is accelerating by
+        # definition (the trader, 2026-10-25). 0 = no exemption.
+        climax_fast_minutes: float = 0.0,
+        # Leave the 09:30 bar out of the leg's averages: the open's volume
+        # and range can set the bar too high for the rest of the leg.
+        climax_skip_open: bool = False,
+        # Re-alert throttles (0 = off). A leg's first alert always goes;
+        # a repeat needs its extreme to have moved realert_stop_adr x ADR
+        # since the last alert sent, and/or to have moved since then at
+        # realert_pace times the leg's own pace -- a steady slide repeating
+        # its ticket every minute stays quiet, a late flush speaks up.
+        # Both on by default since 2026-10-25, together: a repeat needs a
+        # new extreme 0.1x ADR past the last alert's, reached faster than
+        # the leg's own pace. Over 20 replayed sessions: 176 -> 82 alerts a
+        # day (2026-10-22's sell-off 441 -> 180), every one of the trader's
+        # 24 catchable model-book setups still alerted, on time.
+        realert_stop_adr: float = 0.1,
+        realert_pace: float = 1.0,
         max_loss_dollars: float = 100.0,
     ):
         self.min_leg_adr = min_leg_adr
@@ -447,6 +491,21 @@ class _ReversalBase(Setup):
         self.min_accel_price = min_accel_price
         self.min_accel_vol = min_accel_vol
         self.accel_window = accel_window
+        self.climax_bars = climax_bars
+        self.climax_ext_adr = climax_ext_adr
+        self.climax_window_minutes = climax_window_minutes
+        self.climax_mode = climax_mode
+        self.climax_fast_minutes = climax_fast_minutes
+        self.climax_skip_open = climax_skip_open
+        self.realert_stop_adr = realert_stop_adr
+        self.realert_pace = realert_pace
+        self._alerted_at: datetime | None = None
+        # The leg's extreme at the end of each bar since the last alert --
+        # the pace throttle's record of how fast the latest move came
+        self._marks_since_alert: list[tuple[datetime, float]] = []
+        # Each bar's 9EMA as it stood at that bar's close: the climax gate
+        # measures every push bar's own extension, not just the extreme's.
+        self._ema9_at: dict[datetime, float] = {}
         self.max_loss_dollars = max_loss_dollars
         # Both running values -- see the class docstring. anchor is the
         # running extreme in the OPPOSITE direction from extreme. Only the
@@ -692,6 +751,8 @@ class _ReversalBase(Setup):
     ) -> Trigger | None:
         if indicators is None or indicators.session_open is None:
             return None
+        if indicators.ema9 is not None:
+            self._ema9_at[bar.start] = indicators.ema9
 
         session_extreme = self._session_extreme(indicators)
         session_anchor = self._session_anchor(indicators)
@@ -970,6 +1031,13 @@ class _ReversalBase(Setup):
             else None
         )
         accel_price, accel_vol = self._compute_accel(extreme_at, extreme_close)
+        # Shown and recorded always (the trader's measure: extended bars
+        # beating the leg's average move AND volume); gated on only when
+        # climax_bars is set, in its own mode.
+        climax_n = self._climax_count(extreme_at, adr, bar.end, curve, mode="each")
+        climax_bars = (
+            self._climax_count(extreme_at, adr, bar.end, curve) if self.climax_bars > 0 else climax_n
+        )
         readout = _FilterReadout(
             retrace_pct=retrace_pct,
             min_retrace_pct=self.min_retrace_pct,
@@ -992,6 +1060,8 @@ class _ReversalBase(Setup):
             min_accel_price=self.min_accel_price,
             accel_vol=accel_vol,
             min_accel_vol=self.min_accel_vol,
+            climax_bars=climax_bars,
+            min_climax_bars=self.climax_bars,
             pace_adr1=_pace_adr1(
                 push_size,
                 leg_duration_minutes,
@@ -1056,6 +1126,14 @@ class _ReversalBase(Setup):
             _candidate("FAIL accel_vol: volume not building into the extreme")
             return None
 
+        fast = 0 < leg_duration_minutes <= self.climax_fast_minutes
+        if self.climax_bars > 0 and not fast and (climax_bars is None or climax_bars < self.climax_bars):
+            _candidate(
+                f"FAIL climax: fewer than {self.climax_bars} extended, outsized bars "
+                f"in the last {self.climax_window_minutes:g}m of the push"
+            )
+            return None
+
         # The trigger is the answer the alert was waiting for; do not send
         # both for the same bar -- except on a same-bar reversal. Its alert
         # carries the new extreme as the stop, which no earlier alert had,
@@ -1112,6 +1190,7 @@ class _ReversalBase(Setup):
                     indicators.session_high - indicators.session_low,
                 ),
                 "pace_adr": _pace_adr(push_size, leg_duration_minutes, adr),
+                "climax": climax_n,
                 "exit_target": round(self._session_anchor(indicators), 4),
                 "rr": _reward_to_risk(
                     bar.close, self._extreme, self._session_anchor(indicators)
@@ -1210,6 +1289,74 @@ class _ReversalBase(Setup):
         )
         return accel_price, accel_vol
 
+    def _climax_count(
+        self, extreme_at: datetime, adr: float, now: datetime, curve: VolumeCurve | None = None,
+        mode: str | None = None,
+    ) -> int | None:
+        """How many bars of the push were a climax: closed climax_ext_adr x
+        ADR past the 9EMA (as it stood at that bar), with a bigger
+        close-to-close move and bigger volume than the leg's average bar
+        -- counted only from bars in the last climax_window_minutes, so an
+        old flush doesn't vouch for a slow drift that followed.
+
+        The trader's alternative to accel_price/accel_vol (2026-10-25): a
+        3-bar window at the extreme fails on a fast leg from the open,
+        where the opening bars carry the most volume, and resets when a
+        quiet bar ticks the extreme after the flush. Extension picks out
+        the capitulation bars wherever they are in the push.
+
+        climax_mode 'or': a bigger move OR bigger volume -- on a real
+        flush they often land on different bars. 'avg': the count is of
+        extended bars, and they pass
+        only if their own average move and volume beat the leg's -- one
+        outsized bar can carry two quieter ones. 'rel': as 'each', but
+        volume against what is usual for that minute of the day (the
+        volume curve), so the opening minutes' volume doesn't swamp the
+        leg's average. 'ext': extension alone."""
+        mode = mode or self.climax_mode
+        push = [b for b in self._leg_bars if b.start <= extreme_at]
+        if len(push) < 2 or adr <= 0:
+            return None
+        # A bar's move in the push's own direction: a bar closing against
+        # the leg is not part of its acceleration, however big.
+        sign = self._push_sign()
+        moves = [sign * (b.close - (push[i - 1].close if i else b.open)) for i, b in enumerate(push)]
+        vols = [b.volume for b in push]
+        if mode == "rel":
+            vols = [v / e if (e := _minute_volume(curve, b.start)) else v for b, v in zip(push, vols, strict=True)]
+        vol_of = {b.start: v for b, v in zip(push, vols, strict=True)}
+        base = [
+            i for i, b in enumerate(push)
+            if not (self.climax_skip_open and b.start.timetz().replace(tzinfo=None) == time(9, 30))
+        ] or list(range(len(push)))
+        avg_move = sum(abs(moves[i]) for i in base) / len(base)
+        avg_vol = sum(vols[i] for i in base) / len(base)
+        since = now - timedelta(minutes=self.climax_window_minutes)
+        extended = [
+            (b, m) for b, m in zip(push, moves, strict=True)
+            if b.start >= since
+            and (ema := self._ema9_at.get(b.start)) is not None
+            and self._ema9_extension(b.close, ema) >= self.climax_ext_adr * adr
+        ]
+        if mode == "ext":
+            return len(extended)
+        if mode == "avg":
+            if not extended:
+                return 0
+            ok = (
+                sum(m for _, m in extended) / len(extended) > avg_move
+                and sum(vol_of[b.start] for b, _ in extended) / len(extended) > avg_vol
+            )
+            return len(extended) if ok else 0
+        if mode == "or":
+            return sum(1 for b, m in extended if m > avg_move or vol_of[b.start] > avg_vol)
+        return sum(1 for b, m in extended if m > avg_move and vol_of[b.start] > avg_vol)
+
+    def _push_sign(self) -> int:
+        """+1 when the push runs up (REV-S fades it), -1 when it runs down
+        (REV-L)."""
+        return -1 if self.direction == "long" else 1
+
     # -- capitulation-in-progress alert --------------------------------------
 
     def _maybe_flag_capitulation(
@@ -1279,6 +1426,10 @@ class _ReversalBase(Setup):
             accel_vol is None or accel_vol < self.min_accel_vol
         ):
             return
+        if self.climax_bars > 0 and not 0 < leg_duration_minutes <= self.climax_fast_minutes:
+            n = self._climax_count(extreme_at, adr, bar.end, curve)
+            if n is None or n < self.climax_bars:
+                return
 
         # Where the trigger could first fire, so the alert can be acted on
         # with a resting stop order instead of waiting for the bar to print.
@@ -1299,11 +1450,36 @@ class _ReversalBase(Setup):
         # target wobbling with the EMA.
         if self._alerted_levels is not None:
             prev_target, prev_stop = self._alerted_levels
-            stop_moved = round(self._extreme, 2) != round(prev_stop, 2)
-            target_moved = abs(target - prev_target) > self.min_alert_move_adr * adr
-            if not (stop_moved or target_moved):
-                return
+            if self.realert_stop_adr > 0 or self.realert_pace > 0:
+                moved = abs(self._extreme - prev_stop)
+                if self.realert_stop_adr > 0 and moved < self.realert_stop_adr * adr:
+                    # Kept for the pace test either way: a later flush is
+                    # timed from every quiet minute since the last alert.
+                    self._marks_since_alert.append((bar.end, self._extreme))
+                    return
+                if self.realert_pace > 0:
+                    # The fastest stretch since the last alert, ending at
+                    # this extreme: a flush after a long creep is judged on
+                    # the flush, not diluted by the creep before it.
+                    leg_rate = (push_size or leg_size) / max(leg_duration_minutes, 1.0)
+                    marks = [(self._alerted_at, prev_stop)] if self._alerted_at else []
+                    marks += self._marks_since_alert
+                    rate = max(
+                        (abs(self._extreme - x) / max((bar.end - t).total_seconds() / 60.0, 1.0)
+                         for t, x in marks if t < bar.end),
+                        default=0.0,
+                    )
+                    if rate < self.realert_pace * leg_rate:
+                        self._marks_since_alert.append((bar.end, self._extreme))
+                        return
+            else:
+                stop_moved = round(self._extreme, 2) != round(prev_stop, 2)
+                target_moved = abs(target - prev_target) > self.min_alert_move_adr * adr
+                if not (stop_moved or target_moved):
+                    return
         self._alerted_levels = (target, self._extreme)
+        self._alerted_at = bar.end
+        self._marks_since_alert = []
         shares, dollars = _position_size(target, self._extreme, self.max_loss_dollars)
         # Where the trade expects to be out: back at the other end of the
         # day. _session_anchor is exactly that -- the high for a long fading
@@ -1334,6 +1510,7 @@ class _ReversalBase(Setup):
                 indicators.session_high - indicators.session_low,
             ),
             pace_adr=_pace_adr(push_size, leg_duration_minutes, adr),
+            climax=self._climax_count(extreme_at, adr, bar.end, curve, mode="each"),
             stop=round(self._extreme, 4),
             shares=shares,
             dollars=dollars,

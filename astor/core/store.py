@@ -194,6 +194,7 @@ SELECT
     -- analysis, not filtered on.
     json_extract(t.extras_json, '$.pace_adr1')                  AS pace_adr1,
     json_extract(t.extras_json, '$.pace_adr')                   AS pace_adr,
+    json_extract(t.extras_json, '$.climax')                     AS climax,
     -- The retired U&R (REV-L)/O&F (REV-S) breach+reclaim condition against
     -- PDL/PDH -- one of these two keys is present depending on direction,
     -- coalesced the same way bars_below/bars_above already are above.
@@ -324,6 +325,7 @@ SELECT
     json_extract(a.extras_json, '$.accel_vol')           AS accel_vol,
     json_extract(a.extras_json, '$.pace_adr1')           AS pace_adr1,
     json_extract(a.extras_json, '$.pace_adr')            AS pace_adr,
+    json_extract(a.extras_json, '$.climax')              AS climax,
     -- AVWAP-touch-only fields (kind 'avwap_touch'): the pullback as it
     -- stood when the touch was flagged, before any continuation. touch_adr
     -- is signed -- which side of AVWAP the wick reached. All of these are

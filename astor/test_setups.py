@@ -128,7 +128,9 @@ def _generous_curve(symbol: str = "REV", n: int = 60) -> VolumeCurve:
     )
 
 
-_GATED = {"min_accel_price": 1.2, "min_accel_vol": 1.0}
+# ...and with every changed ticket re-alerting (realert_pace 0), the
+# behavior until 2026-10-25.
+_GATED = {"min_accel_price": 1.2, "min_accel_vol": 1.0, "realert_pace": 0.0, "realert_stop_adr": 0.0}
 
 
 def _rev_scanner(
@@ -169,8 +171,39 @@ def test_accel_gate_is_off_by_default() -> None:
 
     check("gate off: both alerts", len(alerts_with(None)), 2)
     check("gate on: one", len(alerts_with(_GATED)), 1)
+    check("throttle off: the minute-4 alert repeats",
+          len(alerts_with({"realert_pace": 0.0, "realert_stop_adr": 0.0})), 2)
     a = alerts_with(None)[0]
     check("accel still recorded", a.accel_price is not None, True)
+
+
+def test_pace_throttle_quiets_a_slowing_leg() -> None:
+    """A repeat alert needs the move since the last one to beat the leg's
+    own pace: a leg that keeps edging lower, slower than it fell, stays
+    quiet; a fresh flush speaks up again."""
+    levels = DailyLevels("REV", date(2026, 8, 13), 0.0, 0.0, adr_pct=4.0, prev_close=100.0, adv=100_000_000.0)
+
+    def alerts(kwargs, bars):
+        sc = Scanner({"REV": levels}, [ReversalLong], {"REV-L": kwargs})
+        sc.curves["REV"] = _generous_curve()
+        out = []
+        run_replay(sc, {"REV": bars}, on_trigger=lambda t: None, on_setup_alert=out.append)
+        return out
+
+    def b(i, o, h, lo, c):
+        return BarEvent("REV", OPEN + timedelta(minutes=i), OPEN + timedelta(minutes=i + 1), o, h, lo, c, 50_000)
+
+    # 105 -> 99 in five minutes (about 1.2 a minute), then 1c a minute lower
+    fall = [b(0, 105, 105.2, 104, 104.2), b(1, 104.2, 104.3, 102.8, 103), b(2, 103, 103.1, 101.6, 101.8),
+            b(3, 101.8, 101.9, 100.4, 100.6), b(4, 100.6, 100.7, 99.2, 99.4)]
+    creep = [b(5 + i, 99.4 - 0.01 * i, 99.45 - 0.01 * i, 99.18 - 0.01 * i, 99.38 - 0.01 * i) for i in range(5)]
+    flush = [b(10, 99.3, 99.3, 97.0, 97.2)]
+    every = alerts({"realert_pace": 0.0, "realert_stop_adr": 0.0}, fall + creep + flush)
+    paced = alerts({}, fall + creep + flush)
+    check("the throttle keeps fewer", len(paced) < len(every), True)
+    check("the first alert still goes", paced[0].bar_start, every[0].bar_start)
+    check("the flush speaks up", paced[-1].bar_start, OPEN + timedelta(minutes=10))
+    check("climax recorded on the alert", paced[-1].climax is not None, True)
 
 
 def test_run_replay_end_to_end() -> None:

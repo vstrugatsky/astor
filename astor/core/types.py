@@ -147,6 +147,9 @@ class CapitulationAlert:
     # and the view reports NULL for those rather than guessing.
     session_high: float | None = None
     session_low: float | None = None
+    # Climax bars: extended bars of the move beating its average move and
+    # volume (setups._climax_count, 'each'), shown next to pace
+    climax: int | None = None
 
     def store_extras(self) -> dict[str, Any]:
         """What the alerts table records beyond the columns every alert
@@ -163,6 +166,7 @@ class CapitulationAlert:
             "accel_vol": self.accel_vol,
             "pace_adr1": self.pace_adr1,
             "pace_adr": self.pace_adr,
+            "climax": self.climax,
             "target": self.target,
             "target_basis": self.target_basis,
             "exit_target": self.exit_target,

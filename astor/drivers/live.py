@@ -620,6 +620,8 @@ def _format_order_alert(
     # is a leg built thirteen times faster than the stock's usual day.
     if isinstance(a, CapitulationAlert):
         rr = f"pace {_bold(pace_label(a.pace_adr))}; " if a.pace_adr is not None else ""
+        if a.climax is not None:
+            rr += f"climax {_bold(str(a.climax))}; "
     else:
         rr = f"R:R {_bold(f'{a.rr:.1f}')}; " if a.rr is not None else ""
     marker = f"{_accent('(position)', _ANSI_PURPLE)} " if held else ""
