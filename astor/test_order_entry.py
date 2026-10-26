@@ -481,6 +481,42 @@ def test_pause_and_resume() -> None:
     check("KALU still paused", d.paused, {("REV-L", "KALU")})
 
 
+def test_shares_and_stop_words() -> None:
+    import asyncio
+    from datetime import datetime, timedelta
+    from fractions import Fraction
+    from zoneinfo import ZoneInfo
+
+    from astor.core.order_entry import parse_share
+    from astor.core.types import BarEvent
+
+    for tok in ("30%", "0.3", "3/10"):
+        check(f"{tok} is 3/10", parse_share(tok), Fraction(3, 10))
+    check("a share count is not a share", parse_share("30"), None)
+    r = parse_stop("XYZ 1/2 be 0.25 LOD 25% 75.59")
+    check("tranches", r.tranches, [(Fraction(1, 2), "be"), (Fraction(1, 4), "lod"), (Fraction(1, 4), 75.59)])
+    check("one word", parse_stop("XYZ hod").tranches, [(Fraction(1), "hod")])
+    check("an entry's stop at lod", parse_enter("XYZ stop LOD", "long").stop, "lod")
+    raises("no breakeven before the entry", parse_enter, "XYZ stop be", "long")
+
+    # lod looked up from today's bars, through an entry
+    et = ZoneInfo("America/New_York")
+    d = _entry_driver(10.00, 9.99, 10.01)
+    now = datetime.now(et)
+    d.session = now.date()
+    open_dt = datetime.combine(d.session, datetime.min.time(), tzinfo=et).replace(hour=9, minute=30)
+
+    async def range_bars(contract, start, end):
+        return [BarEvent("XYZ", open_dt, open_dt + timedelta(minutes=1), 9.9, 10.1, 9.62, 10.0, 1e5)]
+
+    d._range_bars = range_bars
+    if now >= open_dt:
+        t = asyncio.run(d.prepare_entry(parse_enter("XYZ stop lod", "long")))
+        check("stop at the day's low", (t.req.stop, "stop at lod 9.62" in t.summary), (9.62, True))
+    else:
+        check("before the open: no lod", "no lod yet" in asyncio.run(d.prepare_entry(parse_enter("XYZ stop lod", "long"))), True)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

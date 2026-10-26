@@ -29,16 +29,21 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
-from astor.core.order_entry import CommandError, account_token, is_account
+from astor.core.order_entry import (
+    CommandError,
+    _price,
+    account_token,
+    is_account,
+    parse_share,
+)
 
-Rule = Literal["gb", "avwap", "be"]
-RULES: tuple[Rule, ...] = ("gb", "avwap", "be")
+Rule = Literal["gb", "avwap", "be", "level"]
+RULES: tuple[Rule, ...] = ("gb", "avwap", "be", "level")
 DEFAULT_AVWAP_ADR = 0.05
 # At the close, what's left goes unless it is up at least this many R.
 DEFAULT_CLOSE_HOLD_R = 2.0
 
 _R = re.compile(r"^(\d+(?:\.\d+)?)r$", re.IGNORECASE)
-_PCT = re.compile(r"^(\d+(?:\.\d+)?)%$")
 _AVWAP = re.compile(r"^avwap(\d*\.?\d+)?$", re.IGNORECASE)
 
 
@@ -47,12 +52,28 @@ class Leg:
     rule: Rule
     pct: float
     avwap_adr: float = DEFAULT_AVWAP_ADR
+    # 'level': a price on the chart -- these shares sell on a 1-min close
+    # beyond it -- given as a price, or as 'lod'/'hod' until live looks up
+    # today's low or high when the trail starts
+    level: float | None = None
+    level_word: str | None = None
+
+    @property
+    def key(self) -> str:
+        """What tells this leg apart: its rule, or for a level its price."""
+        if self.rule != "level":
+            return self.rule
+        return f"@{self.level:g}" if self.level is not None else f"@{self.level_word}"
 
     def label(self) -> str:
         rule = self.rule
         if rule == "avwap" and self.avwap_adr != DEFAULT_AVWAP_ADR:
             rule = f"avwap{self.avwap_adr:g}"
-        return f"{self.pct:g}% {rule}"
+        if rule == "level":
+            rule = f"{self.level:.2f}" if self.level is not None else str(self.level_word)
+            if self.level is not None and self.level_word:
+                rule = f"{self.level_word} {self.level:.2f}"
+        return f"{round(self.pct, 1):g}% {rule}"
 
 
 @dataclass(frozen=True)
@@ -64,6 +85,9 @@ class ExitPlan:
 
     def leg(self, rule: Rule) -> Leg | None:
         return next((g for g in self.legs if g.rule == rule), None)
+
+    def leg_by_key(self, key: str) -> Leg | None:
+        return next((g for g in self.legs if g.key == key), None)
 
     @property
     def is_default(self) -> bool:
@@ -80,7 +104,7 @@ class ExitPlan:
         return "; ".join(parts)
 
 
-def allocate(legs: tuple[Leg, ...], qty: int) -> dict[Rule, int]:
+def allocate(legs: tuple[Leg, ...], qty: int) -> dict[str, int]:
     """Whole shares per leg, adding up to `qty`: each its floor, the shares
     left over to the largest fractions -- the earliest leg on a tie."""
     exact = [g.pct / 100.0 * qty for g in legs]
@@ -88,7 +112,7 @@ def allocate(legs: tuple[Leg, ...], qty: int) -> dict[Rule, int]:
     by_fraction = sorted(range(len(legs)), key=lambda i: (-(exact[i] - shares[i]), i))
     for i in by_fraction[: qty - sum(shares)]:
         shares[i] += 1
-    return {g.rule: n for g, n in zip(legs, shares, strict=True)}
+    return {g.key: n for g, n in zip(legs, shares, strict=True)}
 
 
 @dataclass
@@ -110,10 +134,39 @@ def _rule(tok: str) -> tuple[Rule, float] | None:
     return None
 
 
+def _leg(tok: str, pct: float) -> Leg | None:
+    """The rule a share is given to: gb, avwap, be, or a level -- a price,
+    lod or hod."""
+    if (rule := _rule(tok)) is not None:
+        return Leg(rule[0], pct, rule[1])
+    if tok.lower() in ("lod", "hod"):
+        return Leg("level", pct, level_word=tok.lower())
+    try:
+        float(tok)
+    except ValueError:
+        return None
+    return Leg("level", pct, level=_price(tok, "level"))
+
+
+def _share(tok: str) -> float | None:
+    """A share of the position, as a percent: 30%, 0.3 or 3/10. A decimal
+    above 1 is a price, not a share."""
+    t = tok.strip()
+    if "." in t and not t.endswith("%") and "/" not in t:
+        try:
+            if float(t) > 1:
+                return None
+        except ValueError:
+            return None
+    f = parse_share(t)
+    return float(f * 100) if f is not None else None
+
+
 def parse_trade_command(rest: str, verb: str = "trail") -> TradeCommand:
     usage = (
-        f"{verb} SYM [ENTRY STOP] [ACCOUNT] [1.5R] [PCT gb|avwap|be ...] [close 2.5R|close exit]"
-        f"  e.g. '{verb} XYZ 1.5R 35% gb 35% avwap 30% be close exit'"
+        f"{verb} SYM [ENTRY STOP] [ACCOUNT] [1.5R] [SHARE RULE ...] [close 2.5R|close exit]"
+        f"  (SHARE: 30%, 0.3, 3/10; RULE: gb, avwap, be, a price, lod, hod)"
+        f"  e.g. '{verb} XYZ 1.5R 25% gb 0.25 75.59 1/4 avwap 25% be close exit'"
     )
     tokens = rest.split()
     if not tokens:
@@ -122,13 +175,22 @@ def parse_trade_command(rest: str, verb: str = "trail") -> TradeCommand:
     prices: list[float] = []
     legs: list[Leg] = []
     r_mult, close_hold_r = 1.0, DEFAULT_CLOSE_HOLD_R
-    pending_pct: float | None = None
+    pending: tuple[str, float] | None = None  # (as typed, percent)
 
     rest_tokens = tokens[1:]
     i = 0
     while i < len(rest_tokens):
         tok = rest_tokens[i]
         i += 1
+        if pending is not None:
+            leg = _leg(tok, pending[1])
+            if leg is None:
+                raise CommandError(
+                    f"'{pending[0]}' needs a rule after it (gb, avwap, be, a price, lod, hod), not '{tok}'"
+                )
+            legs.append(leg)
+            pending = None
+            continue
         if tok.lower() == "close":
             # The token right after `close` is its own: 'exit' or an R.
             nxt = rest_tokens[i].lower() if i < len(rest_tokens) else ""
@@ -142,23 +204,17 @@ def parse_trade_command(rest: str, verb: str = "trail") -> TradeCommand:
                     "('close 2.5R': sell if up less than 2.5R); the default is 2R"
                 )
             continue
-        if pending_pct is not None:
-            rule = _rule(tok)
-            if rule is None:
-                raise CommandError(f"'{pending_pct:g}%' needs a rule after it (gb, avwap, be), not '{tok}'")
-            legs.append(Leg(rule[0], pending_pct, rule[1]))
-            pending_pct = None
-        elif (m := _PCT.match(tok)) is not None:
-            pending_pct = float(m.group(1))
-            if pending_pct <= 0:
-                raise CommandError(f"'{tok}': a share of the position must be above 0%")
+        if (pct := _share(tok)) is not None:
+            pending = (tok, pct)
         elif (m := _R.match(tok)) is not None:
             r_mult = float(m.group(1))
             if r_mult <= 0:
                 raise CommandError(f"'{tok}': R must be above 0")
         elif (rule := _rule(tok)) is not None:
-            # a rule with no percent: the whole position
+            # a rule with no share: the whole position
             legs.append(Leg(rule[0], 100.0, rule[1]))
+        elif tok.lower() in ("lod", "hod"):
+            legs.append(Leg("level", 100.0, level_word=tok.lower()))
         elif is_account(tok):
             if cmd.account is not None:
                 raise CommandError(f"two accounts given ('{cmd.account}', '{tok}')")
@@ -168,20 +224,20 @@ def parse_trade_command(rest: str, verb: str = "trail") -> TradeCommand:
                 prices.append(float(tok))
             except ValueError:
                 raise CommandError(f"'{tok}' isn't a price, account, R, share or rule; {usage}") from None
-    if pending_pct is not None:
-        raise CommandError(f"'{pending_pct:g}%' needs a rule after it (gb, avwap, be)")
+    if pending is not None:
+        raise CommandError(f"'{pending[0]}' needs a rule after it (gb, avwap, be, a price, lod, hod)")
     if len(prices) not in (0, 2):
         raise CommandError(f"give both ENTRY and STOP, or neither; {usage}")
     if prices:
         cmd.entry, cmd.stop = prices
 
-    rules = [g.rule for g in legs]
-    if len(set(rules)) != len(rules):
+    keys = [g.key for g in legs]
+    if len(set(keys)) != len(keys):
         raise CommandError("each rule once -- give it its whole share in one place")
     total = sum(g.pct for g in legs)
-    if total > 100.0 + 1e-9:
+    if total > 100.0 + 1e-6:
         raise CommandError(f"the shares add up to {total:g}%, over 100%")
-    if legs and total < 100.0 - 1e-9:
+    if legs and total < 100.0 - 1e-6:
         # The rest rides the stop.
         be = next((g for g in legs if g.rule == "be"), None)
         rest_pct = 100.0 - total

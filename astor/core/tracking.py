@@ -25,7 +25,7 @@ from typing import Literal
 from astor.core.exit_plan import ExitPlan, Leg
 
 State = Literal["watching", "armed", "done"]
-AlertKind = Literal["breakeven", "sell", "eod"]
+AlertKind = Literal["breakeven", "sell", "eod", "hold"]
 
 
 @dataclass
@@ -55,8 +55,21 @@ class TrackedTrade:
     legs_done: set[str] = field(default_factory=set)
     # avwap: armed once a close has been on the trade's side of AVWAP
     avwap_armed: bool = False
-    # trail: whole shares per rule, fixed when it starts
+    # trail: whole shares per rule (by Leg.key), fixed when it starts
     leg_shares: dict[str, int] = field(default_factory=dict)
+    # the close rule has had its say for the day: an exit, or the notice
+    # that the trade is held overnight
+    eod_done: bool = False
+
+    @property
+    def close_level(self) -> float | None:
+        """The price the close rule turns on: entry plus the plan's hold R
+        (2R unless 'close 2.5R') -- under it at the close a long is sold;
+        None with 'close exit'."""
+        hold = self.plan.close_hold_r
+        if hold is None:
+            return None
+        return self.entry + hold * self.r if self.direction == "long" else self.entry - hold * self.r
 
     def __post_init__(self) -> None:
         if self.stop == self.entry:
@@ -99,7 +112,7 @@ class TrackedTrade:
     @property
     def finished(self) -> bool:
         """Every rule has fired and no shares ride the stop."""
-        return all(g.rule in self.legs_done for g in self.plan.legs)
+        return all(g.key in self.legs_done for g in self.plan.legs)
 
     def avwap_lost(self, close: float, avwap: float | None, yard: float | None) -> bool:
         """The avwap rule on one close: arms once a close is on the trade's
@@ -172,7 +185,7 @@ class TrackAlert:
 
 # -- trail: the same trade, managed rather than announced -------------------
 
-TrailActionKind = Literal["breakeven", "exit", "eod"]
+TrailActionKind = Literal["breakeven", "exit", "eod", "hold"]
 
 # The end-of-day rule: a trailed trade still open one minute before the
 # close exits unless it is up at least its plan's close_hold_r -- 2R
@@ -291,21 +304,27 @@ class TrailTracker(_Book):
         # Ahead of breakeven: a trade reaching +1R on this bar still exits
         # if it is under 2R -- there is no session left for the stop to work.
         # The plan's `close` takes it out at the close whatever the gain.
+        held: list[TrailAction] = []
         if (
             trade.eod_exit is not None
             and bar_end is not None
             and bar_end.time() >= trade.eod_exit
-            and (trade.plan.close_hold_r is None or trade.gain_r(close) < trade.plan.close_hold_r)
+            and not trade.eod_done
         ):
-            trade.state = "done"
-            return [TrailAction("eod", symbol, close, bar_start, account)]
+            trade.eod_done = True
+            if trade.plan.close_hold_r is None or trade.gain_r(close) < trade.plan.close_hold_r:
+                trade.state = "done"
+                return [TrailAction("eod", symbol, close, bar_start, account)]
+            # Held: said once, so the trader knows it was a decision. The
+            # other rules still run on this close.
+            held = [TrailAction("hold", symbol, close, bar_start, account, limit=trade.close_level or 0.0)]
 
         # The exits are checked before breakeven: on a trade that ran past
         # +1R before trail was started, the first close may already have
         # given back too much. On a trade trailed from entry the giveback
         # and breakeven can't land on the same close -- the close that first
         # reaches +1R is the peak, with nothing given back.
-        actions = []
+        actions = held
         if trade.open_leg("gb") is not None:
             giveback = abs(trade.peak - close)
             limit = giveback_limit(trade)
@@ -322,6 +341,14 @@ class TrailTracker(_Book):
                 "exit", symbol, close, bar_start, account,
                 abs(close - avwap), leg.avwap_adr * yard, "avwap",
             ))
+        # A level from the chart: these shares go on a close beyond it
+        for g in trade.plan.legs:
+            if g.rule != "level" or g.level is None or g.key in trade.legs_done:
+                continue
+            if (close < g.level) if trade.direction == "long" else (close > g.level):
+                trade.legs_done.add(g.key)
+                actions.append(TrailAction("exit", symbol, close, bar_start, account,
+                                           abs(close - g.level), 0.0, g.key))
         if trade.finished:
             trade.state = "done"
             if actions:
@@ -347,7 +374,7 @@ class SellRuleTracker(TrailTracker):
     a 0.5R giveback off the peak, and no end-of-day rule.)
     """
 
-    _KIND: dict[str, AlertKind] = {"breakeven": "breakeven", "exit": "sell", "eod": "eod"}
+    _KIND: dict[str, AlertKind] = {"breakeven": "breakeven", "exit": "sell", "eod": "eod", "hold": "hold"}
 
     def track(  # type: ignore[override]
         self,

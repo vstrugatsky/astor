@@ -315,11 +315,11 @@ def _avwap_inputs(ind) -> tuple[float | None, float | None]:
 
 def _leg_part(trade: TrackedTrade, rule: str | None) -> str:
     """'35% (35 sh)' for a rule's share; '' on a one-rule plan."""
-    leg = trade.plan.leg(rule) if rule else None  # type: ignore[arg-type]
+    leg = trade.plan.leg_by_key(rule) if rule else None
     if leg is None or leg.pct >= 100:
         return ""
-    n = trade.leg_shares.get(leg.rule)
-    return f"{leg.pct:g}%" + (f" ({n} sh)" if n is not None else "")
+    n = trade.leg_shares.get(leg.key)
+    return f"{round(leg.pct, 1):g}%" + (f" ({n} sh)" if n is not None else "")
 
 
 def _plan_text(trade: TrackedTrade) -> str:
@@ -327,7 +327,7 @@ def _plan_text(trade: TrackedTrade) -> str:
     share with its shares, and the close."""
     plan = trade.plan
     legs = ", ".join(
-        f"{g.label()}" + (f" ({trade.leg_shares[g.rule]} sh)" if g.rule in trade.leg_shares else "")
+        f"{g.label()}" + (f" ({trade.leg_shares[g.key]} sh)" if g.key in trade.leg_shares else "")
         for g in plan.legs
     )
     parts = ([f"R x{plan.r_mult:g}"] if plan.r_mult != 1.0 else []) + [legs]
@@ -347,6 +347,8 @@ def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
         )
     # A short is covered, not sold.
     verb = "SELL" if trade.direction == "long" else "COVER"
+    if alert.kind == "hold":
+        return f"{header} {_hold_text(trade, alert.close, alert.limit)}{_account_tag(trade.account)}"
     if alert.kind == "eod":
         hold = trade.plan.close_hold_r
         return (
@@ -361,6 +363,8 @@ def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
     )
     if alert.rule == "avwap":
         why = f"{_accent('lost AVWAP', _ANSI_BROWN)}: close {alert.close:.2f} is {alert.giveback:.2f} past it (limit {alert.limit:.2f})"
+    elif alert.rule and alert.rule.startswith("@"):
+        why = _accent(_level_text(trade, alert.close, alert.rule), _ANSI_BROWN)
     else:
         assert trade.peak is not None
         why = (
@@ -371,6 +375,24 @@ def _format_track_alert(alert: TrackAlert, trade: TrackedTrade) -> str:
         f"{header} {what} -- {why}"
         f"  (entry {trade.entry:.2f}, stop {trade.stop:.2f}, R {trade.r:.2f}){_account_tag(trade.account)}"
     )
+
+
+def _hold_text(trade: TrackedTrade, close: float, level: float) -> str:
+    """The close rule letting a trade stay overnight."""
+    side = "over" if trade.direction == "long" else "under"
+    hold = trade.plan.close_hold_r
+    return (
+        f"keeping the position overnight: ${close:.2f} is {side} the "
+        f"{hold:g}R level ${level:.2f}"
+    )
+
+
+def _level_text(trade: TrackedTrade, close: float, key: str) -> str:
+    leg = trade.plan.leg_by_key(key)
+    level = leg.level if leg is not None and leg.level is not None else float(key[1:])
+    side = "below" if trade.direction == "long" else "above"
+    named = f"{leg.level_word} " if leg is not None and leg.level_word else ""
+    return f"closed {close:.2f}, {side} the {named}level {level:.2f}"
 
 
 def _print_track_alert(alert: TrackAlert, trade: TrackedTrade) -> None:
@@ -387,6 +409,8 @@ def _format_trail_alert(action: TrailAction, trade: TrackedTrade, outcome: Outco
     so in red: it is the one line the trader has to act on."""
     if action.kind == "breakeven":
         why = f"+1R @ {action.close:.2f} (target {trade.target_1r:.2f})"
+    elif action.kind == "hold":
+        why = _hold_text(trade, action.close, action.limit)
     elif action.kind == "eod":
         hold = trade.plan.close_hold_r
         why = f"end-of-day: last close {action.close:.2f} is {trade.gain_r(action.close):+.2f}R" + (
@@ -397,6 +421,8 @@ def _format_trail_alert(action: TrailAction, trade: TrackedTrade, outcome: Outco
             f"lost AVWAP: close {action.close:.2f} is {action.giveback:.2f} past it "
             f"(limit {action.limit:.2f})"
         )
+    elif action.rule and action.rule.startswith("@"):
+        why = _level_text(trade, action.close, action.rule)
     else:
         assert trade.peak is not None
         why = (
@@ -407,6 +433,11 @@ def _format_trail_alert(action: TrailAction, trade: TrackedTrade, outcome: Outco
         why = f"{part}: {why}"
     elif action.kind == "exit" and not trade.plan.is_default:
         why = f"the rest: {why}"
+    if action.kind == "hold":
+        return (
+            f"{_trail_header(action.symbol, action.bar_start)} {trade.direction:<5} {why}"
+            f"{_account_tag(trade.account)}"
+        )
     done = outcome.text if outcome.ok else _accent(outcome.text, _ANSI_RED)
     return (
         f"{_trail_header(action.symbol, action.bar_start)} {trade.direction:<5} {why}  ->  {done}"
@@ -438,10 +469,11 @@ def _trail_start_state(trade: TrackedTrade, closes: list[float]) -> str:
 
 def _eod_text(trade: TrackedTrade, close: time | None, verb: str) -> str:
     """What happens at the close, as the track/trail confirmation says it."""
-    hold = trade.plan.close_hold_r
+    hold, level = trade.plan.close_hold_r, trade.close_level
+    side = "under" if trade.direction == "long" else "over"
     text = (
-        f"{verb} what's left at {trade.eod_exit:%H:%M} ET" if hold is None
-        else f"{verb} at {trade.eod_exit:%H:%M} ET if under {hold:g}R"
+        f"{verb} what's left at {trade.eod_exit:%H:%M} ET" if hold is None or level is None
+        else f"{verb} at {trade.eod_exit:%H:%M} ET if {side} ${level:.2f} ({hold:g}R)"
     )
     if close is None:
         text += _accent(" (IBKR schedule unavailable -- assuming a 16:00 close)", _ANSI_RED)
@@ -1090,12 +1122,13 @@ class LiveDriver:
         entry, stop, account, known = opened
         if opened_at is None and known is not None:
             opened_at = known.opened_at
-        self.trailer.untrack(symbol, account)
-
         # trail's rules, so trail's start: the best close since entry, the
         # avwap rule armed if a close since was on the trade's side, the
         # cutoff from the symbol's own close.
-        plan = plan or ExitPlan()
+        plan = await self._fix_levels(symbol, account, plan or ExitPlan())
+        if isinstance(plan, str):
+            return plan
+        self.trailer.untrack(symbol, account)
         if opened_at is None and account is not None:
             opened_at = await self._opened_at(symbol, account)
         closes = self._closes_since(symbol, opened_at)
@@ -1169,10 +1202,12 @@ class LiveDriver:
         closes = self._closes_since(symbol, opened_at)
         best = (max if stop < entry else min)(closes) if closes else None
 
+        plan = await self._fix_levels(symbol, account, plan or ExitPlan())
+        if isinstance(plan, str):
+            return plan
         self.tracker.untrack(symbol, account)
         close = await self._session_close(symbol)
         eod_exit = _minute_before(self.session, close) if close else None
-        plan = plan or ExitPlan()
         trade = self.trailer.track(
             symbol, entry, stop, account, eod_exit, opened_at, best,
             plan, allocate(plan.legs, int(abs(held))),
@@ -1274,6 +1309,8 @@ class LiveDriver:
         try:
             if action.kind == "breakeven":
                 outcome = await self.executor.move_stop_to_breakeven(trade)
+            elif action.kind == "hold":
+                outcome = Outcome(True, "nothing sent")
             elif action.kind == "eod":
                 outcome = await self.executor.exit(trade, EOD_ADAPTIVE_PRIORITY)
             elif action.whole or action.rule is None:
@@ -1448,6 +1485,51 @@ class LiveDriver:
         )
         store.commit()
 
+    async def _fix_levels(self, symbol: str, account: str | None, plan: ExitPlan) -> ExitPlan | str:
+        """A plan's lod/hod levels, fixed at today's low or high as of now:
+        those shares go on a close beyond where the day stood when the
+        trail started, not wherever it gets to later."""
+        if not any(g.level_word and g.level is None for g in plan.legs):
+            return plan
+        legs = []
+        for g in plan.legs:
+            if g.level_word and g.level is None:
+                level = await self._stop_level(symbol, account, g.level_word)
+                if isinstance(level, str):
+                    return level
+                g = dataclasses.replace(g, level=round(level, 4))
+            legs.append(g)
+        return dataclasses.replace(plan, legs=tuple(legs))
+
+    async def _day_level(self, contract: Contract, word: str) -> float | str:
+        """Today's regular-hours low ('lod') or high ('hod') so far, from
+        IBKR's 1-min bars -- or why it can't be had."""
+        now = datetime.now(ET)
+        open_dt = datetime.combine(self.session, RTH_OPEN, tzinfo=ET)
+        if now.date() != self.session or now < open_dt:
+            return f"no {word} yet -- the session hasn't opened"
+        bars = await self._range_bars(contract, open_dt, now + timedelta(minutes=1))
+        if not bars:
+            return f"no bars for {contract.symbol} today yet -- no {word}"
+        return min(b.low for b in bars) if word == "lod" else max(b.high for b in bars)
+
+    async def _stop_level(self, sym: str, account: str | None, word: str) -> float | str:
+        """A stop given as a word: 'lod'/'hod' looked up, 'be' as the
+        position's breakeven -- astor's own entry when it has the trade,
+        else IBKR's average cost -- rounded away from a loss."""
+        if word == "be":
+            pos = next((p for p in held_positions(self.ib, sym) if account in (None, p.account)), None)
+            if pos is None:
+                return f"be needs a {sym} position to take breakeven from"
+            known = self._known_trade(sym, pos.account)
+            entry = known.entry if known is not None else pos.avgCost
+            long = pos.position > 0
+            return breakeven_price(TrackedTrade(sym, entry, entry - 1 if long else entry + 1, pos.account))
+        contract = await self._contract(sym)
+        if contract is None:
+            return f"IBKR doesn't know {sym}."
+        return await self._day_level(contract, word)
+
     async def _orb(
         self, req: EnterRequest, contract: Contract, now: datetime | None = None
     ) -> tuple[EnterRequest, str] | str:
@@ -1528,6 +1610,13 @@ class LiveDriver:
         contract = await self._contract(req.symbol)
         if contract is None:
             return f"IBKR doesn't know {req.symbol}."
+        level_note = None
+        if isinstance(req.stop, str):
+            level = await self._day_level(contract, req.stop)
+            if isinstance(level, str):
+                return level
+            level_note = f"stop at {req.stop} {level:.2f}"
+            req = dataclasses.replace(req, stop=round(level, 4))
         orb_note = None
         if req.orb_minutes is not None:
             sized = await self._orb(req, contract)
@@ -1539,7 +1628,7 @@ class LiveDriver:
             return "Adaptive is regular-hours only; outside them use lmt (works now) or stp (from the open)."
         quote = await (self._snapshot(contract) if in_rth else self._quote(contract))
         market, half = _price_of(quote), _half_spread_of(quote)
-        notes = [orb_note] if orb_note else []
+        notes = [n for n in (orb_note, level_note) if n]
         # A stop entry the market is already through would trigger at once
         # and fill at the market anyway: send it as the market order it is
         # -- Adaptive, or outside regular hours the limit below -- and say
@@ -1754,6 +1843,16 @@ class LiveDriver:
             return str(e)
         if req.breakeven:
             return await self._stop_to_breakeven(sym, account, run_id, store)
+        if any(isinstance(p, str) for _, p in req.tranches):
+            tranches = []
+            for part, p in req.tranches:
+                if isinstance(p, str):
+                    level = await self._stop_level(sym, account, p)
+                    if isinstance(level, str):
+                        return level
+                    p = round(level, 4)
+                tranches.append((part, p))
+            req = dataclasses.replace(req, tranches=tranches)
         working = working_orders(open_trades, sym, account)
         held = self._held(sym, account)
         prices = [p for _, p in req.tranches]

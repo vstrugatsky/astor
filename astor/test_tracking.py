@@ -238,8 +238,12 @@ def test_trail_eod_holds_at_2r_or_more() -> None:
     tr = TrailTracker()
     tr.track("NVDA", entry=100.0, stop=95.0)
     close1(tr, "NVDA", 105.0, bar_time(0))
-    check("+2R at 15:59, held", close1(tr, "NVDA", 110.0, *eod_bar()), None)
+    a = close1(tr, "NVDA", 110.0, *eod_bar())
+    check("+2R at 15:59: held, and says so at the 2R level", (a.kind, a.limit), ("hold", 110.0))
     check("still open", tr.trades["NVDA", None].state, "armed")
+    check("said once", close1(tr, "NVDA", 110.5, *eod_bar()), None)
+    t = tr.trades["NVDA", None]
+    check("close_level: entry + 2R", t.close_level, 110.0)
 
 
 def test_trail_eod_beats_breakeven_on_the_same_bar() -> None:
@@ -253,7 +257,8 @@ def test_trail_eod_short_measures_gain_downward() -> None:
     tr = TrailTracker()
     tr.track("TSLA", entry=100.0, stop=105.0)
     close1(tr, "TSLA", 95.0, bar_time(0))
-    check("short +2.2R held", close1(tr, "TSLA", 89.0, *eod_bar()), None)
+    a = close1(tr, "TSLA", 89.0, *eod_bar())
+    check("short +2.2R held, 2R level below entry", (a.kind, a.limit), ("hold", 90.0))
     tr2 = TrailTracker()
     tr2.track("TSLA", entry=100.0, stop=105.0)
     close1(tr2, "TSLA", 95.0, bar_time(0))
@@ -482,12 +487,13 @@ def test_two_rules_on_one_close_end_with_the_whole() -> None:
 def test_close_sells_even_past_2r() -> None:
     from datetime import time as dtime
 
-    for plan, want in (("", "breakeven"), ("close exit", "eod"), ("close 3R", "eod"), ("close 2.5R", "breakeven")):
+    for plan, want in (("", ["hold", "breakeven"]), ("close exit", ["eod"]), ("close 3R", ["eod"]),
+                       ("close 2.5R", ["hold", "breakeven"])):
         tr = TrailTracker(eod_exit=dtime(15, 59))
         tr.track("XYZ", 100.0, 98.0, plan=_plan(plan))
         late = OPEN.replace(hour=15, minute=58)
-        a = close1(tr, "XYZ", 105.0, late, late + timedelta(minutes=1))  # +2.5R
-        check(f"{plan or 'default'} at +2.5R", a.kind, want)
+        out = tr.on_close("XYZ", 105.0, late, late + timedelta(minutes=1))  # +2.5R
+        check(f"{plan or 'default'} at +2.5R", [a.kind for a in out], want)
 
 
 def test_track_notifies_per_rule() -> None:
@@ -622,6 +628,29 @@ def test_partial_sale_survives_a_tranche_filling_mid_way() -> None:
     check("never sells more than held", sold <= 50, True)
     check(f"stops ({covered}) cover no more than what's left ({left})", covered <= left, True)
     check("and says what happened", bool(out.text), True)
+
+
+def test_plan_shares_three_ways_and_levels() -> None:
+    from astor.core.exit_plan import allocate, parse_trade_command
+
+    c = parse_trade_command("XYZ 0.25 gb 0.25 75.59 1/4 avwap 25% be")
+    check("the user's example", c.plan.describe(), "25% gb, 25% 75.59, 25% avwap, 25% be")
+    check("level keyed by its price", [g.key for g in c.plan.legs], ["gb", "@75.59", "avwap", "be"])
+    check("shares by key", allocate(c.plan.legs, 100), {"gb": 25, "@75.59": 25, "avwap": 25, "be": 25})
+    c = parse_trade_command("XYZ 100.5 98.2 0.3 gb 3/10 lod")
+    check("prices still entry/stop; lod waits for a lookup",
+          (c.entry, c.stop, c.plan.legs[1].level_word), (100.5, 98.2, "lod"))
+    check("thirds read cleanly", parse_trade_command("XYZ 1/3 gb 1/3 hod").plan.describe(),
+          "33.3% gb, 33.3% hod, 33.3% be")
+
+
+def test_level_leg_sells_on_a_close_beyond_it() -> None:
+    tr = TrailTracker(eod_exit=None)
+    t = tr.track("XYZ", 100.0, 98.0, plan=_plan("0.5 99.10 0.5 be"), leg_shares={"@99.1": 50, "be": 50})
+    check("above the level: nothing", close1(tr, "XYZ", 99.2, bar_time(1)), None)
+    a = close1(tr, "XYZ", 99.05, bar_time(2))
+    check("a close under it: its share", (a.kind, a.rule, a.whole), ("exit", "@99.1", False))
+    check("the be shares stay", t.state, "watching")
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

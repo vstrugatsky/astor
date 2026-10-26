@@ -1266,6 +1266,12 @@ async def _live_console(
             continue
         cmd, _, rest = line.partition(" ")
         cmd = cmd.lower()
+        # 'trail untrail TTMI' -- an earlier 'trail ...' recalled and edited
+        # into an untrail (2026-10-23) -- is the untrail.
+        if cmd in ("track", "trail"):
+            head, _, tail = rest.strip().partition(" ")
+            if head.lower() in ("untrack", "untrail"):
+                cmd, rest = head.lower(), tail
 
         # 'exit' closes a position now, so only 'quit' leaves -- a bare
         # 'exit' typed out of habit must not take the session down with it.

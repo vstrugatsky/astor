@@ -92,7 +92,7 @@ class EnterRequest:
     # STP and STP LMT: the trigger. LMT: the limit -- a cap on the price,
     # worked by Adaptive in regular hours.
     price: float | None
-    stop: float | None
+    stop: float | str | None  # 'lod'/'hod' until live looks it up
     # No type typed: ADN in regular hours; outside them live makes it an
     # LMT at the ask (long) or bid (short).
     type_defaulted: bool = False
@@ -182,9 +182,11 @@ def parse_enter(rest: str, direction: str | None = None) -> EnterRequest:
                 raise CommandError(f"'{tok}' needs a value: '{tok} PRICE'")
             if tok in _LOSS:
                 once("loss", _dollars(nxt), tok)
+            elif tok == "stop":
+                once("stop", _stop_price(nxt, allow_be=False), tok)
             else:
-                key = "stop" if tok == "stop" else "trigger" if tok in _TRIGGER else "cap"
-                once(key, _price(nxt, {"stop": "stop", "trigger": "stop entry", "cap": "limit"}[key]), tok)
+                key = "trigger" if tok in _TRIGGER else "cap"
+                once(key, _price(nxt, {"trigger": "stop entry", "cap": "limit"}[key]), tok)
             i += 2
             continue
         if tok in _URGENT:
@@ -251,28 +253,66 @@ def _dollars(tok: str) -> float:
 class StopRequest:
     symbol: str
     account: str | None
-    # (part, price): part is a Fraction of the position or an int share count
-    tranches: list[tuple[Fraction | int, float]]
+    # (part, price): part is a Fraction of the position or an int share
+    # count; price a number or 'be'/'lod'/'hod', which live resolves
+    tranches: list[tuple[Fraction | int, StopPrice]]
     # 'stop SYM be': every stop short of breakeven goes to it
     breakeven: bool = False
 
 
-STOP_USAGE = "stop SYM [ACCOUNT] PRICE, stop SYM [ACCOUNT] 1/2 PRICE 1/2 PRICE, or stop SYM [ACCOUNT] be"
+STOP_USAGE = (
+    "stop SYM [ACCOUNT] PRICE|be|lod|hod, or stop SYM [ACCOUNT] PART PRICE PART PRICE ..."
+    "  (PART: 30%, 0.3, 3/10 or a share count; PRICE: a price, be, lod or hod)"
+)
+
+
+def parse_share(tok: str) -> Fraction | None:
+    """A share of the position written as 30%, 0.3 or 3/10 -- the same
+    three ways in `stop` and `trail` -- or None if `tok` isn't one."""
+    t = tok.strip()
+    try:
+        if t.endswith("%"):
+            f = Fraction(t[:-1]) / 100
+        elif "/" in t or "." in t:
+            f = Fraction(t)
+        else:
+            return None
+    except (ValueError, ZeroDivisionError):
+        return None
+    if not 0 < f <= 1:
+        raise CommandError(f"part '{tok}' must be above 0 and at most all of it")
+    return f
 
 
 def _part(tok: str) -> Fraction | int:
+    """A tranche's size: a share of the position (parse_share) or a whole
+    number of shares."""
+    if (f := parse_share(tok)) is not None:
+        return f
     try:
-        if "/" in tok:
-            f = Fraction(tok)
-            if not 0 < f <= 1:
-                raise CommandError(f"part '{tok}' must be between 0 and 1")
-            return f
         n = int(tok)
-    except (ValueError, ZeroDivisionError):
-        raise CommandError(f"part '{tok}' is not a fraction (1/2) or a share count") from None
+    except ValueError:
+        raise CommandError(
+            f"part '{tok}' is not a share (30%, 0.3, 3/10) or a share count"
+        ) from None
     if n <= 0:
         raise CommandError(f"part '{tok}' must be positive")
     return n
+
+
+# Stop prices given as a level astor looks up: breakeven, or today's
+# regular-hours low or high -- exactly, not a tick beyond, like the ORB stop.
+STOP_WORDS = ("be", "lod", "hod")
+StopPrice = float | str
+
+
+def _stop_price(tok: str, what: str = "stop", allow_be: bool = True) -> StopPrice:
+    t = tok.lower()
+    if t in STOP_WORDS:
+        if t == "be" and not allow_be:
+            raise CommandError("an entry has no breakeven yet -- give a price, lod or hod")
+        return t
+    return _price(tok, what)
 
 
 def parse_stop(rest: str) -> StopRequest:
@@ -284,11 +324,11 @@ def parse_stop(rest: str) -> StopRequest:
     if len(tokens) == 1 and tokens[0].lower() == "be":
         return StopRequest(symbol, account, [], breakeven=True)
     if len(tokens) == 1:
-        return StopRequest(symbol, account, [(Fraction(1), _price(tokens[0], "stop"))])
+        return StopRequest(symbol, account, [(Fraction(1), _stop_price(tokens[0]))])
     if not tokens or len(tokens) % 2:
         raise CommandError(STOP_USAGE)
     tranches = [
-        (_part(tokens[i]), _price(tokens[i + 1], "stop")) for i in range(0, len(tokens), 2)
+        (_part(tokens[i]), _stop_price(tokens[i + 1])) for i in range(0, len(tokens), 2)
     ]
     return StopRequest(symbol, account, tranches)
 
