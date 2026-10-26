@@ -59,6 +59,7 @@ from astor.core.order_entry import (
 from astor.core.scanner import Scanner
 from astor.core.setups import ALL_SETUPS, SETUPS_BY_NAME, pace_label, rev_rvol_threshold
 from astor.core.store import TriggerStore
+from astor.drivers import console_io
 from astor.drivers.live import _ANSI_GREEN, _ANSI_RED, LiveDriver, _accent, position_pnl
 from astor.drivers.replay import (
     ADR_SESSIONS,
@@ -1235,7 +1236,7 @@ async def _confirm(loop) -> bool:
     """The order prompt, for entries and exits alike: only y or yes, in
     any case, sends. Enter alone doesn't -- a stray one must not place or
     close a position."""
-    answer = await loop.run_in_executor(None, input, "  send? [y/n] ")
+    answer = await console_io.prompt(loop, "  send? [y/n] ")
     return answer.strip().lower() in ("y", "yes")
 
 
@@ -1258,7 +1259,7 @@ async def _live_console(
     )
     while True:
         try:
-            line = await loop.run_in_executor(None, input, "> ")
+            line = await console_io.prompt(loop, "> ")
         except EOFError:
             break
         line = line.strip()
@@ -2057,7 +2058,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    handler = logging.StreamHandler()
+    # Through console_io: a log line never lands in a half-typed command
+    handler = console_io.Handler()
     handler.setFormatter(
         _ETFormatter("%(asctime)s ET %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
     )

@@ -65,6 +65,7 @@ from astor.core.types import (
     TouchAlert,
     Trigger,
 )
+from astor.drivers import console_io
 from astor.drivers.orders import (
     EOD_ADAPTIVE_PRIORITY,
     OrderDesk,
@@ -276,7 +277,7 @@ def _print_alert(text: str, bell: bool = True) -> None:
     """Bell + explicit black, not just a plain print -- an alert scrolling by
     silently in a wall of other output is exactly what this is for. Only
     setup alerts ever go without the bell (`mute`)."""
-    print(f"{_BELL if bell else ''}{_ANSI_BLACK}{text}{_ANSI_RESET}")
+    console_io.emit(f"{_BELL if bell else ''}{_ANSI_BLACK}{text}{_ANSI_RESET}")
 
 
 def _print_trigger_alert(t: Trigger, bell: bool = True) -> None:
