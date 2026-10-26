@@ -1186,7 +1186,7 @@ _CONSOLE_COMMANDS = (
     "'buy|sell SYM [ACCOUNT] orb [MINUTES] [lim P] [loss $]' (opening-range break), "
     "'enter SYM [ACCOUNT] l|s QTY ...' (the same, direction spelled out), "
     "'stop SYM [ACCOUNT] P', 'stop SYM 1/2 P1 1/2 P2' or 'stop SYM be', "
-    "'cancel SYM [ACCOUNT]', 'exit SYM [ACCOUNT] [SHARES|1/3] [adn|adu|mkt|lmt P]'."
+    "'cancel SYM [ACCOUNT]', 'exit SYM [ACCOUNT] [SHARES|1/3] [adn|adu|mkt|lim P]'."
 )
 
 _ORDER_PARSERS = {

@@ -517,6 +517,18 @@ def test_shares_and_stop_words() -> None:
         check("before the open: no lod", "no lod yet" in asyncio.run(d.prepare_entry(parse_enter("XYZ stop lod", "long"))), True)
 
 
+def test_limit_words_and_partial_sells() -> None:
+    for word in ("lmt", "lim", "limit"):
+        r = parse_exit(f"EWZ 1/5 {word} 33")
+        check(f"exit takes {word}", (r.order_type, r.price), ("LMT", 33.0))
+    try:
+        parse_enter("ewz 1/5 lim 33", "short")
+    except CommandError as e:
+        check("a fraction on sell points to exit", "exit EWZ 1/5 lim 33" in str(e), True)
+    else:
+        raise AssertionError("sell with a fraction should be refused")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

@@ -32,7 +32,11 @@ DIRECTIONS = {"l": "long", "long": "long", "s": "short", "short": "short"}
 ADAPTIVE = {"ADN": "Normal", "ADU": "Urgent"}
 # 'alg', the old name for adn, still types the same order.
 ENTRY_TYPES = {"adn": "ADN", "adu": "ADU", "alg": "ADN", "mkt": "MKT", "lmt": "LMT", "stp": "STP"}
-EXIT_TYPES = {"adn": "ADN", "adu": "ADU", "alg": "ADN", "mkt": "MKT", "lmt": "LMT"}
+EXIT_TYPES = {
+    "adn": "ADN", "adu": "ADU", "alg": "ADN", "mkt": "MKT",
+    # the same three words as an entry's price cap
+    "lmt": "LMT", "lim": "LMT", "limit": "LMT",
+}
 PRICED = ("LMT", "STP")
 
 
@@ -157,6 +161,14 @@ def parse_enter(rest: str, direction: str | None = None) -> EnterRequest:
         raise CommandError(usage)
 
     qty: int | None = None
+    # A share of the position is a partial exit's, not an entry's: 'sell'
+    # opens a short, it doesn't sell part of a long (2026-10-26).
+    if parse_share(tokens[0]) is not None:
+        example = " ".join([f"exit {symbol}", *tokens])
+        raise CommandError(
+            f"'{tokens[0]}' is part of a position -- to sell part of one: '{example}'. "
+            f"buy and sell open a new position, and take a share count"
+        )
     if tokens[0][0].isdigit():
         try:
             qty = int(tokens[0])
@@ -378,7 +390,7 @@ def parse_cancel(rest: str) -> SymbolRequest:
     return SymbolRequest(_symbol(tokens[0]), account)
 
 
-EXIT_USAGE = "exit SYM [ACCOUNT] [SHARES | 1/3] [adn | adu | mkt | lmt PRICE]  (default: all of it, adn)"
+EXIT_USAGE = "exit SYM [ACCOUNT] [SHARES | 1/3] [adn | adu | mkt | lmt|lim|limit PRICE]  (default: all of it, adn)"
 
 
 def parse_exit(rest: str) -> SymbolRequest:
@@ -395,10 +407,10 @@ def parse_exit(rest: str) -> SymbolRequest:
         return SymbolRequest(symbol, account, qty=qty)
     order_type = EXIT_TYPES.get(tokens[0].lower())
     if order_type is None:
-        raise CommandError(f"exit order '{tokens[0]}' is not adn/adu/mkt/lmt; {EXIT_USAGE}")
+        raise CommandError(f"exit order '{tokens[0]}' is not adn/adu/mkt/lmt/lim/limit; {EXIT_USAGE}")
     if order_type == "LMT":
         if len(tokens) != 2:
-            raise CommandError("an LMT exit needs a price: 'exit SYM [SHARES] lmt PRICE'")
+            raise CommandError("a limit exit needs a price: 'exit SYM [SHARES] lim PRICE'")
         return SymbolRequest(symbol, account, "LMT", _price(tokens[1], "LMT price"), qty)
     if len(tokens) != 1:
         raise CommandError(f"{order_type} takes no price; {EXIT_USAGE}")
