@@ -518,11 +518,15 @@ class TriggerStore:
                 continue
             if kind == "order_enter" and not extras.get("ok"):
                 continue
+            limit = extras.get("limit")
+            if limit is None and extras.get("order_type") == "LMT":
+                limit = extras.get("price")  # entries recorded before the limit was
             out.append({
                 "time": datetime.fromisoformat(ts),
                 "symbol": symbol,
                 "account": extras["account"],
                 "stop": float(extras["stop"]),
+                "limit": float(limit) if kind == "order_enter" and limit is not None else None,
                 "source": "enter" if kind == "order_enter" else "track/trail",
             })
         return out

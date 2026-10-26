@@ -15,7 +15,14 @@ from ib_async import IB, ExecutionFilter
 
 from astor.core.order_entry import ACCOUNT_SUFFIX, is_ira
 from astor.core.store import TriggerStore
-from astor.core.trade_log import Fill, Trade, attach_stops, entry_rvol, round_trips
+from astor.core.trade_log import (
+    Fill,
+    Trade,
+    attach_stops,
+    entry_range_pct,
+    entry_rvol,
+    round_trips,
+)
 from astor.drivers.replay import ReplayDriver
 
 logger = logging.getLogger(__name__)
@@ -49,7 +56,7 @@ async def todays_trades(
         Fill(
             f.execution.time.astimezone(ET), f.contract.symbol, f.execution.acctNumber,
             f.execution.shares if f.execution.side == "BOT" else -f.execution.shares,
-            f.execution.price, commission.get(f.execution.execId, 0.0),
+            f.execution.price, commission.get(f.execution.execId, 0.0), f.execution.permId,
         )
         for f in answered
         if f.contract.secType == "STK" and f.execution.time.astimezone(ET).date() == session
@@ -83,41 +90,56 @@ async def _attach_rvol(ib: IB, session: date, trades: list[Trade], cache_dir: Pa
         return
     for t in trades:
         t.rvol = entry_rvol(t, bars.get(t.symbol, []), curves.get(t.symbol))
+        t.adr1_pct = entry_range_pct(t, bars.get(t.symbol, []))
+
+
+def _num(x: float | None) -> str:
+    return f"{x:.4f}".rstrip("0").rstrip(".") if x is not None else "--"
 
 
 def format_trades(trades: list[Trade], color: Callable[[str, float], str] = lambda s, v: s) -> list[str]:
-    """The table, one trade a row, then the day's total. `color` paints a
-    P&L cell by its sign."""
+    """The table: a trade's entry on its first line, then one line per exit
+    order -- its time, shares, price and its own P&L and R -- and a last
+    'open' line for shares still held. The day's total at the bottom.
+    `color` paints a P&L cell by its sign."""
     if not trades:
         return ["  No trades today."]
     head = (
-        f"  {'SYM':<6} {'ACCT':<4} {'SIDE':<5} {'SHARES':>6}  {'IN':>8} {'ENTRY':>9} {'RVOL':>5}"
-        f"  {'OUT':>8} {'EXIT':>9}  {'STOP':>8}  {'P&L':>9} {'R':>6}"
+        f"  {'SYM':<6} {'ACCT':<4} {'SIDE':<5} {'SHARES':>6}  {'IN':>8} {'ENTRY':>9} {'RVOL':>5} {'ADR1':>5}"
+        f"  {'OUT':>8} {'SH OUT':>6} {'EXIT':>9}  {'STOP':>8} {'LIMIT':>8}  {'P&L':>9} {'R':>6}"
     )
     lines = [head]
+    blank_in = " " * len(f"  {'':<6} {'':<4} {'':<5} {'':>6}  {'':>8} {'':>9} {'':>5} {'':>5}")
     total = 0.0
     for t in trades:
-        entry = f"{t.entry:.4f}".rstrip("0").rstrip(".") if t.entry is not None else "--"
-        exit_ = f"{t.exit:.4f}".rstrip("0").rstrip(".") if t.exit is not None else "--"
         tin = f"{t.opened_at:%H:%M:%S}" if t.opened_at else "earlier"
-        tout = f"{t.closed_at:%H:%M:%S}" if t.closed_at else "open"
+        rvol = f"{t.rvol:.2f}" if t.rvol is not None else "--"
+        adr1 = f"{t.adr1_pct:.1f}%" if t.adr1_pct is not None else "--"
         stop = f"{t.stop:.2f}" if t.stop is not None else "--"
-        if t.pnl is not None:
-            total += t.pnl
-            pnl = color(f"{t.pnl:>+9,.2f}", t.pnl)
-            r = color(f"{t.pnl_r:>+6.2f}", t.pnl) if t.pnl_r is not None else f"{'--':>6}"
-        else:
-            pnl, r = f"{'--':>9}", f"{'--':>6}"
-        if t.is_open and t.exited:
-            tout = f"part {t.exited:g}"
-        lines.append(
-            f"  {t.symbol:<6} {_alias(t.account):<4} {t.direction:<5} {t.shares:>6g}  {tin:>8} {entry:>9}"
-            f" {f'{t.rvol:.2f}' if t.rvol is not None else '--':>5}"
-            f"  {tout:>8} {exit_:>9}  {stop:>8}  {pnl} {r}"
+        limit = f"{t.limit:.2f}" if t.limit is not None else "--"
+        entry_cols = (
+            f"  {t.symbol:<6} {_alias(t.account):<4} {t.direction:<5} {t.shares:>6g}  {tin:>8} "
+            f"{_num(t.entry):>9} {rvol:>5} {adr1:>5}"
         )
-    lines.append(f"  {'':<58}{'net':>8}  {color(f'{total:>+9,.2f}', total)}")
+        risk_cols = f"  {stop:>8} {limit:>8}"
+        rows = []
+        for e in t.exits:
+            pnl, r = t.exit_pnl(e), t.exit_r(e)
+            if pnl is not None:
+                total += pnl
+                pnl_s = color(f"{pnl:>+9,.2f}", pnl)
+                r_s = color(f"{r:>+6.2f}", pnl) if r is not None else f"{'--':>6}"
+            else:
+                pnl_s, r_s = f"{'--':>9}", f"{'--':>6}"
+            rows.append(f"  {e.time:%H:%M:%S} {e.shares:>6g} {_num(e.price):>9}{risk_cols}  {pnl_s} {r_s}")
+        held = t.shares - t.exited if t.is_open else 0
+        if t.is_open:
+            rows.append(f"  {'open':>8} {held:>6g} {'--':>9}{risk_cols}  {'--':>9} {'--':>6}")
+        for i, row in enumerate(rows):
+            lines.append((entry_cols if i == 0 else blank_in) + row)
+    lines.append(f"{'net':>{len(blank_in) + 47}}  {color(f'{total:>+9,.2f}', total)}")
     lines.append(
-        "  P&L is net of commissions, on the shares closed today; STOP is the original one astor "
-        "recorded; RVOL is at entry, from today's bars as IBKR has them now."
+        "  One line per exit order; P&L net of commissions (the entry's shared by shares). STOP is the "
+        "original astor recorded, LIMIT the entry's cap; RVOL and ADR1 (today's range, % of price) at entry."
     )
     return lines

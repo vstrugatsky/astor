@@ -1751,7 +1751,10 @@ class LiveDriver:
         self._record_order(
             store, run_id, "order_enter", req.symbol, req.direction, req.price or 0.0, outcome,
             {"account": ticket.account, "qty": req.qty, "order_type": req.order_type,
-             "price": req.price, "stop": req.stop},
+             "price": req.price, "stop": req.stop,
+             # the cap on the fill, for the trades report: a limit's price,
+             # a stop-limit's limit
+             "limit": req.price if req.order_type == "LMT" else req.cap},
         )
         if pt is not None:
             task = asyncio.create_task(self._watch_entry(ticket, pt, ct, scanner, run_id, store))

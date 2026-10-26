@@ -22,6 +22,18 @@ class Fill:
     shares: float  # signed: + bought, - sold
     price: float
     commission: float = 0.0
+    order_id: int = 0  # IBKR's permId: an order's partial fills share it
+
+
+@dataclass(frozen=True)
+class Exit:
+    """One exit order: its fills taken together."""
+
+    time: datetime  # the last fill's
+    shares: float
+    price: float  # share-weighted
+    commission: float
+    order_id: int = 0
 
 
 @dataclass
@@ -37,8 +49,41 @@ class Trade:
     _in: list[tuple[float, float]] = field(default_factory=list)   # (shares, price) opening
     _out: list[tuple[float, float]] = field(default_factory=list)  # (shares, price) closing
     commission: float = 0.0
+    in_commission: float = 0.0  # the entry fills' share of it
+    _exits: list[Exit] = field(default_factory=list)  # one per fill, merged by `exits`
     stop: float | None = None  # the original stop, when astor knows it
+    limit: float | None = None  # the entry's limit (a stop-limit's cap), when astor sent it
     rvol: float | None = None  # at entry: volume through the last bar before it, against its curve
+    adr1_pct: float | None = None  # at entry: today's range so far, % of the entry price
+
+    @property
+    def exits(self) -> list[Exit]:
+        """Each exit order once: consecutive fills of one order merged."""
+        out: list[Exit] = []
+        for e in self._exits:
+            last = out[-1] if out else None
+            if last is not None and e.order_id and e.order_id == last.order_id:
+                n = last.shares + e.shares
+                out[-1] = Exit(e.time, n, (last.price * last.shares + e.price * e.shares) / n,
+                               last.commission + e.commission, e.order_id)
+            else:
+                out.append(e)
+        return out
+
+    def exit_pnl(self, e: Exit) -> float | None:
+        """One exit's dollars: its shares' move from the entry, less its
+        own commission and its shares' part of the entry's."""
+        if self.entry is None or self.carried:
+            return None
+        bought = sum(q for q, _ in self._in)
+        sign = 1 if self.direction == "long" else -1
+        return sign * (e.price - self.entry) * e.shares - e.commission - self.in_commission * e.shares / bought
+
+    def exit_r(self, e: Exit) -> float | None:
+        pnl = self.exit_pnl(e)
+        if pnl is None or self.stop is None or self.entry is None or self.stop == self.entry:
+            return None
+        return pnl / (abs(self.entry - self.stop) * e.shares)
 
     @property
     def entry(self) -> float | None:
@@ -101,9 +146,11 @@ def round_trips(fills: list[Fill], start: dict[tuple[str, str], float] | None = 
                 if opening:
                     take = qty
                     current._in.append((abs(take), f.price))
+                    current.in_commission += share_of_comm * abs(take)
                 else:
                     take = qty if abs(qty) <= abs(pos) else -pos  # up to flat, the rest opens the next
                     current._out.append((abs(take), f.price))
+                    current._exits.append(Exit(f.time, abs(take), f.price, share_of_comm * abs(take), f.order_id))
                 current.commission += share_of_comm * abs(take)
                 pos += take
                 qty -= take
@@ -135,6 +182,7 @@ def attach_stops(trades: list[Trade], records: list[dict]) -> None:
             ]
             if enters:
                 t.stop = enters[-1]["stop"]
+                t.limit = enters[-1].get("limit")
                 continue
         during = [
             r for r in mine
@@ -159,3 +207,14 @@ def entry_rvol(t: Trade, bars: list, curve) -> float | None:
     if not done:
         return None
     return compute_rvol(sum(b.volume for b in done), done[-1].start, curve)
+
+
+def entry_range_pct(t: Trade, bars: list) -> float | None:
+    """ADR(1) when `t` was entered: today's range over the bars closed by
+    the entry fill, as a percent of the entry price."""
+    if t.opened_at is None or t.entry is None or not bars:
+        return None
+    done = [b for b in bars if b.end <= t.opened_at]
+    if not done:
+        return None
+    return (max(b.high for b in done) - min(b.low for b in done)) / t.entry * 100
