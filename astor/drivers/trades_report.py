@@ -21,6 +21,8 @@ from astor.core.trade_log import (
     attach_stops,
     entry_range_pct,
     entry_rvol,
+    lot_range_pct,
+    lot_rvol,
     round_trips,
 )
 from astor.drivers.replay import ReplayDriver
@@ -91,6 +93,9 @@ async def _attach_rvol(ib: IB, session: date, trades: list[Trade], cache_dir: Pa
     for t in trades:
         t.rvol = entry_rvol(t, bars.get(t.symbol, []), curves.get(t.symbol))
         t.adr1_pct = entry_range_pct(t, bars.get(t.symbol, []))
+        for lot in t.lots:
+            lot.rvol = lot_rvol(lot, bars.get(t.symbol, []), curves.get(t.symbol))
+            lot.adr1_pct = lot_range_pct(lot, bars.get(t.symbol, []))
 
 
 def _num(x: float | None) -> str:
@@ -112,34 +117,38 @@ def format_trades(trades: list[Trade], color: Callable[[str, float], str] = lamb
     blank_in = " " * len(f"  {'':<6} {'':<4} {'':<5} {'':>6}  {'':>8} {'':>9} {'':>5} {'':>5}")
     total = 0.0
     for t in trades:
-        tin = f"{t.opened_at:%H:%M:%S}" if t.opened_at else "earlier"
-        rvol = f"{t.rvol:.2f}" if t.rvol is not None else "--"
-        adr1 = f"{t.adr1_pct:.1f}%" if t.adr1_pct is not None else "--"
-        stop = f"{t.stop:.2f}" if t.stop is not None else "--"
-        limit = f"{t.limit:.2f}" if t.limit is not None else "--"
-        entry_cols = (
-            f"  {t.symbol:<6} {_alias(t.account):<4} {t.direction:<5} {t.shares:>6g}  {tin:>8} "
-            f"{_num(t.entry):>9} {rvol:>5} {adr1:>5}"
-        )
-        risk_cols = f"  {stop:>8} {limit:>8}"
-        rows = []
-        for e in t.exits:
-            pnl, r = t.exit_pnl(e), t.exit_r(e)
-            if pnl is not None:
-                total += pnl
-                pnl_s = color(f"{pnl:>+9,.2f}", pnl)
-                r_s = color(f"{r:>+6.2f}", pnl) if r is not None else f"{'--':>6}"
-            else:
-                pnl_s, r_s = f"{'--':>9}", f"{'--':>6}"
-            rows.append(f"  {e.time:%H:%M:%S} {e.shares:>6g} {_num(e.price):>9}{risk_cols}  {pnl_s} {r_s}")
-        held = t.shares - t.exited if t.is_open else 0
-        if t.is_open:
-            rows.append(f"  {'open':>8} {held:>6g} {'--':>9}{risk_cols}  {'--':>9} {'--':>6}")
-        for i, row in enumerate(rows):
-            lines.append((entry_cols if i == 0 else blank_in) + row)
+        for n, lot in enumerate(t.lots):
+            tin = f"{lot.time:%H:%M:%S}" if lot.time else "earlier"
+            rvol = f"{lot.rvol:.2f}" if lot.rvol is not None else "--"
+            adr1 = f"{lot.adr1_pct:.1f}%" if lot.adr1_pct is not None else "--"
+            stop = f"{lot.stop:.2f}" if lot.stop is not None else "--"
+            limit = f"{lot.limit:.2f}" if lot.limit is not None else "--"
+            # The trade's name on its first entry; an add shows its own
+            # entry, under it.
+            name = (
+                f"  {t.symbol:<6} {_alias(t.account):<4} {t.direction:<5}" if n == 0
+                else f"  {'':<6} {'':<4} {'add':<5}"
+            )
+            entry_cols = f"{name} {lot.shares:>6g}  {tin:>8} {_num(lot.price):>9} {rvol:>5} {adr1:>5}"
+            risk_cols = f"  {stop:>8} {limit:>8}"
+            rows = []
+            for e in lot.exits:
+                pnl, r = lot.pnl(e, t.direction), lot.r(e, t.direction)
+                if pnl is not None:
+                    total += pnl
+                    pnl_s = color(f"{pnl:>+9,.2f}", pnl)
+                    r_s = color(f"{r:>+6.2f}", pnl) if r is not None else f"{'--':>6}"
+                else:
+                    pnl_s, r_s = f"{'--':>9}", f"{'--':>6}"
+                rows.append(f"  {e.time:%H:%M:%S} {e.shares:>6g} {_num(e.price):>9}{risk_cols}  {pnl_s} {r_s}")
+            if lot.remaining > 1e-9:
+                rows.append(f"  {'open':>8} {lot.remaining:>6g} {'--':>9}{risk_cols}  {'--':>9} {'--':>6}")
+            for i, row in enumerate(rows):
+                lines.append((entry_cols if i == 0 else blank_in) + row)
     lines.append(f"{'net':>{len(blank_in) + 47}}  {color(f'{total:>+9,.2f}', total)}")
     lines.append(
-        "  One line per exit order; P&L net of commissions (the entry's shared by shares). STOP is the "
-        "original astor recorded, LIMIT the entry's cap; RVOL and ADR1 (today's range, % of price) at entry."
+        "  Each entry on its own line ('add' for a later one), its exits under it, matched oldest entry "
+        "first; P&L net of commissions. STOP and LIMIT are what each entry was sent with; RVOL and ADR1 "
+        "(today's range, % of price) at each entry."
     )
     return lines

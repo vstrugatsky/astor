@@ -130,6 +130,27 @@ def test_limit_and_adr1_at_entry() -> None:
     check("ADR(1) at entry", round(entry_range_pct(t, bars), 2), 8.0)
 
 
+def test_each_entry_its_own_lot_exits_oldest_first() -> None:
+    """KDK 2026-10-29: in, stopped out on half, added, then all out."""
+    [t] = round_trips([
+        Fill(at(33), "KDK", REG, 1333, 1.358, 2.0, order_id=1),
+        Fill(at(72), "KDK", REG, -666, 1.345, 1.0, order_id=2),
+        Fill(at(79), "KDK", REG, 923, 1.378, 1.0, order_id=3),
+        Fill(at(160), "KDK", REG, -1590, 1.322, 2.0, order_id=4),
+    ])
+    first, add = t.lots
+    check("two entries", [(lot.shares, lot.price) for lot in t.lots], [(1333, 1.358), (923, 1.378)])
+    check("the stop-out comes off the first", [e.shares for e in first.exits], [666, 667])
+    check("the final sale takes the rest of it, then the add", [e.shares for e in add.exits], [923])
+    attach_stops([t], [
+        {"time": at(32), "symbol": "KDK", "account": REG, "stop": 1.30, "limit": 1.36, "source": "enter"},
+        {"time": at(78), "symbol": "KDK", "account": REG, "stop": 1.33, "limit": 1.38, "source": "enter"},
+    ])
+    check("each entry its own stop and limit", [(lot.stop, lot.limit) for lot in t.lots], [(1.30, 1.36), (1.33, 1.38)])
+    by_lot = sum(lot.pnl(e, t.direction) for lot in t.lots for e in lot.exits)
+    check("lots add up to the trade", round(by_lot, 6), round(t.pnl, 6))
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
