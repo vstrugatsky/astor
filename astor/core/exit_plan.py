@@ -44,7 +44,8 @@ DEFAULT_AVWAP_ADR = 0.05
 DEFAULT_CLOSE_HOLD_R = 2.0
 
 _R = re.compile(r"^(\d+(?:\.\d+)?)r$", re.IGNORECASE)
-_AVWAP = re.compile(r"^avwap(\d*\.?\d+)?$", re.IGNORECASE)
+# avwap, also as av and the easy slip awvap (2026-10-29)
+_AVWAP = re.compile(r"^(?:avwap|awvap|av)(\d*\.?\d+)?$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)

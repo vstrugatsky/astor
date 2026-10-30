@@ -640,6 +640,8 @@ def test_plan_shares_three_ways_and_levels() -> None:
     c = parse_trade_command("XYZ 100.5 98.2 0.3 gb 3/10 lod")
     check("prices still entry/stop; lod waits for a lookup",
           (c.entry, c.stop, c.plan.legs[1].level_word), (100.5, 98.2, "lod"))
+    for word in ("avwap", "awvap", "av", "AV"):
+        check(f"{word} is avwap", parse_trade_command(f"XYZ 1/2 {word} 1/2 be").plan.legs[0].rule, "avwap")
     check("thirds read cleanly", parse_trade_command("XYZ 1/3 gb 1/3 hod").plan.describe(),
           "33.3% gb, 33.3% hod, 33.3% be")
 
